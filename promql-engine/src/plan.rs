@@ -63,6 +63,7 @@ use crate::selector;
 use crate::series::{Block, Series, BLOCK_END, BLOCK_START, LABELS, SAMPLES};
 use crate::sort;
 use crate::source::{Grouping, SelectHints, SelectorTable, SeriesSource};
+use crate::to_scalar;
 use crate::value_type::{value_type, ValueType};
 use crate::{scalar, series};
 
@@ -691,10 +692,12 @@ impl Planner<'_> {
                 .await?;
             return self.absent(&call.args[0], input);
         }
+        if name == "scalar" {
+            return self.scalar_of(&call.args[0]).await;
+        }
         // `time()` and `pi()` are a value per step and nothing else, the
         // table `scalar_series` builds, which the result then reads as a
-        // scalar. `scalar(v)` is typed the same and is not that: it reads
-        // a vector, and the fold names it as the gap it is.
+        // scalar.
         let returns_scalar =
             crate::function::signature(name).is_some_and(|s| s.return_type == ValueType::Scalar);
         if returns_scalar {
@@ -716,6 +719,47 @@ impl Planner<'_> {
         // do they must stop `grouping`: they rewrite labels, so a `by`
         // can name a label the input lacks while its source goes unnamed.
         self.range_function(call, above).await
+    }
+
+    /// `scalar(v)`: upstream's `funcScalar` over the instant vector `arg`,
+    /// one unlabelled series with a sample at every step.
+    ///
+    /// Planned like [`Planner::absent`], with no group key so that it
+    /// answers when `arg` reached no rows at all, and the row is stamped
+    /// with the whole grid as a scalar's is. The store is not told a `by`:
+    /// `scalar` reads which series exist and what they say, not their
+    /// labels. What comes out still cannot be an operand of another
+    /// operator, since those fold their scalars while planning.
+    async fn scalar_of(&mut self, arg: &Expr) -> Result<Planned, EngineError> {
+        let input = self
+            .expr(
+                arg,
+                Above {
+                    func: Some("scalar"),
+                    grouping: None,
+                },
+            )
+            .await?;
+        let plan = LogicalPlanBuilder::from(input.plan)
+            .aggregate(
+                Vec::<datafusion::logical_expr::Expr>::new(),
+                vec![to_scalar::call(
+                    col(SAMPLES),
+                    self.query.start_ms,
+                    self.query.end_ms,
+                    self.query.step_ms,
+                )
+                .alias(SAMPLES)],
+            )?
+            .project(whole_grid(
+                labels::call(Vec::new()).alias(LABELS),
+                col(SAMPLES),
+            ))?
+            .build()?;
+        Ok(Planned {
+            plan,
+            label_names: Vec::new(),
+        })
     }
 
     /// `absent(v)` and `absent_over_time(x[5m])`: the one series over the
@@ -1759,17 +1803,25 @@ mod tests {
     /// `year()` has no series to read, so no store is asked: the
     /// evaluation time comes from the grid the planner already holds.
     /// `time()` at the top of a query is the scalar table and nothing
-    /// else; `scalar(up)` is typed the same and is still the gap it was.
+    /// else. `scalar(up)` is typed the same but reads a series, so the
+    /// store is asked, and an operand that needs the data is not a
+    /// constant the folds can take, which is still the gap it was.
     #[tokio::test]
     async fn a_scalar_returning_call_is_the_scalar_table() {
         let range = RangeQuery::new(0, 60_000, 30_000);
         assert!(hints_of("time()", range).await.is_empty());
         assert!(hints_of("pi()", range).await.is_empty());
-        let err = plan_of("scalar(up)", range).await.unwrap_err();
-        assert!(
-            matches!(&err, EngineError::Unsupported(f) if f == "the scalar function"),
-            "{err}"
-        );
+        let hints = hints_of("scalar(up)", range).await;
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].func.as_deref(), Some("scalar"));
+        assert_eq!(hints[0].grouping, None);
+        for query in ["scalar(up) + 1", "abs(x) + scalar(up)"] {
+            let err = plan_of(query, range).await.unwrap_err();
+            assert!(
+                matches!(&err, EngineError::Unsupported(f) if f == "the scalar function"),
+                "{query}: {err}"
+            );
+        }
     }
 
     /// The store hears `timestamp` only when the selector is what it

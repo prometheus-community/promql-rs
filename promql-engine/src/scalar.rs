@@ -9,6 +9,9 @@
 //! `scalar(v)` is the exception, and the reason [`fold`] returns a
 //! result rather than a value: it reads a vector, so it cannot be
 //! answered here and is reported as the unsupported feature it is.
+//! [`crate::to_scalar`] answers it when it is the whole of a query or the
+//! argument of a call that takes a vector; as an operand of an operator,
+//! or as a function's scalar argument, it still reaches this fold.
 //!
 //! The arithmetic is upstream's `scalarBinop` (`promql/engine.go:3224`
 //! at 83962c35), comparisons included: between two scalars a comparison

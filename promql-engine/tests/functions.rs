@@ -349,10 +349,11 @@ fn a_call_prometheus_would_not_parse_is_a_query_error() {
 }
 
 /// What the elementwise operator cannot express is still named as the
-/// feature it is, not as a bad query.
+/// feature it is, not as a bad query: a `scalar(v)` operand reads data,
+/// and the operators fold their scalars while planning.
 #[test]
 fn the_functions_that_are_not_elementwise_are_still_unsupported() {
-    let err = error("scalar(temperature)");
+    let err = error("temperature + scalar(temperature)");
     assert!(
         matches!(&err, EngineError::Unsupported(f) if f == "the scalar function"),
         "{err}"

@@ -266,3 +266,76 @@ fn parentheses_around_a_range_selector_argument_change_nothing() {
         [(_, v)] if v == &[1.0, 1.0, 1.0]
     ));
 }
+
+fn scalar_over(source: &MemorySeriesSource, query: &str, at_ms: i64) -> f64 {
+    match Engine::blocking()
+        .unwrap()
+        .instant_query(source, query, at_ms)
+        .unwrap_or_else(|e| panic!("{query}: {e}"))
+    {
+        InstantResult::Scalar(v) => v,
+        other => panic!("{query}: not a scalar: {other:?}"),
+    }
+}
+
+/// `funcScalar`: the one series' value, and NaN for none or several, an
+/// empty vector included.
+#[test]
+fn scalar_of_a_vector_is_its_one_value_or_nan() {
+    let source = source();
+    assert_eq!(
+        scalar_over(&source, r#"scalar(temperature{city="oslo"})"#, 60_000),
+        3.0
+    );
+    assert!(scalar_over(&source, "scalar(temperature)", 60_000).is_nan());
+    assert!(scalar_over(&source, "scalar(nonexistent)", 60_000).is_nan());
+}
+
+/// The store's partitions each see part of the vector, and the Final that
+/// merges them has to count across them: two series in two partitions are
+/// still two.
+#[test]
+fn scalar_counts_across_the_stores_partitions() {
+    for n in [1, 2, 3, 8] {
+        let store = Arc::try_unwrap(source())
+            .unwrap()
+            .partitions(NonZeroUsize::new(n).unwrap());
+        assert!(
+            scalar_over(&store, "scalar(temperature)", 60_000).is_nan(),
+            "{n} partitions"
+        );
+        assert_eq!(
+            scalar_over(&store, r#"scalar(temperature{city="lima"})"#, 60_000),
+            12.0,
+            "{n} partitions"
+        );
+    }
+}
+
+/// A range query's `scalar(v)` has a sample at every step, which no
+/// other operator does: a step the vector is empty at is NaN, not absent.
+#[test]
+fn scalar_has_a_sample_at_every_step_of_a_range_query() {
+    let engine = Engine::blocking().unwrap();
+    let range = RangeQuery::new(0, 120_000, 60_000);
+    let run = |query: &str| {
+        let batches = engine
+            .range_query(source().as_ref(), query, &range)
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
+        let decoded = series::decode(&batches).unwrap();
+        assert_eq!(decoded.len(), 1, "{query}: one unlabelled series");
+        assert_eq!(decoded[0].labels().count(), 0, "{query}");
+        (
+            decoded[0].timestamps().to_vec(),
+            decoded[0].values().to_vec(),
+        )
+    };
+    let (ts, vs) = run(r#"scalar(temperature{city="oslo"})"#);
+    assert_eq!(ts, [0, 60_000, 120_000]);
+    assert_eq!(vs, [1.0, 3.0, 5.0]);
+
+    // Nothing is in reach ten minutes back, at any step.
+    let (ts, vs) = run(r#"scalar(temperature{city="oslo"} offset 10m)"#);
+    assert_eq!(ts, [0, 60_000, 120_000]);
+    assert!(vs.iter().all(|v| v.is_nan()), "{vs:?}");
+}

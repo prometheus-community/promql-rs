@@ -52,6 +52,7 @@ pub mod selector; // benches/kernels.rs
 pub mod series;
 pub(crate) mod sort;
 pub mod source;
+pub(crate) mod to_scalar;
 pub(crate) mod value_type;
 
 pub use engine::{check_selector_plans, Engine, EngineOptions, InstantResult, RangeQuery};

@@ -258,3 +258,20 @@ tests:
             Projection: labels, samples, block_start, block_end
               Aggregate: vector_selector(samples, 1200000..1200000 step 30s, lookback 5m) per series per block
                 TableScan: temperature{city="oslo"}
+
+  - name: scalar of a vector
+    description: >
+      funcScalar answers at every step, so like absent it is an aggregate
+      with no group key, which finalizes a row even when no input arrived,
+      and the row is stamped with the whole range as a scalar's is. The
+      labels are the empty struct.
+    load:
+      - temperature{city="oslo"} 0
+    query: |
+      scalar(temperature{city="oslo"})
+    plan: |
+      Projection: labels{}, TimestampMillisecond(-9223372036854775808, None), TimestampMillisecond(9223372036854775807, None)
+        Aggregate: scalar(samples, 600000..1200000 step 30s) over the whole range
+          Projection: labels, samples, block_start, block_end
+            Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+              TableScan: temperature{city="oslo"}

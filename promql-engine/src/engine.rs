@@ -48,7 +48,9 @@ pub use crate::plan::RangeQuery;
 use crate::series::{self, LABELS};
 use crate::source::{SeriesSetExec, SeriesSource};
 use crate::value_type::{value_type, ValueType};
-use crate::{absent, aggregate, binary, elementwise, labels, matrix, range, selector, sort};
+use crate::{
+    absent, aggregate, binary, elementwise, labels, matrix, range, selector, sort, to_scalar,
+};
 
 /// The knobs of Prometheus's `promql.EngineOpts` that this engine honours,
 /// one field each, under a name that follows upstream's.
@@ -137,6 +139,7 @@ impl Engine {
         ctx.register_udaf(aggregate::udaf());
         ctx.register_udaf(range::udaf());
         ctx.register_udaf(absent::udaf());
+        ctx.register_udaf(to_scalar::udaf());
         ctx.register_udf(elementwise::udf());
         ctx.register_udf(matrix::udf());
         ctx.register_udaf(binary::udaf());

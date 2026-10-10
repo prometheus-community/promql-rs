@@ -53,7 +53,7 @@ use promql_parser::ast::LabelMatcher;
 
 use crate::matcher::METRIC_NAME;
 use crate::source::{SelectHints, SelectorTable};
-use crate::{absent, aggregate, labels, range, selector, series};
+use crate::{absent, aggregate, labels, range, selector, series, to_scalar};
 
 /// Renders `plan` the way `tests/testdata/plans/` pins it. See the module doc
 /// comment for what "readable" means and why it is safe to pin.
@@ -402,7 +402,8 @@ fn render_aggregate_call<A: Arg>(name: &str, args: &[A], single_scan: bool) -> O
         selector::NAME => render_vector_selector(args, single_scan),
         range::NAME => render_range_function(args, single_scan),
         aggregate::NAME => render_aggregate_op(args, single_scan),
-        absent::NAME => render_absent_call(args, single_scan),
+        absent::NAME => render_absent_call("absent", args, single_scan),
+        to_scalar::NAME => render_absent_call("scalar", args, single_scan),
         _ => None,
     }
 }
@@ -696,8 +697,9 @@ fn render_aggregate_function(f: &AggregateFunction, single_scan: bool) -> Option
 }
 
 /// `promql_absent(samples, start, end, step)` as
-/// `absent(samples, START..END step STEP)`.
-fn render_absent_call<A: Arg>(args: &[A], single_scan: bool) -> Option<String> {
+/// `absent(samples, START..END step STEP)`, and `promql_scalar`, which
+/// takes the same arguments, as `scalar(...)`.
+fn render_absent_call<A: Arg>(name: &str, args: &[A], single_scan: bool) -> Option<String> {
     if args.len() != 4 {
         return None;
     }
@@ -706,7 +708,7 @@ fn render_absent_call<A: Arg>(args: &[A], single_scan: bool) -> Option<String> {
     let end = require_i64(&args[2])?;
     let step = require_i64(&args[3])?;
     Some(format!(
-        "absent({samples}, {start}..{end} step {})",
+        "{name}({samples}, {start}..{end} step {})",
         Duration::from_millis(step).ok()?
     ))
 }
@@ -774,14 +776,14 @@ fn render_aggregate_node(agg: &Aggregate, single_scan: bool) -> Option<String> {
         return None;
     }
 
-    // `absent` is the one aggregate with no key at all, the block
-    // included: it has to answer when no row ever arrived, and a block no
-    // series reached is never sent.
-    if f.func.name() == absent::NAME {
+    // `absent` and `scalar` are the aggregates with no key at all, the
+    // block included: they have to answer when no row ever arrived, and a
+    // block no series reached is never sent.
+    if matches!(f.func.name(), absent::NAME | to_scalar::NAME) {
         if !agg.group_expr.is_empty() {
             return None;
         }
-        let call = render_absent_call(&p.args, single_scan)?;
+        let call = render_aggregate_call(f.func.name(), &p.args, single_scan)?;
         return Some(format!("Aggregate: {call} over the whole range"));
     }
 
