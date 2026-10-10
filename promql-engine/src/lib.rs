@@ -53,7 +53,7 @@ pub(crate) mod sort;
 pub mod source;
 pub(crate) mod value_type;
 
-pub use engine::{check_selector_plans, Engine, EngineOptions, RangeQuery};
+pub use engine::{check_selector_plans, Engine, EngineOptions, InstantResult, RangeQuery};
 pub use error::{EngineError, SeriesError};
 pub use explain::{render as explain_plan, render_physical as explain_physical_plan};
 pub use matcher::{CompiledMatcher, METRIC_NAME};

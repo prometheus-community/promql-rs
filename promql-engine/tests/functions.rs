@@ -488,17 +488,3 @@ fn a_literal_covers_the_range_and_a_string_is_refused_in_one() {
         "{err}"
     );
 }
-
-/// The instant query's string answer, through any parentheses, and
-/// nothing for a query that is not a string.
-#[test]
-fn an_instant_string_is_the_literal_without_its_quotes() {
-    let engine = Engine::blocking().unwrap();
-    assert_eq!(
-        engine.instant_string(r#"(" Foo ")"#).unwrap().as_deref(),
-        Some(" Foo ")
-    );
-    assert_eq!(engine.instant_string(r#""""#).unwrap().as_deref(), Some(""));
-    assert_eq!(engine.instant_string("1").unwrap(), None);
-    assert_eq!(engine.instant_string("temperature").unwrap(), None);
-}

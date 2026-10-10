@@ -133,6 +133,9 @@ fn validate(query: &RangeQuery) -> Result<RangeQuery, EngineError> {
     Ok(query)
 }
 
+/// Plan `expr` as `NewRangeQuery` (`promql/engine.go` at 83962c35)
+/// would run it: a value per step, so only a scalar or an instant vector
+/// has a plan.
 pub async fn plan(
     state: &dyn Session,
     source: &dyn SeriesSource,
@@ -142,6 +145,43 @@ pub async fn plan(
     // Every query comes through here, so this covers a `RangeQuery` built
     // as a struct literal as well as through `new`.
     let query = &validate(query)?;
+    check_expr(expr)?;
+    // `NewRangeQuery` refuses every expression type but these two. A
+    // string and a range vector are answered only by an instant query,
+    // which [`crate::Engine::instant_query_async`] gives them without
+    // the grid this plan is built over.
+    let typ = value_type(expr);
+    if !matches!(typ, ValueType::Scalar | ValueType::Vector) {
+        return Err(EngineError::Query(format!(
+            "invalid expression type \"{}\" for range query, must be Scalar or instant Vector",
+            typ.as_str()
+        )));
+    }
+    plan_grid(state, source, expr, query).await
+}
+
+/// Plan `expr` as `execEvalStmt` runs an instant query: a range of one
+/// step whose answer is read as the expression's own type, so a range
+/// selector is planned here and refused by [`plan`].
+pub async fn plan_instant(
+    state: &dyn Session,
+    source: &dyn SeriesSource,
+    expr: &Expr,
+    at_ms: i64,
+) -> Result<LogicalPlan, EngineError> {
+    // The step is nominal: `Grid::new` wants it positive, and with equal
+    // bounds nothing reads it but the hint the store hears.
+    let query = &validate(&RangeQuery::new(at_ms, at_ms, 1))?;
+    check_expr(expr)?;
+    plan_grid(state, source, expr, query).await
+}
+
+async fn plan_grid(
+    state: &dyn Session,
+    source: &dyn SeriesSource,
+    expr: &Expr,
+    query: &RangeQuery,
+) -> Result<LogicalPlan, EngineError> {
     // `aggregate::Grid` checks the same constant; this half exists so
     // the user gets a query error naming the limit.
     let steps = step_count(query.start_ms, query.end_ms, query.step_ms);
@@ -153,17 +193,6 @@ pub async fn plan(
             query.step_ms,
             aggregate::MAX_STEPS
         )));
-    }
-    check_expr(expr)?;
-    if string_literal(expr).is_some() {
-        // `NewRangeQuery` (`promql/engine.go`) refuses every expression
-        // type but these two; a string is answered only by an instant
-        // query, which [`crate::Engine::instant_string`] does without a
-        // plan.
-        return Err(EngineError::Query(
-            "invalid expression type \"string\" for range query, must be Scalar or instant Vector"
-                .into(),
-        ));
     }
     let mut planner = Planner {
         state,

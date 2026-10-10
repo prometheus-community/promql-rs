@@ -142,12 +142,22 @@ pub trait Engine {
         step_ms: i64,
     ) -> Result<QueryResult, EngineError>;
 
-    /// The string an instant query answers, if the query is a bare
-    /// string literal. Prometheus gives strings only to instant queries
-    /// and refuses them in a range query, so the one-step range the
-    /// runner uses for an instant eval cannot carry one.
-    fn instant_string(&self, _query: &str) -> Result<Option<String>, EngineError> {
-        Ok(None)
+    /// An instant query, answered with the type its expression has:
+    /// a vector, a matrix for a range selector, a scalar or a string.
+    ///
+    /// The default is the one-step range query this seam offered before
+    /// it had an instant method, whose answer is always a matrix; the
+    /// runner reshapes that by what the script expects. An engine that
+    /// knows the expression's type overrides this, because a range query
+    /// cannot carry a string or a range vector, and Prometheus refuses
+    /// both in one.
+    fn instant_query(
+        &self,
+        load: &[LoadedSeries<'_>],
+        query: &str,
+        at_ms: i64,
+    ) -> Result<QueryResult, EngineError> {
+        self.range_query(load, query, at_ms, at_ms, 1)
     }
 }
 

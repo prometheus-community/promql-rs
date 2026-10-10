@@ -47,6 +47,7 @@ use crate::labelset;
 pub use crate::plan::RangeQuery;
 use crate::series::{self, LABELS};
 use crate::source::{SeriesSetExec, SeriesSource};
+use crate::value_type::{value_type, ValueType};
 use crate::{absent, aggregate, binary, elementwise, labels, range, selector, sort};
 
 /// The knobs of Prometheus's `promql.EngineOpts` that this engine honours,
@@ -62,6 +63,23 @@ pub struct EngineOptions {
     /// these, so an experimental construct is refused with upstream's
     /// message unless its gate is on here.
     pub parser: ParserOptions,
+}
+
+/// What an instant query answers with: the type its expression has, as
+/// Prometheus's `parser.Value`. `Vector` and `Matrix` stay Arrow batches in
+/// the canonical schema ([`crate::series`]); a scalar and a string are not
+/// series, so they come back as plain values.
+///
+/// A `Vector` row holds one sample, stamped with the evaluation time. A
+/// `Matrix` row holds the samples of a range selector under their own
+/// timestamps, one row per chunk, so a label set may span several rows
+/// that [`series::coalesce`] joins.
+#[derive(Debug, Clone)]
+pub enum InstantResult {
+    Vector(Vec<RecordBatch>),
+    Matrix(Vec<RecordBatch>),
+    Scalar(f64),
+    String(String),
 }
 
 pub struct Engine {
@@ -162,23 +180,26 @@ impl Engine {
     ) -> Result<LogicalPlan, EngineError> {
         // The one place a query string is parsed: `range_query`,
         // `range_query_async` and `physical_plan_async` all plan through here.
-        let expr = Parser::new(self.options.parser)
-            .parse_expr(query)
-            .map_err(EngineError::Parse)?;
+        let expr = self.parse(query)?;
         crate::plan::plan(&self.ctx.state(), source, &expr, range).await
     }
 
-    /// The answer of an instant query that is a bare string literal, or
-    /// `None` for any other query.
-    ///
-    /// A string is not a series, so it has no place in the engine's
-    /// batches, and upstream answers it only to an instant query
-    /// (`evalStmt` returns `parser.String` for a `StringLiteral`) and
-    /// refuses it in a range query. Callers that run instant queries ask
-    /// here first; [`Self::range_query_async`] refuses the same query.
-    pub fn instant_string(&self, query: &str) -> Result<Option<String>, EngineError> {
-        let expr = promql_parser::parse_expr(query).map_err(EngineError::Parse)?;
-        Ok(crate::plan::string_literal(&expr).map(str::to_owned))
+    /// Plan an instant query without running it, for inspection. Like
+    /// every `*_async` method, this must run on a Tokio runtime.
+    pub async fn plan_instant_async(
+        &self,
+        source: &dyn SeriesSource,
+        query: &str,
+        at_ms: i64,
+    ) -> Result<LogicalPlan, EngineError> {
+        let expr = self.parse(query)?;
+        crate::plan::plan_instant(&self.ctx.state(), source, &expr, at_ms).await
+    }
+
+    fn parse(&self, query: &str) -> Result<promql_parser::ast::Expr, EngineError> {
+        Parser::new(self.options.parser)
+            .parse_expr(query)
+            .map_err(EngineError::Parse)
     }
 
     /// The optimized `ExecutionPlan` a range query runs, for inspection or
@@ -222,6 +243,72 @@ impl Engine {
         range: &RangeQuery,
     ) -> Result<Vec<RecordBatch>, EngineError> {
         let plan = self.plan_async(source, query, range).await?;
+        self.run(plan).await
+    }
+
+    /// Evaluate a query at one instant and answer with the type the
+    /// *expression* has: `execEvalStmt` (`promql/engine.go` at 83962c35)
+    /// runs an instant query as a range evaluation of one step and then
+    /// reads the matrix back by `Expr.Type()`. The result of the
+    /// evaluation cannot say which it was, since `scalar(x)` and `sum(x)`
+    /// both come back as one series with no labels, which is why the type
+    /// comes from [`value_type`] before anything runs.
+    ///
+    /// A string is not a series, so it has no place in the engine's
+    /// batches and is answered without a plan. Like the range query, this
+    /// must run on a Tokio runtime, see [`Self::plan_async`].
+    pub async fn instant_query_async(
+        &self,
+        source: &dyn SeriesSource,
+        query: &str,
+        at_ms: i64,
+    ) -> Result<InstantResult, EngineError> {
+        let expr = self.parse(query)?;
+        if let Some(s) = crate::plan::string_literal(&expr) {
+            return Ok(InstantResult::String(s.to_owned()));
+        }
+        let plan = crate::plan::plan_instant(&self.ctx.state(), source, &expr, at_ms).await?;
+        let batches = self.run(plan).await?;
+        match value_type(&expr) {
+            ValueType::Vector => Ok(InstantResult::Vector(batches)),
+            ValueType::Matrix => Ok(InstantResult::Matrix(batches)),
+            // `Scalar{V: mat[0].Floats[0].F}`: a scalar is planned as one
+            // unlabelled series with a sample at every step, so the one
+            // step has one sample. Anything else is a planner bug and is
+            // said so rather than answered as a number.
+            ValueType::Scalar => {
+                let decoded = series::decode(&batches)?;
+                match decoded.as_slice() {
+                    [only] if only.values().len() == 1 => {
+                        Ok(InstantResult::Scalar(only.values()[0]))
+                    }
+                    other => Err(EngineError::Schema(format!(
+                        "a scalar query produced {} series instead of one sample",
+                        other.len()
+                    ))),
+                }
+            }
+            ValueType::String => Err(EngineError::Schema(
+                "a string query that is not a literal reached the planner".into(),
+            )),
+        }
+    }
+
+    /// [`Self::instant_query_async`], blocking on the engine's own runtime,
+    /// under the refusal [`Self::range_query`] makes.
+    pub fn instant_query(
+        &self,
+        source: &dyn SeriesSource,
+        query: &str,
+        at_ms: i64,
+    ) -> Result<InstantResult, EngineError> {
+        self.outside_runtime("instant_query")?
+            .block_on(self.instant_query_async(source, query, at_ms))
+    }
+
+    /// Execute a planned query and apply the passes Prometheus runs on
+    /// every result.
+    async fn run(&self, plan: LogicalPlan) -> Result<Vec<RecordBatch>, EngineError> {
         // Only sort, sort_desc and sort_by_label plan a Sort, and only at
         // the root of an instant query: their order is the result, and
         // Prometheus orders by label set only a matrix.
@@ -264,17 +351,22 @@ impl Engine {
         query: &str,
         range: &RangeQuery,
     ) -> Result<Vec<RecordBatch>, EngineError> {
+        self.outside_runtime("range_query")?
+            .block_on(self.range_query_async(source, query, range))
+    }
+
+    /// The runtime a blocking method runs on, unless this thread is
+    /// already inside one.
+    fn outside_runtime(&self, method: &str) -> Result<&tokio::runtime::Runtime, EngineError> {
         // `block_on` panics inside a runtime, on a worker thread of either
         // flavor; an error lets the caller find the `*_async` method instead.
         if tokio::runtime::Handle::try_current().is_ok() {
-            return Err(EngineError::Runtime(
-                "range_query blocks and cannot run inside a Tokio runtime, spawn_blocking threads \
-                 included; use range_query_async or a plain thread"
-                    .into(),
-            ));
+            return Err(EngineError::Runtime(format!(
+                "{method} blocks and cannot run inside a Tokio runtime, spawn_blocking threads \
+                 included; use {method}_async or a plain thread"
+            )));
         }
-        self.runtime()?
-            .block_on(self.range_query_async(source, query, range))
+        self.runtime()
     }
 
     fn runtime(&self) -> Result<&tokio::runtime::Runtime, EngineError> {

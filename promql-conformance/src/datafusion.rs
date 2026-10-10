@@ -12,9 +12,9 @@ use std::collections::BTreeMap;
 use std::num::{NonZeroU64, NonZeroUsize};
 
 use promql_engine::series::{coalesce, decode};
-use promql_engine::{MemorySeriesSource, RangeQuery};
+use promql_engine::{InstantResult, MemorySeriesSource, RangeQuery};
 
-use crate::result::{Engine, EngineError, LoadedSeries, Point, QueryResult, Series};
+use crate::result::{Engine, EngineError, LoadedSeries, Point, QueryResult, Sample, Series};
 
 pub struct DataFusionEngine {
     inner: promql_engine::Engine,
@@ -177,13 +177,89 @@ fn merge(load: &[LoadedSeries<'_>]) -> Vec<promql_engine::Series> {
         .collect()
 }
 
+impl DataFusionEngine {
+    /// A store that cannot be built is a broken fixture, not a verdict
+    /// on the query, so it stays an Other rather than an answer.
+    fn store(&self, load: &[LoadedSeries<'_>]) -> Result<MemorySeriesSource, EngineError> {
+        let source = MemorySeriesSource::try_new(merge(load))
+            .map_err(|e| EngineError::Other(format!("seeding the store: {e}")))?;
+        Ok(self.source.apply(source))
+    }
+}
+
+/// How an engine failure reads to the harness: an invalid query is an
+/// answer, an unsupported feature is "not built yet", anything else is a
+/// bug.
+fn failure(error: promql_engine::EngineError) -> Result<QueryResult, EngineError> {
+    match error {
+        promql_engine::EngineError::Unsupported(feature) => Err(EngineError::Unsupported(feature)),
+        // The text is what the corpus's expected errors are matched on.
+        e if e.is_user_error() => Ok(QueryResult::Error(e.to_string())),
+        other => Err(EngineError::Other(other.to_string())),
+    }
+}
+
+/// Upstream's matrix has one series per label set; the engine's rows have
+/// one per label set and block.
+fn series_of(
+    decoded: Result<Vec<promql_engine::Series>, promql_engine::SeriesError>,
+) -> Result<Vec<Series>, EngineError> {
+    let decoded = decoded
+        .and_then(coalesce)
+        .map_err(|e| EngineError::Other(format!("decoding: {e}")))?;
+    Ok(decoded
+        .iter()
+        .map(|s| Series {
+            labels: s
+                .labels()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect(),
+            floats: s
+                .timestamps()
+                .iter()
+                .zip(s.values())
+                .map(|(&t, &v)| Point { t, v })
+                .collect(),
+            histograms: 0,
+        })
+        .collect())
+}
+
 impl Engine for DataFusionEngine {
-    fn instant_string(&self, query: &str) -> Result<Option<String>, EngineError> {
-        match self.inner.instant_string(query) {
-            Ok(s) => Ok(s),
-            // A parse error is the query's own answer, which `range_query`
-            // reports; leave it to that.
-            Err(_) => Ok(None),
+    fn instant_query(
+        &self,
+        load: &[LoadedSeries<'_>],
+        query: &str,
+        at_ms: i64,
+    ) -> Result<QueryResult, EngineError> {
+        let source = self.store(load)?;
+        match self.inner.instant_query(&source, query, at_ms) {
+            Ok(InstantResult::Vector(batches)) => {
+                // `execEvalStmt` stamps every sample with the evaluation
+                // time, whatever time the point it came from carried.
+                let samples = series_of(decode(&batches))?
+                    .into_iter()
+                    .map(|s| match s.floats.as_slice() {
+                        [p] => Ok(Sample {
+                            labels: s.labels,
+                            t: at_ms,
+                            v: p.v,
+                            histogram: false,
+                        }),
+                        points => Err(EngineError::Other(format!(
+                            "an instant vector series carried {} points",
+                            points.len()
+                        ))),
+                    })
+                    .collect::<Result<_, _>>()?;
+                Ok(QueryResult::Vector(samples))
+            }
+            Ok(InstantResult::Matrix(batches)) => {
+                Ok(QueryResult::Matrix(series_of(decode(&batches))?))
+            }
+            Ok(InstantResult::Scalar(v)) => Ok(QueryResult::Scalar { v, t: at_ms }),
+            Ok(InstantResult::String(v)) => Ok(QueryResult::Str { v, t: at_ms }),
+            Err(e) => failure(e),
         }
     }
 
@@ -195,44 +271,11 @@ impl Engine for DataFusionEngine {
         end_ms: i64,
         step_ms: i64,
     ) -> Result<QueryResult, EngineError> {
-        // A store that cannot be built is a broken fixture, not a verdict
-        // on the query, so it stays an Other rather than an answer.
-        let source = MemorySeriesSource::try_new(merge(load))
-            .map_err(|e| EngineError::Other(format!("seeding the store: {e}")))?;
-        let source = self.source.apply(source);
+        let source = self.store(load)?;
         let range = RangeQuery::new(start_ms, end_ms, step_ms);
         match self.inner.range_query(&source, query, &range) {
-            Ok(batches) => {
-                // Upstream's matrix has one series per label set; the
-                // engine's rows have one per label set and block.
-                let decoded = decode(&batches)
-                    .and_then(coalesce)
-                    .map_err(|e| EngineError::Other(format!("decoding: {e}")))?;
-                Ok(QueryResult::Matrix(
-                    decoded
-                        .iter()
-                        .map(|s| Series {
-                            labels: s
-                                .labels()
-                                .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                                .collect(),
-                            floats: s
-                                .timestamps()
-                                .iter()
-                                .zip(s.values())
-                                .map(|(&t, &v)| Point { t, v })
-                                .collect(),
-                            histograms: 0,
-                        })
-                        .collect(),
-                ))
-            }
-            Err(promql_engine::EngineError::Unsupported(feature)) => {
-                Err(EngineError::Unsupported(feature))
-            }
-            // The text is what the corpus's expected errors are matched on.
-            Err(e) if e.is_user_error() => Ok(QueryResult::Error(e.to_string())),
-            Err(other) => Err(EngineError::Other(other.to_string())),
+            Ok(batches) => Ok(QueryResult::Matrix(series_of(decode(&batches))?)),
+            Err(e) => failure(e),
         }
     }
 }

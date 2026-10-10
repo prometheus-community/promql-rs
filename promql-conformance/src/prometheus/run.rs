@@ -19,14 +19,15 @@
 //!
 //! # Instant queries
 //!
-//! 1,801 of the 2,098 evals are instant, and the engine only offers a
-//! range query. Issuing one with `start == end` yields exactly one point
-//! per series, which is then reshaped into the vector or scalar the
-//! script expects. The *script* says which — our own output cannot,
-//! since a scalar comes back as a matrix with one empty-label series,
-//! indistinguishable from what `sum(x)` returns. Anything other than
-//! exactly one point means the emulation itself is wrong, and is
-//! reported as a harness failure rather than passed to the comparer.
+//! 1,801 of the 2,098 evals are instant. They go to
+//! `Engine::instant_query`, which answers with the type the expression
+//! has, as upstream does, and the comparison is by what the script
+//! expects: a vector, a scalar, a string, or `expect range vector` for a
+//! matrix. An engine without that method falls back to a one-step range
+//! query, whose matrix is reshaped into the vector or scalar the script
+//! says; anything other than exactly one point then means the emulation
+//! itself is wrong, and is reported as a harness failure rather than
+//! passed to the comparer.
 
 use std::collections::BTreeMap;
 
@@ -457,22 +458,11 @@ fn evaluate(engine: &dyn Engine, eval: &Eval, active: &[Block]) -> Verdict {
         })
         .collect();
 
-    // An instant query is a range of one step. `Grid::new` rejects a
-    // non-positive step, so the step is nominal rather than zero.
-    let (start_ms, end_ms, step_ms) = match eval.timing {
-        Timing::Instant { at_ms } => (at_ms, at_ms, 1),
-        Timing::Range(r) => (r.start_ms, r.end_ms, r.step_ms),
+    let actual = match eval.timing {
+        Timing::Instant { at_ms } => engine.instant_query(&load, &eval.query, at_ms),
+        Timing::Range(r) => engine.range_query(&load, &eval.query, r.start_ms, r.end_ms, r.step_ms),
     };
-
-    if matches!(eval.timing, Timing::Instant { .. }) {
-        if let Ok(Some(v)) = engine.instant_string(&eval.query) {
-            return match verify(eval, QueryResult::Str { v, t: start_ms }) {
-                Ok(()) => Verdict::Pass,
-                Err(detail) => Verdict::Fail(detail),
-            };
-        }
-    }
-    let actual = match engine.range_query(&load, &eval.query, start_ms, end_ms, step_ms) {
+    let actual = match actual {
         Ok(r) => r,
         Err(EngineError::Unsupported(feature)) => return Verdict::Unsupported(feature),
         Err(e) => return Verdict::Fail(e.to_string()),
@@ -599,11 +589,13 @@ fn labels_of(desc: &SeriesDescription) -> Labels {
         .collect()
 }
 
-/// A range query always answers with a matrix. Reshape it into the
-/// vector an instant eval expects, refusing to guess when the shape is
-/// not what a single-step query should have produced.
+/// The vector an instant eval expects. An engine that answers instant
+/// queries by type hands one over; the default `Engine::instant_query` is
+/// a one-step range query, whose matrix is reshaped here, refusing to
+/// guess when it is not what a single step should have produced.
 fn normalise_vector(actual: QueryResult) -> Result<Vec<Sample>, String> {
     let series = match actual {
+        QueryResult::Vector(samples) => return Ok(samples),
         QueryResult::Matrix(series) => series,
         other => {
             return Err(format!(
@@ -915,6 +907,56 @@ mod tests {
             [Verdict::Pass]
         );
         assert!(!verdicts("eval instant at 0 q\n  {job=\"a\"} 8\n", &engine)[0].is_pass());
+    }
+
+    /// An engine that answers instant queries by type is trusted with it:
+    /// a vector is compared as one and a matrix against `expect range
+    /// vector`, where the one-step range query could give neither.
+    #[test]
+    fn an_instant_eval_takes_the_engines_typed_answer() {
+        struct Typed(QueryResult);
+
+        impl Engine for Typed {
+            fn range_query(
+                &self,
+                _: &[LoadedSeries<'_>],
+                _: &str,
+                _: i64,
+                _: i64,
+                _: i64,
+            ) -> Result<QueryResult, EngineError> {
+                panic!("an instant eval is not a range query")
+            }
+
+            fn instant_query(
+                &self,
+                _: &[LoadedSeries<'_>],
+                _: &str,
+                _: i64,
+            ) -> Result<QueryResult, EngineError> {
+                Ok(self.0.clone())
+            }
+        }
+
+        let sample = |v| Sample {
+            labels: [("job".to_string(), "a".to_string())].into(),
+            t: 0,
+            v,
+            histogram: false,
+        };
+        let vector = Typed(QueryResult::Vector(vec![sample(7.0)]));
+        assert_eq!(
+            verdicts("eval instant at 0 q\n  {job=\"a\"} 7\n", &vector),
+            [Verdict::Pass]
+        );
+        assert!(!verdicts("eval instant at 0 q\n  {job=\"a\"} 8\n", &vector)[0].is_pass());
+
+        let rows: &[Row<'_>] = &[(&[("job", "a")], &[(10_000, 1.0), (20_000, 2.0)])];
+        let script = "eval instant at 20s q\n  expect range vector from 10s to 20s step 10s\n  \
+                      {job=\"a\"} 1 2\n";
+        assert_eq!(verdicts(script, &Typed(matrix(rows))), [Verdict::Pass]);
+        // The same samples as a vector are not what the script asked for.
+        assert!(!verdicts(script, &vector)[0].is_pass());
     }
 
     /// Without this the instant emulation could silently compare against

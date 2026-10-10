@@ -116,17 +116,13 @@ fn matchers_reach_the_source() {
 #[test]
 fn anything_but_a_selector_is_unsupported_by_name() {
     let engine = Engine::blocking().unwrap();
-    for (query, what) in [
-        ("topk(2, http_requests_total)", "the topk aggregation"),
-        ("http_requests_total[5m]", "a range selector"),
-    ] {
-        let err = engine
-            .range_query(envoy().as_ref(), query, &RangeQuery::new(0, 60_000, 30_000))
-            .unwrap_err();
-        match err {
-            EngineError::Unsupported(f) => assert_eq!(f, what, "{query}"),
-            other => panic!("{query}: expected Unsupported, got {other}"),
-        }
+    let query = "topk(2, http_requests_total)";
+    let err = engine
+        .range_query(envoy().as_ref(), query, &RangeQuery::new(0, 60_000, 30_000))
+        .unwrap_err();
+    match err {
+        EngineError::Unsupported(f) => assert_eq!(f, "the topk aggregation", "{query}"),
+        other => panic!("{query}: expected Unsupported, got {other}"),
     }
 }
 
