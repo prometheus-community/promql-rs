@@ -35,6 +35,9 @@ node is still built, as with `addParseErrf`.
 The `start()`, `end()`, `step()` and `range()` arms are gated but still not
 ported past the gate: with the flag on they fail as before.
 
+Every gate error carries its flag in `ParseError::gate`, so a caller sorting
+queries by the flag they need does not match on upstream's wording.
+
 `FEATURE_FLAGS` in `promql-parser/src/options.rs` is the code's copy of the
 first three columns.
 

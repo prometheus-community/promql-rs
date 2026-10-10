@@ -160,7 +160,8 @@ pub fn binary<'l, 'i: 'l>(
         }) = &expr
         {
             if vm.fill_values.lhs.is_some() || vm.fill_values.rhs.is_some() {
-                p.add_parse_err(
+                p.add_gate_err(
+                    crate::options::BINOP_FILL_MODIFIERS,
                     expr.position_range(),
                     "binop fill modifiers are experimental and not enabled",
                 );
@@ -606,7 +607,8 @@ fn set_range_modifier(p: &ParserCtx, inner: Result<Expr, ()>, anchored: bool) ->
     let name = if anchored { "anchored" } else { "smoothed" };
     let range = e.position_range();
     if !p.options().enable_extended_range_selectors {
-        p.add_parse_err(
+        p.add_gate_err(
+            crate::options::EXTENDED_RANGE_SELECTORS,
             range,
             format!("{name} modifier is experimental and not enabled"),
         );
@@ -721,7 +723,11 @@ pub fn function_call<'l, 'i: 'l>(
 fn check_function_enabled(p: &ParserCtx, name: &str, range: PositionRange) -> bool {
     let experimental = crate::functions::is_experimental(name);
     if experimental && !p.options().enable_experimental_functions {
-        p.add_parse_err(range, format!("function {name:?} is not enabled"));
+        p.add_gate_err(
+            crate::options::EXPERIMENTAL_FUNCTIONS,
+            range,
+            format!("function {name:?} is not enabled"),
+        );
     }
     experimental
 }
@@ -774,7 +780,8 @@ pub fn aggregate<'l, 'i: 'l>(
     if !p.options().enable_experimental_functions
         && matches!(op, ItemType::Limitk | ItemType::LimitRatio)
     {
-        p.add_parse_err(
+        p.add_gate_err(
+            crate::options::EXPERIMENTAL_FUNCTIONS,
             to_pos_range(span),
             format!(
                 "{op}() is experimental and must be enabled with \

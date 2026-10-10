@@ -42,6 +42,19 @@ impl ParserCtx {
             .push(ParseError::new(message, range));
     }
 
+    /// `addParseErrf` from a feature gate: the error also names `flag`,
+    /// the `--enable-feature` value that would have let the query through.
+    pub fn add_gate_err(
+        &self,
+        flag: &'static str,
+        range: PositionRange,
+        message: impl Into<String>,
+    ) {
+        let mut err = ParseError::new(message, range);
+        err.gate = Some(flag);
+        self.errors.borrow_mut().push(err);
+    }
+
     /// Upstream `experimentalDurationExpr`: grammar actions that build a
     /// duration expression call this with it, and it reports the
     /// expression when `ExperimentalDurationExpr` is off. Nothing calls it
@@ -49,7 +62,8 @@ impl ParserCtx {
     #[allow(dead_code)]
     pub fn experimental_duration_expr(&self, e: &Expr) {
         if !self.options.experimental_duration_expr {
-            self.add_parse_err(
+            self.add_gate_err(
+                crate::options::DURATION_EXPR,
                 e.position_range(),
                 "experimental duration expression is not enabled",
             );
@@ -91,6 +105,7 @@ mod tests {
             "experimental duration expression is not enabled"
         );
         assert_eq!(got[0].range, e.position_range());
+        assert_eq!(got[0].gate, Some("promql-duration-expr"));
 
         let on = ParserCtx::new(ParserOptions {
             experimental_duration_expr: true,

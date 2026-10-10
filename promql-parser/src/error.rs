@@ -9,6 +9,11 @@ use crate::posrange::PositionRange;
 pub struct ParseError {
     pub message: String,
     pub range: PositionRange,
+    /// The `--enable-feature` value whose gate refused the query, for an
+    /// error a feature gate raised. Not in upstream's `ParseErr`; there the
+    /// message is the only trace, and a caller sorting queries by the flag
+    /// they need would have to match on wording that upstream rephrases.
+    pub gate: Option<&'static str>,
 }
 
 impl ParseError {
@@ -16,6 +21,7 @@ impl ParseError {
         Self {
             message: message.into(),
             range,
+            gate: None,
         }
     }
 }

@@ -7,7 +7,7 @@
 //! are the ones in `upstream/parse.go` and `upstream/generated_parser.y`.
 
 use promql_parser::posrange::PositionRange;
-use promql_parser::{parse_expr, ParseErrors, Parser, ParserOptions};
+use promql_parser::{parse_expr, ParseErrors, Parser, ParserOptions, FEATURE_FLAGS};
 
 const FUNCTIONS: ParserOptions = ParserOptions {
     enable_experimental_functions: true,
@@ -40,6 +40,24 @@ fn errors(result: Result<impl std::fmt::Debug, ParseErrors>) -> Vec<(String, Pos
         .collect()
 }
 
+/// The flag each error names, which a caller sorting queries by the flag
+/// they need reads instead of the message.
+fn gates(result: Result<impl std::fmt::Debug, ParseErrors>) -> Vec<Option<&'static str>> {
+    result
+        .expect_err("the construct should be rejected")
+        .into_iter()
+        .map(|e| e.gate)
+        .collect()
+}
+
+fn flag_of(enabling: ParserOptions) -> &'static str {
+    FEATURE_FLAGS
+        .iter()
+        .find(|f| OFF.with_flag(f.flag, true) == Some(enabling))
+        .expect("one flag")
+        .flag
+}
+
 fn range(start: u32, end: u32) -> PositionRange {
     PositionRange { start, end }
 }
@@ -49,6 +67,11 @@ fn range(start: u32, end: u32) -> PositionRange {
 fn gate(query: &str, enabling: ParserOptions, message: &str, at: PositionRange) {
     let want = vec![(message.to_string(), at)];
     assert_eq!(errors(parse_expr(query)), want, "{query}: defaults");
+    assert_eq!(
+        gates(parse_expr(query)),
+        [Some(flag_of(enabling))],
+        "{query}: defaults"
+    );
     for (name, other) in [
         ("functions", FUNCTIONS),
         ("duration", DURATION),
@@ -129,6 +152,11 @@ fn the_keyword_function_arms_are_gated_too() {
         assert_eq!(
             errors(parse_expr(query)),
             vec![(message.clone(), at)],
+            "{query}"
+        );
+        assert_eq!(
+            gates(parse_expr(query)),
+            [Some("promql-experimental-functions")],
             "{query}"
         );
         let enabled = errors(Parser::new(FUNCTIONS).parse_expr(query));

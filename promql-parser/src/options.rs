@@ -97,6 +97,12 @@ pub const FEATURE_FLAGS: [FeatureFlag; 4] = [
     },
 ];
 
+/// The `--enable-feature` values a gate names on the error it raises.
+pub(crate) const EXPERIMENTAL_FUNCTIONS: &str = FEATURE_FLAGS[0].flag;
+pub(crate) const DURATION_EXPR: &str = FEATURE_FLAGS[1].flag;
+pub(crate) const EXTENDED_RANGE_SELECTORS: &str = FEATURE_FLAGS[2].flag;
+pub(crate) const BINOP_FILL_MODIFIERS: &str = FEATURE_FLAGS[3].flag;
+
 #[cfg(test)]
 mod tests {
     use super::*;
