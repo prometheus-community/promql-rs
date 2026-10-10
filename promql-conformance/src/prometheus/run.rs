@@ -142,78 +142,17 @@ pub struct Outcome {
 struct Block {
     series: Vec<SeriesDescription>,
     interval_secs: f64,
-    /// Metric names of series lines in this block that did not parse —
-    /// native-histogram descriptors, today. `None` for a line whose name
-    /// could not be recovered at all.
-    ///
-    /// An eval reading one of these is being asked a different question
-    /// than the script wrote, because the data it needs is missing. But
-    /// most are not: `operators.test` seeds one histogram series in a
-    /// block that 165 float evals also read from, and skipping all of
-    /// them would throw away most of the file.
-    missing: Vec<Option<String>>,
+    /// Label sets of the series lines in this block that did not load,
+    /// native-histogram descriptors today; `None` for a line whose labels
+    /// could not be read. An eval selecting one is skipped: the data it
+    /// asks about is missing. Matched like `histograms`, by label matchers,
+    /// because a check on metric names alone skipped float evals that
+    /// share a name prefix or a block with a histogram.
+    unloaded: Vec<Option<Labels>>,
     /// Label sets of the series this block loads with native histogram
     /// samples. `None` for a line whose labels could not be read, which
     /// any selector is taken to match.
     histograms: Vec<Option<Labels>>,
-}
-
-/// Whether a query could be reading one of the series we failed to load.
-///
-/// A deliberate over-approximation, and a textual one: it answers "might
-/// this touch it?", never "does it?". Two ways to say yes — the query
-/// names the metric, or it uses a selector with no metric name at all
-/// (`max({job="api-server"})`), which can match anything. A name we
-/// could not recover also counts, since there is nothing to compare.
-///
-/// Over-approximating is the safe direction. A false yes costs one
-/// skipped eval; a false no reports a missing-data failure as though the
-/// engine were wrong, and step 7 would then bake that into the baseline.
-fn might_read(query: &str, missing: &[Option<String>]) -> bool {
-    if missing.is_empty() {
-        return false;
-    }
-    if missing.iter().any(Option::is_none) {
-        return true;
-    }
-    if missing
-        .iter()
-        .flatten()
-        .any(|name| query.contains(name.as_str()))
-    {
-        return true;
-    }
-    has_nameless_selector(query)
-}
-
-fn has_nameless_selector(query: &str) -> bool {
-    let bytes = query.as_bytes();
-    bytes.iter().enumerate().any(|(i, &b)| {
-        b == b'{'
-            && !bytes[..i]
-                .iter()
-                .rev()
-                .find(|c| !c.is_ascii_whitespace())
-                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_' || *c == b':')
-    })
-}
-
-/// The metric name a series line declares, from either spelling:
-/// `foo{bar="baz"} …` or `{__name__="foo", bar="baz"} …`.
-fn metric_name(line: &str) -> Option<String> {
-    let line = line.trim();
-    if let Some(rest) = line.strip_prefix('{') {
-        let at = rest.find("__name__")?;
-        let eq = rest[at..].find('=')? + at;
-        let open = rest[eq..].find('"')? + eq + 1;
-        let close = rest[open..].find('"')? + open;
-        return Some(rest[open..close].to_string());
-    }
-    let name: String = line
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
-        .collect();
-    (!name.is_empty()).then_some(name)
 }
 
 /// Run every eval in a script, in source order.
@@ -231,10 +170,10 @@ pub fn run_script(engine: &dyn Engine, script: &Script) -> Vec<Outcome> {
             Command::Load(load) => active.push(Block {
                 series: load.block.parsed().cloned().collect(),
                 interval_secs: load.block.interval_secs,
-                missing: load
+                unloaded: load
                     .block
                     .unsupported()
-                    .map(|u| metric_name(&u.text))
+                    .map(|u| series_labels(&u.text))
                     .collect(),
                 histograms: histogram_series(&load.block),
             }),
@@ -269,7 +208,7 @@ fn has_histograms(eval: &Eval, active: &[Block]) -> bool {
     eval.unsupported
         .iter()
         .any(|u| u.reason == Unsupported::NativeHistogram)
-        || selects_histogram(&eval.query, active)
+        || selects(&eval.query, active.iter().flat_map(|b| &b.histograms))
 }
 
 /// The series a block holds as native histograms, as upstream's `loadCmd`
@@ -336,15 +275,15 @@ fn series_labels(line: &str) -> Option<Labels> {
     Some(labels_of(&desc))
 }
 
-/// Whether a selector in `query` matches a series an active block loads as
-/// a native histogram, by Prometheus's matcher rules: a label the series
-/// lacks compares as `""`, and a regex matches the whole value.
-fn selects_histogram(query: &str, active: &[Block]) -> bool {
+/// Whether a selector in `query` matches one of `series`, by Prometheus's
+/// matcher rules: a label the series lacks compares as `""`, and a regex
+/// matches the whole value. A `None` series matches every selector.
+fn selects<'a>(query: &str, series: impl IntoIterator<Item = &'a Option<Labels>>) -> bool {
     use promql_engine::CompiledMatcher;
     use promql_parser::ast::{LabelMatcher, MatchOp, VectorSelector};
     use promql_parser::{Expr, ParserOptions};
 
-    let series: Vec<&Option<Labels>> = active.iter().flat_map(|b| &b.histograms).collect();
+    let series: Vec<&Option<Labels>> = series.into_iter().collect();
     if series.is_empty() {
         return false;
     }
@@ -503,7 +442,7 @@ fn evaluate(engine: &dyn Engine, eval: &Eval, active: &[Block]) -> Verdict {
             eval.unsupported[0].text
         ));
     }
-    if active.iter().any(|b| might_read(&eval.query, &b.missing)) {
+    if selects(&eval.query, active.iter().flat_map(|b| &b.unloaded)) {
         return Verdict::Skipped(
             "a series it may read did not load (native histogram)".to_string(),
         );
@@ -871,58 +810,6 @@ mod tests {
         assert!(!almost_equal(0.0, 1e-30, EPSILON));
     }
 
-    #[test]
-    fn a_metric_name_is_read_from_either_spelling() {
-        assert_eq!(metric_name("foo{a=\"b\"} 1 2 3").as_deref(), Some("foo"));
-        assert_eq!(metric_name("  foo 1 2 3").as_deref(), Some("foo"));
-        assert_eq!(
-            metric_name("{__name__=\"testhistogram\", id=\"1\"} {{schema:-53}}").as_deref(),
-            Some("testhistogram")
-        );
-        assert_eq!(metric_name("{a=\"b\"} 1").as_deref(), None);
-    }
-
-    /// The case that motivates the whole heuristic: `operators.test`
-    /// loads one histogram series into a block that 165 float evals also
-    /// read. Poisoning the block wholesale would skip all of them.
-    #[test]
-    fn a_query_naming_other_metrics_is_not_poisoned() {
-        let missing = vec![Some("http_requests_histogram".to_string())];
-        assert!(!might_read("sum(http_requests) by (job)", &missing));
-        assert!(might_read("sum(http_requests_histogram)", &missing));
-    }
-
-    #[test]
-    fn a_selector_without_a_metric_name_matches_anything() {
-        let missing = vec![Some("http_requests_histogram".to_string())];
-        assert!(might_read("max({job=\"api-server\"})", &missing));
-        assert!(might_read("count({__name__=~\".+\"})", &missing));
-    }
-
-    #[test]
-    fn a_named_selector_is_not_mistaken_for_a_nameless_one() {
-        assert!(!has_nameless_selector("http_requests{job=\"x\"}"));
-        assert!(!has_nameless_selector("rate(foo{a=\"b\"}[5m])"));
-        // A space between name and braces is still a named selector.
-        assert!(!has_nameless_selector("http_requests {job=\"x\"}"));
-        assert!(!has_nameless_selector("sum by (job) (foo)"));
-        assert!(!has_nameless_selector("foo[5m:1m]"));
-        assert!(has_nameless_selector("{job=\"x\"}"));
-        assert!(has_nameless_selector("sum({job=\"x\"})"));
-    }
-
-    #[test]
-    fn a_block_that_loaded_cleanly_poisons_nothing() {
-        assert!(!might_read("{job=\"x\"}", &[]));
-    }
-
-    /// A name we could not recover means we cannot reason about it, so
-    /// everything downstream is suspect.
-    #[test]
-    fn an_unrecoverable_name_poisons_conservatively() {
-        assert!(might_read("sum(unrelated)", &[None]));
-    }
-
     // ---------------- the runner ----------------
     //
     // These go through `run_script` on hand-written snippets rather than
@@ -1247,6 +1134,22 @@ mod tests {
              eval instant at 0m h </ 2\n  {{}} 1\n"
         );
         assert_eq!(categories(&script), [NativeHistograms, Core, Core]);
+    }
+
+    /// The name check this replaces skipped `some_metric_with_stale_marker`
+    /// for a histogram named `some_metric`, and any nameless selector.
+    #[test]
+    fn only_an_eval_selecting_a_series_that_did_not_load_is_skipped() {
+        let engine = Stub(|_: &str| Ok(matrix(&[])));
+        let script = format!(
+            "load 1m\n  h{{job=\"y\"}} {HIST}\n  h_total{{job=\"x\"}} 1\n\n\
+             eval instant at 0m h_total\n\n\
+             eval instant at 0m absent_over_time({{job=\"x\"}}[1m])\n\n\
+             eval instant at 0m h\n"
+        );
+        let got = verdicts(&script, &engine);
+        assert_eq!(got[..2], [Verdict::Pass, Verdict::Pass]);
+        assert!(matches!(got[2], Verdict::Skipped(_)), "{got:?}");
     }
 
     #[test]
