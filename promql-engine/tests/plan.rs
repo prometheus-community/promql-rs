@@ -152,6 +152,11 @@ struct Case {
     /// the ordering functions plan a `Sort` over an instant query and
     /// nothing at all over a range.
     range: Option<Bounds>,
+    /// Plan as an instant query at the range's start, the only way to
+    /// plan a range selector, which a range query refuses. No physical
+    /// plan: the engine lowers only the plan a range query runs.
+    #[serde(default)]
+    instant: bool,
 }
 
 fn plans_dir() -> PathBuf {
@@ -211,7 +216,13 @@ fn plan_of(case: &Case, defaults: Bounds) -> (String, Option<String>) {
     // own newlines, which PromQL treats as whitespace.
     let query = case.query.trim_end();
     let plan = rt
-        .block_on(engine.plan_async(&source, query, range))
+        .block_on(async {
+            if case.instant {
+                engine.plan_instant_async(&source, query, b.start_ms).await
+            } else {
+                engine.plan_async(&source, query, range).await
+            }
+        })
         .expect("the query plans");
     let logical = promql_engine::explain_plan(&plan);
     // The engine's own physical plan, not one lowered here, so the text is
@@ -302,7 +313,14 @@ macro_rules! plan_files {
     };
 }
 
-plan_files!(aggregators, at_modifier, functions, operators, selectors);
+plan_files!(
+    aggregators,
+    at_modifier,
+    functions,
+    operators,
+    range_queries,
+    selectors
+);
 
 // The physical plan decides what the logical plan cannot: whether the
 // selector aggregate holds one open series per partition (Sorted) or every

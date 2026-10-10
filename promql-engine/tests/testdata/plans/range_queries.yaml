@@ -1,0 +1,22 @@
+# Plan pins for the topic of promql-conformance/testdata/prometheus/range_queries.test.
+# tests/plan.rs says what a case holds and how to add one.
+defaults:
+  start_ms: 60000
+  end_ms: 60000
+  step_ms: 1000
+
+tests:
+  - name: a range selector answered by an instant query
+    description: >
+      No aggregate and no grid: matrixSelector keeps the samples of one
+      window under their own timestamps, so the scan's rows are filtered
+      where they lie. The window is the evaluation time less the range,
+      open at its start.
+    instant: true
+    load:
+      - some_metric{env="a"} 0
+    query: |
+      some_metric[1m]
+    plan: |
+      Projection: promql_matrix_selector(selector_0.samples, Int64(0), Int64(60000))
+        TableScan: some_metric

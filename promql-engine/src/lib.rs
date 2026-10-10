@@ -42,6 +42,7 @@ pub(crate) mod labels;
 mod labelset;
 mod matcher;
 pub mod math; // benches/kernels.rs
+pub(crate) mod matrix;
 pub(crate) mod memory;
 pub(crate) mod params;
 pub(crate) mod plan;

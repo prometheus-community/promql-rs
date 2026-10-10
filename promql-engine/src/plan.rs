@@ -44,8 +44,8 @@ use datafusion::common::{Column, ScalarValue};
 use datafusion::datasource::{provider_as_source, MemTable};
 use datafusion::logical_expr::{col, lit, LogicalPlan, LogicalPlanBuilder};
 use promql_parser::ast::{
-    AggregateExpr, AtModifier, BinaryExpr, Call, Expr, UnaryExpr, VectorMatchCardinality,
-    VectorSelector,
+    AggregateExpr, AtModifier, BinaryExpr, Call, Expr, MatrixSelector, UnaryExpr,
+    VectorMatchCardinality, VectorSelector,
 };
 use promql_parser::token::ItemType;
 
@@ -56,6 +56,7 @@ use crate::elementwise;
 use crate::error::EngineError;
 use crate::labels;
 use crate::matcher::{effective_matchers, METRIC_NAME};
+use crate::matrix;
 use crate::params::{step_count, Params};
 use crate::range::{self, Func};
 use crate::selector;
@@ -201,7 +202,11 @@ async fn plan_grid(
         selectors: 0,
         stages: 0,
     };
-    Ok(planner.expr(expr, Above::default()).await?.plan)
+    let planned = match range_selector(expr) {
+        Some(ms) => planner.matrix(ms).await?,
+        None => planner.expr(expr, Above::default()).await?,
+    };
+    Ok(planned.plan)
 }
 
 /// The parse-time rules upstream holds an expression to before any of
@@ -636,15 +641,7 @@ impl Planner<'_> {
     /// the step they were evaluated at, and `funcTimestamp` reads that;
     /// `timestamp(abs(x))` is the step, where `timestamp(x)` is not.
     async fn timestamp(&mut self, call: &Call, above: Above<'_>) -> Result<Planned, EngineError> {
-        let mut arg = &call.args[0];
-        loop {
-            arg = match arg {
-                Expr::Paren(p) => &p.expr,
-                Expr::StepInvariant(e) => e,
-                _ => break,
-            };
-        }
-        match arg {
+        match unwrap_arg(&call.args[0]) {
             Expr::VectorSelector(vs) => {
                 self.selector(
                     vs,
@@ -1144,22 +1141,24 @@ impl Planner<'_> {
         grouping: Option<&Grouping>,
     ) -> Result<Planned, EngineError> {
         let (ms, vs) = match call.args.as_slice() {
-            [Expr::MatrixSelector(ms)] => match ms.vector_selector.as_ref() {
-                Expr::VectorSelector(vs) => (ms, vs),
+            [arg] => match unwrap_arg(arg) {
+                Expr::MatrixSelector(ms) => match ms.vector_selector.as_ref() {
+                    Expr::VectorSelector(vs) => (ms, vs),
+                    other => {
+                        return Err(EngineError::Unsupported(format!(
+                            "a range selector over {}",
+                            describe(other)
+                        )))
+                    }
+                },
+                Expr::Subquery(_) => return Err(EngineError::Unsupported("a subquery".into())),
                 other => {
                     return Err(EngineError::Unsupported(format!(
-                        "a range selector over {}",
+                        "the {name} function over {}",
                         describe(other)
                     )))
                 }
             },
-            [Expr::Subquery(_)] => return Err(EngineError::Unsupported("a subquery".into())),
-            [other] => {
-                return Err(EngineError::Unsupported(format!(
-                    "the {name} function over {}",
-                    describe(other)
-                )))
-            }
             // Out of reach: every range function this engine knows takes
             // exactly one argument, and `check_call` has already said so.
             _ => {
@@ -1222,6 +1221,59 @@ impl Planner<'_> {
         let (labels_expr, label_names) = labels::keep(&input_names, |n| n != METRIC_NAME);
         let plan = builder
             .project(canonical(labels_expr.alias(LABELS)))?
+            .build()?;
+        Ok(Planned { plan, label_names })
+    }
+
+    /// A range selector as the whole of an instant query: upstream's
+    /// `matrixSelector` (`promql/engine.go` at 83962c35), which hands back
+    /// each series' samples in the window ending at the evaluation time
+    /// less the offset, or at the `@` time less it.
+    ///
+    /// Only an instant query reaches here, and only at the root: a range
+    /// selector anywhere else is the argument of a function that reads
+    /// it, planned by `range_over`, and `matrixSelector` itself panics
+    /// when the evaluation has more than one step.
+    async fn matrix(&mut self, ms: &MatrixSelector) -> Result<Planned, EngineError> {
+        let Expr::VectorSelector(vs) = ms.vector_selector.as_ref() else {
+            return Err(EngineError::Unsupported(format!(
+                "a range selector over {}",
+                describe(&ms.vector_selector)
+            )));
+        };
+        if ms.range_expr.is_some() {
+            return Err(EngineError::Unsupported(
+                "a range given as a duration expression".into(),
+            ));
+        }
+        debug_assert_eq!(self.query.start_ms, self.query.end_ms);
+        let params = Params {
+            start_ms: self.query.start_ms,
+            end_ms: self.query.end_ms,
+            step_ms: self.query.step_ms,
+            window_ms: duration_ms("the range", ms.range_secs)?,
+            offset_ms: offset_ms(vs)?,
+            at_ms: resolve_at(vs, self.query),
+        };
+        check_selector_bounds(params.at_ms, params.offset_ms)?;
+        check_time_bound("the range", params.window_ms)?;
+        // Told to the store as any range selector is, so that it reaches
+        // back by the range at the block it cuts. There is no function
+        // above the selector to name.
+        let hints = self.hints(&params, Some(params.window_ms), Above::default());
+        let (builder, label_names) = self.scan(vs, hints).await?;
+        let maxt = params.at_ms.unwrap_or(params.start_ms) - params.offset_ms;
+        let window = matrix::Window {
+            mint: maxt - params.window_ms,
+            maxt,
+        };
+        let plan = builder
+            .project(vec![
+                col(LABELS),
+                matrix::call(col(SAMPLES), window).alias(SAMPLES),
+                col(BLOCK_START),
+                col(BLOCK_END),
+            ])?
             .build()?;
         Ok(Planned { plan, label_names })
     }
@@ -1373,7 +1425,7 @@ fn check_range_modifiers(call: &Call) -> Result<(), EngineError> {
     const ANCHORED_SAFE: [&str; 5] = ["changes", "delta", "increase", "rate", "resets"];
     const SMOOTHED_SAFE: [&str; 3] = ["delta", "increase", "rate"];
 
-    let Some(vs) = call.args.iter().find_map(|a| match a {
+    let Some(vs) = call.args.iter().find_map(|a| match unwrap_arg(a) {
         Expr::MatrixSelector(ms) => match ms.vector_selector.as_ref() {
             Expr::VectorSelector(vs) => Some(vs),
             _ => None,
@@ -1418,6 +1470,28 @@ fn reject_unsupported_modifiers(vs: &VectorSelector) -> Result<(), EngineError> 
         ));
     }
     Ok(())
+}
+
+/// What upstream's `evalCall` does to every argument before it reads it:
+/// `unwrapParenExpr`, then `unwrapStepInvariantExpr`. `rate((x[5m]))` is
+/// `rate(x[5m])`, and `timestamp((x))` reads a bare selector.
+fn unwrap_arg(mut arg: &Expr) -> &Expr {
+    loop {
+        arg = match arg {
+            Expr::Paren(p) => &p.expr,
+            Expr::StepInvariant(e) => e,
+            _ => return arg,
+        };
+    }
+}
+
+/// The range selector a whole query is, however parenthesised: the one
+/// expression an instant query answers that is not a value per step.
+fn range_selector(expr: &Expr) -> Option<&MatrixSelector> {
+    match unwrap_arg(expr) {
+        Expr::MatrixSelector(ms) => Some(ms),
+        _ => None,
+    }
 }
 
 /// The text of a query that is nothing but a string literal, however

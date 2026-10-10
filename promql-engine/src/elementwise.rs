@@ -656,7 +656,7 @@ pub fn apply(samples: &ListArray, bound: Option<Bound>) -> Result<ListArray> {
 /// `holds` spans the whole child array, and a sliced list's rows need
 /// not: only the stretch its offsets cover is filtered, or the samples
 /// outside it would land in the first and last rows.
-fn filtered(
+pub(crate) fn filtered(
     samples: &ListArray,
     timestamps: &ArrayRef,
     values: &Float64Array,
