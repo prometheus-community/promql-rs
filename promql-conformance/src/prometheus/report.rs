@@ -31,12 +31,10 @@ pub struct FileStats {
     /// Evals of experimental syntax, left out of `evals` and everything
     /// derived from it. See [`Verdict::Gated`].
     pub gated: usize,
-    /// Evals with native histograms in play, passing or not. The three
-    /// of `histograms`, `subqueries` and the rest partition `evals`, with
-    /// histograms winning an eval that is both, so the columns add up.
+    /// With `subqueries` and the core, partitions `evals` by [`Category`],
+    /// so the columns add up.
     pub histograms: usize,
     pub subqueries: usize,
-    /// Passes among the evals that are neither.
     pub core_passed: usize,
 }
 
@@ -66,27 +64,57 @@ fn percent(part: usize, whole: usize) -> f64 {
     }
 }
 
-/// Why a core eval fails, one per eval.
+/// The part of PromQL an eval exercises, exactly one per eval.
 ///
-/// Ordered by who can act: native histograms and subqueries are named
-/// feature areas that are parked, so an eval in either is not a finding
-/// about anything else. Only what is left over says how far the engine is
-/// from the whole of the rest of the language.
+/// Taken from the eval and never from its verdict, so an eval that starts
+/// passing moves a numerator and no denominator. The core is the target;
+/// the other three are feature areas parked on purpose, and an eval in one
+/// of them says nothing about the rest of the language.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Reason {
+pub enum Category {
+    FlagGated,
     NativeHistograms,
     Subquery,
+    Core,
+}
+
+/// First match wins, in the order of [`Category`]: a gated eval is held
+/// out of the core totals and `SUPPORTED.toml` whatever else it touches.
+pub fn category(o: &Outcome) -> Category {
+    if matches!(o.verdict, Verdict::Gated { .. }) {
+        Category::FlagGated
+    } else if o.histograms {
+        Category::NativeHistograms
+    } else if o.subquery {
+        Category::Subquery
+    } else {
+        Category::Core
+    }
+}
+
+/// Whether the eval passed, looking through a gate.
+fn passed(o: &Outcome) -> bool {
+    match &o.verdict {
+        Verdict::Gated { verdict, .. } => verdict.is_pass(),
+        v => v.is_pass(),
+    }
+}
+
+/// Why a core eval fails. Only the core gets a reason: the other
+/// categories already say what an eval is waiting on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reason {
     MissingFeature,
     Unattributed,
 }
 
-/// First match wins. `None` for a pass and for a gated eval, which are not
-/// failures of the core language.
+/// `None` for a pass and for every eval outside the core.
 pub fn reason(o: &Outcome) -> Option<Reason> {
+    if category(o) != Category::Core {
+        return None;
+    }
     match o.verdict {
-        Verdict::Pass | Verdict::Gated(_) => None,
-        _ if o.histograms => Some(Reason::NativeHistograms),
-        _ if o.subquery => Some(Reason::Subquery),
+        Verdict::Pass => None,
         Verdict::Unsupported(_) => Some(Reason::MissingFeature),
         _ => Some(Reason::Unattributed),
     }
@@ -105,22 +133,21 @@ pub fn per_file(outcomes: &[Outcome]) -> Vec<FileStats> {
             subqueries: 0,
             core_passed: 0,
         });
-        if matches!(o.verdict, Verdict::Gated(_)) {
-            stats.gated += 1;
-            continue;
+        match category(o) {
+            Category::FlagGated => {
+                stats.gated += 1;
+                continue;
+            }
+            Category::NativeHistograms => stats.histograms += 1,
+            Category::Subquery => stats.subqueries += 1,
+            Category::Core if o.verdict.is_pass() => stats.core_passed += 1,
+            Category::Core => {}
         }
         stats.evals += 1;
         match o.verdict {
             Verdict::Pass => stats.passed += 1,
             Verdict::Skipped(_) => stats.skipped += 1,
             _ => {}
-        }
-        if o.histograms {
-            stats.histograms += 1;
-        } else if o.subquery {
-            stats.subqueries += 1;
-        } else if o.verdict.is_pass() {
-            stats.core_passed += 1;
         }
     }
     let mut stats: Vec<FileStats> = by_file.into_values().collect();
@@ -133,9 +160,34 @@ pub fn per_file(outcomes: &[Outcome]) -> Vec<FileStats> {
     stats
 }
 
-/// Missing engine features, and how many evals each blocks. Only evals
-/// whose [`Reason`] is the feature: one that also has native histograms or
-/// a subquery is counted under that, so the rows sum to the reasons table.
+/// Passing and total evals in one category.
+pub fn category_counts(outcomes: &[Outcome], c: Category) -> (usize, usize) {
+    let evals = outcomes.iter().filter(|o| category(o) == c);
+    (evals.clone().filter(|o| passed(o)).count(), evals.count())
+}
+
+/// Passing and total gated evals per flag the parser knows, in its order.
+/// An eval needing two flags counts under both, so the rows can sum to
+/// more than the gated total.
+pub fn gated_by_flag(outcomes: &[Outcome]) -> Vec<(&'static str, usize, usize)> {
+    promql_parser::FEATURE_FLAGS
+        .iter()
+        .map(|f| {
+            let evals = outcomes.iter().filter(|o| match &o.verdict {
+                Verdict::Gated { flags, .. } => flags.split(", ").any(|x| x == f.flag),
+                _ => false,
+            });
+            (
+                f.flag,
+                evals.clone().filter(|o| passed(o)).count(),
+                evals.count(),
+            )
+        })
+        .collect()
+}
+
+/// Missing engine features, and how many core evals each blocks, so the
+/// rows sum to the reasons table.
 pub fn missing_features(outcomes: &[Outcome]) -> BTreeMap<&str, usize> {
     let mut features: BTreeMap<&str, usize> = BTreeMap::new();
     for o in outcomes {
@@ -146,29 +198,6 @@ pub fn missing_features(outcomes: &[Outcome]) -> BTreeMap<&str, usize> {
         }
     }
     features
-}
-
-/// Failing evals per reason, in the order the reasons are tried.
-pub fn reason_counts(outcomes: &[Outcome]) -> [(Reason, usize); 4] {
-    let count = |r| outcomes.iter().filter(|o| reason(o) == Some(r)).count();
-    [
-        Reason::NativeHistograms,
-        Reason::Subquery,
-        Reason::MissingFeature,
-        Reason::Unattributed,
-    ]
-    .map(|r| (r, count(r)))
-}
-
-/// How many gated evals each `--enable-feature` combination holds out.
-pub fn gated_by_flags(outcomes: &[Outcome]) -> BTreeMap<&str, usize> {
-    let mut gated: BTreeMap<&str, usize> = BTreeMap::new();
-    for o in outcomes {
-        if let Verdict::Gated(flags) = &o.verdict {
-            *gated.entry(flags.as_str()).or_default() += 1;
-        }
-    }
-    gated
 }
 
 /// The per-file table printed on every run.
@@ -232,16 +261,13 @@ pub fn scoreboard(outcomes: &[Outcome], supported: &Supported) -> String {
 /// shows up as a diff someone can be pleased about, rather than only as
 /// a number in a CI log nobody scrolls back to.
 pub fn inventory_markdown(outcomes: &[Outcome]) -> String {
-    let features = missing_features(outcomes);
-    let blocked: usize = features.values().sum();
     let stats = per_file(outcomes);
     let passed: usize = stats.iter().map(|s| s.passed).sum();
     let total: usize = stats.iter().map(|s| s.evals).sum();
-
-    let core_total: usize = stats.iter().map(|s| s.core_evals()).sum();
-    let core_passed: usize = stats.iter().map(|s| s.core_passed).sum();
-    let counts = reason_counts(outcomes);
-    let count_of = |r| counts.iter().find(|(x, _)| *x == r).map_or(0, |c| c.1);
+    let (core_passed, core_total) = category_counts(outcomes, Category::Core);
+    let (hist_passed, hist_total) = category_counts(outcomes, Category::NativeHistograms);
+    let (sub_passed, sub_total) = category_counts(outcomes, Category::Subquery);
+    let (gated_passed, gated_total) = category_counts(outcomes, Category::FlagGated);
 
     let mut out = String::new();
     out.push_str(
@@ -250,30 +276,42 @@ pub fn inventory_markdown(outcomes: &[Outcome]) -> String {
          ```sh\n\
          PROMQL_PROMQLTEST_BLESS=1 cargo test -p promql-conformance --test promqltest\n\
          ```\n\n\
-         Nothing here gates CI. This file is the roadmap, and the second line below is \
-         the target: when every eval that is neither native-histogram nor subquery \
-         passes, it reads 100%. Every failing eval is filed under exactly one reason, \
-         tried in the order of the table, so what is left under *unattributed* is the \
-         work nobody has named yet.\n\n",
+         Nothing here gates CI. This file is the roadmap, and the core line below is \
+         the target: it reads 100% when the engine passes every eval that is neither \
+         native histograms, subquery nor experimental syntax. \
+         An eval is native-histogram if an expected row is a native histogram sample \
+         or a selector in its query matches, by its label matchers, a series the active \
+         load blocks load with native histogram samples (`{{…}}`, or derived by \
+         `load_with_nhcb`). Each eval is in exactly one category, first match wins: \
+         flag-gated, native histograms, subquery, core. The category comes from the \
+         eval, never from whether it passes, so the denominators hold still.\n\n",
     );
 
-    let _ = writeln!(
+    // `scripts/progress` reads the first bold `N of M evals pass`, and only
+    // the total line may match it: the series it rebuilds started there.
+    let _ = write!(
         out,
-        "Against the vendored corpus: **{passed} of {total} evals pass** ({:.1}%), \
-         and **{blocked}** are blocked on the features below.\n",
-        percent(passed, total),
-    );
-    let _ = writeln!(
-        out,
-        "Excluding native histograms and subqueries: **{core_passed} of {core_total}** \
-         pass ({:.1}%). An eval is excluded if any series in its load blocks or its \
-         expected rows is a native histogram, or its query contains a subquery, \
-         whether it passes or not, so the denominator holds still.\n",
+        "**Core: {core_passed} of {core_total} evals pass ({:.1}%).**\n\n\
+         - Native histograms: {hist_passed} of {hist_total} pass.\n\
+         - Subqueries: {sub_passed} of {sub_total} pass.\n\
+         - Experimental (flag-gated): {gated_passed} of {gated_total} pass, run with \
+         every gate open and never in `SUPPORTED.toml`; `docs/feature-flags.md` lists \
+         the flags.\n",
         percent(core_passed, core_total),
     );
+    let by_flag = gated_by_flag(outcomes);
+    for (flag, p, t) in &by_flag {
+        let _ = writeln!(out, "  - `{flag}`: {p} of {t}");
+    }
+    if by_flag.iter().map(|f| f.2).sum::<usize>() > gated_total {
+        out.push_str("  - an eval needing two flags counts under both\n");
+    }
+    let _ = writeln!(
+        out,
+        "\nAll but the flag-gated: **{passed} of {total} evals pass** ({:.1}%).\n",
+        percent(passed, total),
+    );
 
-    // The failing core evals are exactly the two reasons with work in
-    // them; the other two are parked areas.
     let _ = write!(
         out,
         "## Core evals\n\n\
@@ -286,24 +324,23 @@ pub fn inventory_markdown(outcomes: &[Outcome]) -> String {
         core_total - core_passed,
     );
 
-    let failing: usize = counts.iter().map(|c| c.1).sum();
+    let count_of = |r| outcomes.iter().filter(|o| reason(o) == Some(r)).count();
+    let missing = count_of(Reason::MissingFeature);
+    let unattributed = count_of(Reason::Unattributed);
     let _ = write!(
         out,
-        "## Why evals fail\n\n\
+        "## Why core evals fail\n\n\
+         Each failing core eval is filed under a missing feature the engine names, or \
+         left unattributed: what is left there is the work nobody has named yet.\n\n\
          | failing evals | reason |\n|---:|---|\n\
-         | {} | native histograms |\n\
-         | {} | subquery |\n\
-         | {} | missing features |\n\
-         | {} | unattributed |\n\
-         | {failing} | **total** |\n\n",
-        count_of(Reason::NativeHistograms),
-        count_of(Reason::Subquery),
-        count_of(Reason::MissingFeature),
-        count_of(Reason::Unattributed),
+         | {missing} | missing features |\n\
+         | {unattributed} | unattributed |\n\
+         | {} | **total** |\n\n",
+        missing + unattributed,
     );
 
     out.push_str("## Missing features\n\n| evals blocked | feature |\n|---:|---|\n");
-    let mut rows: Vec<(&str, usize)> = features.into_iter().collect();
+    let mut rows: Vec<(&str, usize)> = missing_features(outcomes).into_iter().collect();
     rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
     for (feature, count) in rows {
         let _ = writeln!(out, "| {count} | {feature} |");
@@ -319,9 +356,9 @@ pub fn inventory_markdown(outcomes: &[Outcome]) -> String {
     if !unattributed.is_empty() {
         out.push_str(
             "\n## Unattributed failures\n\n\
-             Not native histograms, not a subquery, and the engine does not name a missing \
-             feature: wrong results, panics, errors nobody has classified. Ids are spelled \
-             as in `SUPPORTED.toml`.\n",
+             Core evals the engine does not name a missing feature for: wrong results, \
+             panics, errors nobody has classified. Ids are spelled as in \
+             `SUPPORTED.toml`.\n",
         );
         for (file, ids) in &unattributed {
             let _ = write!(out, "\n### {file} ({})\n\n", ids.len());
@@ -331,48 +368,37 @@ pub fn inventory_markdown(outcomes: &[Outcome]) -> String {
         }
     }
 
-    let gated = gated_by_flags(outcomes);
-    if !gated.is_empty() {
-        let total: usize = gated.values().sum();
-        let _ = write!(
-            out,
-            "\n## Left out: experimental syntax\n\n\
-             **{total}** more evals use syntax that stock Prometheus refuses unless an \
-             `--enable-feature` value is on. They are not part of the core language yet, \
-             so they are in no total above, in no row of the tables, and not in \
-             `SUPPORTED.toml`. The harness still evaluates them with every gate open; \
-             `docs/feature-flags.md` lists the flags.\n\n\
-             | evals | needs |\n|---:|---|\n"
-        );
-        let mut rows: Vec<(&str, usize)> = gated.into_iter().collect();
-        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-        for (flags, count) in rows {
-            let _ = writeln!(out, "| {count} | `{flags}` |");
-        }
-    }
-
     out.push_str(
         "\n## By file\n\n\
-         | file | evals | native histograms | subquery | passing | passing core | |\n\
-         |---|---:|---:|---:|---:|---:|---|\n",
+         | file | evals | native histograms | subquery | flag-gated | passing | passing core | |\n\
+         |---|---:|---:|---:|---:|---:|---:|---|\n",
     );
+    let mut stats = stats;
+    // Closest to a green core first; a file with no core evals has
+    // nothing to say about it and goes last.
+    stats.sort_by(|a, b| {
+        (b.core_evals() > 0)
+            .cmp(&(a.core_evals() > 0))
+            .then_with(|| b.core_percent().total_cmp(&a.core_percent()))
+            .then_with(|| b.core_evals().cmp(&a.core_evals()))
+            .then_with(|| a.file.cmp(&b.file))
+    });
     for s in &stats {
-        let note = if s.evals == 0 && s.gated > 0 {
-            "all gated — experimental syntax"
-        } else if s.is_fully_green() {
-            "fully green"
-        } else if s.skipped == s.evals {
-            "all skipped — native histograms"
+        let note = if s.core_evals() == 0 {
+            "no core evals"
+        } else if s.core_passed == s.core_evals() {
+            "core green"
         } else {
             ""
         };
         let _ = writeln!(
             out,
-            "| {} | {} | {} | {} | {} ({:.0}%) | {} of {} ({:.0}%) | {note} |",
+            "| {} | {} | {} | {} | {} | {} ({:.0}%) | {} of {} ({:.0}%) | {note} |",
             s.file,
             s.evals,
             s.histograms,
             s.subqueries,
+            s.gated,
             s.passed,
             s.percent(),
             s.core_passed,
@@ -473,18 +499,28 @@ mod tests {
         assert_eq!(features.len(), 2);
     }
 
+    fn gated(flags: &str, verdict: Verdict) -> Verdict {
+        Verdict::Gated {
+            flags: flags.into(),
+            verdict: Box::new(verdict),
+        }
+    }
+
     #[test]
-    fn gated_evals_are_in_no_total_and_are_listed_by_flag() {
+    fn gated_evals_are_in_no_total_and_are_counted_per_flag() {
         let mut outcomes = sample();
         outcomes.push(outcome(
             "fill",
             "1",
-            Verdict::Gated("promql-binop-fill-modifiers".into()),
+            gated("promql-binop-fill-modifiers", Verdict::Pass),
         ));
         outcomes.push(outcome(
             "half",
             "9",
-            Verdict::Gated("promql-extended-range-selectors".into()),
+            gated(
+                "promql-binop-fill-modifiers, promql-extended-range-selectors",
+                Verdict::Fail("x".into()),
+            ),
         ));
         let stats = per_file(&outcomes);
         let fill = stats.iter().find(|s| s.file == "fill").unwrap();
@@ -498,9 +534,21 @@ mod tests {
 
         let md = inventory_markdown(&outcomes);
         assert!(md.contains("**3 of 8 evals pass**"), "{md}");
-        assert!(md.contains("| 1 | `promql-binop-fill-modifiers` |"), "{md}");
-        assert!(md.contains("all gated"), "{md}");
-        assert!(!inventory_markdown(&sample()).contains("Left out"));
+        assert!(
+            md.contains("Experimental (flag-gated): 1 of 2 pass"),
+            "{md}"
+        );
+        assert!(md.contains("`promql-binop-fill-modifiers`: 1 of 2"), "{md}");
+        assert!(
+            md.contains("`promql-extended-range-selectors`: 0 of 1"),
+            "{md}"
+        );
+        assert!(md.contains("`promql-duration-expr`: 0 of 0"), "{md}");
+        assert!(md.contains("counts under both"), "{md}");
+        assert!(
+            md.contains("| fill | 0 | 0 | 0 | 1 | 0 (0%) | 0 of 0 (0%) | no core evals |"),
+            "{md}"
+        );
     }
 
     #[test]
@@ -527,7 +575,17 @@ mod tests {
         let baz = md.find("the baz function").expect("listed");
         assert!(frob < baz, "the bigger win should come first");
         assert!(md.contains("**3 of 8 evals pass**"), "{md}");
-        assert!(md.contains("all skipped"), "{md}");
+    }
+
+    /// The headline's total is the only text `scripts/progress` may read
+    /// as the pass count; a category line it matched first would rewrite
+    /// the series it rebuilds from git history.
+    #[test]
+    fn only_the_total_line_reads_as_the_progress_count() {
+        let md = inventory_markdown(&categorised());
+        let re = regex::Regex::new(r"\*\*([0-9]+) of ([0-9]+) evals pass\*\*").unwrap();
+        let found: Vec<_> = re.find_iter(&md).map(|m| m.as_str()).collect();
+        assert_eq!(found, ["**2 of 7 evals pass**"], "{md}");
     }
 
     fn flagged(id: &str, verdict: Verdict, histograms: bool, subquery: bool) -> Outcome {
@@ -538,10 +596,13 @@ mod tests {
         }
     }
 
-    /// One eval per reason, plus the two ways precedence can go wrong.
-    fn reasoned() -> Vec<Outcome> {
+    /// One eval per category, plus the ways precedence can go wrong: a
+    /// gated eval with histograms and a subquery, and an eval with both.
+    fn categorised() -> Vec<Outcome> {
         vec![
+            flagged("gated", gated("x", Verdict::Pass), true, true),
             flagged("hist", Verdict::Fail("x".into()), true, false),
+            flagged("both", Verdict::Pass, true, true),
             flagged("sub", Verdict::Fail("x".into()), false, true),
             flagged(
                 "feat",
@@ -549,66 +610,83 @@ mod tests {
                 false,
                 false,
             ),
-            flagged("rest", Verdict::Fail("wrong".into()), false, false),
-            // A histogram eval the engine would also call a missing
-            // feature, and one that is both histogram and subquery:
-            // each is filed once, under the first reason.
-            flagged(
-                "both",
-                Verdict::Unsupported("a subquery".into()),
-                true,
-                true,
-            ),
+            flagged("rest", Verdict::Skipped("x".into()), false, false),
+            flagged("pass", Verdict::Pass, false, false),
+            // Excluded from the core, so its missing feature is not one
+            // of the core's.
             flagged(
                 "sub-feat",
                 Verdict::Unsupported("a subquery".into()),
                 false,
                 true,
             ),
-            flagged("pass", Verdict::Pass, false, false),
-            flagged("pass-sub", Verdict::Pass, false, true),
-            flagged("gated", Verdict::Gated("flag".into()), false, false),
         ]
     }
 
     #[test]
-    fn every_failing_eval_gets_one_reason_and_first_match_wins() {
-        let by_id: Vec<_> = reasoned().iter().map(reason).collect();
+    fn every_eval_gets_one_category_and_first_match_wins() {
+        let got: Vec<_> = categorised().iter().map(category).collect();
+        use Category::*;
         assert_eq!(
-            by_id,
+            got,
             [
-                Some(Reason::NativeHistograms),
-                Some(Reason::Subquery),
+                FlagGated,
+                NativeHistograms,
+                NativeHistograms,
+                Subquery,
+                Core,
+                Core,
+                Core,
+                Subquery
+            ]
+        );
+        let reasons: Vec<_> = categorised().iter().map(reason).collect();
+        assert_eq!(
+            reasons,
+            [
+                None,
+                None,
+                None,
+                None,
                 Some(Reason::MissingFeature),
                 Some(Reason::Unattributed),
-                Some(Reason::NativeHistograms),
-                Some(Reason::Subquery),
-                None,
                 None,
                 None,
             ]
         );
-        assert_eq!(missing_features(&reasoned()).len(), 1);
+        assert_eq!(missing_features(&categorised()).len(), 1);
     }
 
     #[test]
-    fn the_core_denominator_ignores_whether_an_excluded_eval_passes() {
-        let stats = per_file(&reasoned());
-        let f = &stats[0];
-        // gated is outside every count; the passing subquery eval is
-        // excluded from the core but stays in the headline passes.
-        assert_eq!((f.evals, f.passed), (8, 2));
-        assert_eq!((f.histograms, f.subqueries), (2, 3));
+    fn each_category_counts_its_passes_against_its_own_evals() {
+        let outcomes = categorised();
+        let counts = |c| category_counts(&outcomes, c);
+        assert_eq!(counts(Category::FlagGated), (1, 1));
+        assert_eq!(counts(Category::NativeHistograms), (1, 2));
+        assert_eq!(counts(Category::Subquery), (0, 2));
+        assert_eq!(counts(Category::Core), (1, 3));
+
+        let f = &per_file(&outcomes)[0];
+        assert_eq!((f.evals, f.passed, f.gated), (7, 2, 1));
+        assert_eq!((f.histograms, f.subqueries), (2, 2));
         assert_eq!((f.core_evals(), f.core_passed), (3, 1));
 
-        let md = inventory_markdown(&reasoned());
-        assert!(md.contains("**1 of 3** pass (33.3%)"), "{md}");
+        let md = inventory_markdown(&outcomes);
+        assert!(md.contains("**Core: 1 of 3 evals pass (33.3%).**"), "{md}");
+        assert!(md.contains("- Native histograms: 1 of 2 pass."), "{md}");
+        assert!(md.contains("- Subqueries: 0 of 2 pass."), "{md}");
+        assert!(
+            md.contains("Experimental (flag-gated): 1 of 1 pass"),
+            "{md}"
+        );
         assert!(md.contains("| not passing | 2 |"), "{md}");
-        assert!(md.contains("| 2 | native histograms |"), "{md}");
-        assert!(md.contains("| 2 | subquery |"), "{md}");
         assert!(md.contains("| 1 | missing features |"), "{md}");
         assert!(md.contains("| 1 | unattributed |"), "{md}");
         assert!(md.contains("### f (1)\n\n- `rest`"), "{md}");
+        assert!(
+            md.contains("| f | 7 | 2 | 2 | 1 | 2 (29%) | 1 of 3 (33%) |  |"),
+            "{md}"
+        );
     }
 
     #[test]

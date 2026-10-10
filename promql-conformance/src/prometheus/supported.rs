@@ -426,7 +426,7 @@ fn why(verdict: &Verdict) -> String {
         Verdict::Pass => String::new(),
         Verdict::Fail(detail) => detail.clone(),
         Verdict::Skipped(reason) => format!("skipped: {reason}"),
-        Verdict::Gated(flags) => format!("gated behind {flags}"),
+        Verdict::Gated { flags, .. } => format!("gated behind {flags}"),
         Verdict::Unsupported(feature) => format!("{feature} is not supported yet"),
     }
 }

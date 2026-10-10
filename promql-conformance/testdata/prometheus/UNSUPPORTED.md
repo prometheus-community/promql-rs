@@ -6,53 +6,63 @@ Generated — do not edit by hand. Regenerated alongside `SUPPORTED.toml` by:
 PROMQL_PROMQLTEST_BLESS=1 cargo test -p promql-conformance --test promqltest
 ```
 
-Nothing here gates CI. This file is the roadmap, and the second line below is the target: when every eval that is neither native-histogram nor subquery passes, it reads 100%. Every failing eval is filed under exactly one reason, tried in the order of the table, so what is left under *unattributed* is the work nobody has named yet.
+Nothing here gates CI. This file is the roadmap, and the core line below is the target: it reads 100% when the engine passes every eval that is neither native histograms, subquery nor experimental syntax. An eval is native-histogram if an expected row is a native histogram sample or a selector in its query matches, by its label matchers, a series the active load blocks load with native histogram samples (`{{…}}`, or derived by `load_with_nhcb`). Each eval is in exactly one category, first match wins: flag-gated, native histograms, subquery, core. The category comes from the eval, never from whether it passes, so the denominators hold still.
 
-Against the vendored corpus: **677 of 1825 evals pass** (37.1%), and **186** are blocked on the features below.
+**Core: 675 of 955 evals pass (70.7%).**
 
-Excluding native histograms and subqueries: **467 of 760** pass (61.4%). An eval is excluded if any series in its load blocks or its expected rows is a native histogram, or its query contains a subquery, whether it passes or not, so the denominator holds still.
+- Native histograms: 2 of 805 pass.
+- Subqueries: 0 of 65 pass.
+- Experimental (flag-gated): 65 of 273 pass, run with every gate open and never in `SUPPORTED.toml`; `docs/feature-flags.md` lists the flags.
+  - `promql-experimental-functions`: 13 of 141
+  - `promql-duration-expr`: 0 of 0
+  - `promql-extended-range-selectors`: 8 of 88
+  - `promql-binop-fill-modifiers`: 44 of 44
+
+All but the flag-gated: **677 of 1825 evals pass** (37.1%).
 
 ## Core evals
 
 | | evals |
 |---|---:|
-| total | 760 |
-| passing | 467 |
-| not passing | 293 |
+| total | 955 |
+| passing | 675 |
+| not passing | 280 |
 
 The not-passing ones are the missing features and the unattributed failures below. Fixing those is what takes the core to 100%.
 
-## Why evals fail
+## Why core evals fail
+
+Each failing core eval is filed under a missing feature the engine names, or left unattributed: what is left there is the work nobody has named yet.
 
 | failing evals | reason |
 |---:|---|
-| 792 | native histograms |
-| 63 | subquery |
-| 186 | missing features |
-| 107 | unattributed |
-| 1148 | **total** |
+| 166 | missing features |
+| 114 | unattributed |
+| 280 | **total** |
 
 ## Missing features
 
 | evals blocked | feature |
 |---:|---|
-| 83 | the histogram_quantile function |
-| 56 | the histogram_fraction function |
+| 49 | the histogram_quantile function |
+| 29 | the histogram_fraction function |
 | 21 | the label_replace function |
-| 10 | the topk aggregation |
-| 6 | the label_join function |
-| 2 | the histogram_count function |
-| 2 | the histogram_sum function |
-| 1 | a range selector |
-| 1 | the histogram_avg function |
-| 1 | the histogram_stddev function |
-| 1 | the histogram_stdvar function |
-| 1 | the stddev_over_time function |
-| 1 | the stdvar_over_time function |
+| 19 | the topk aggregation |
+| 8 | the predict_linear function |
+| 8 | the quantile_over_time function |
+| 7 | the bottomk aggregation |
+| 7 | the label_join function |
+| 6 | the quantile aggregation |
+| 3 | the deriv function |
+| 3 | the stddev_over_time function |
+| 2 | a range selector |
+| 2 | the stdvar_over_time function |
+| 1 | the changes function over a parenthesized expression |
+| 1 | the rate function over a parenthesized expression |
 
 ## Unattributed failures
 
-Not native histograms, not a subquery, and the engine does not name a missing feature: wrong results, panics, errors nobody has classified. Ids are spelled as in `SUPPORTED.toml`.
+Core evals the engine does not name a missing feature for: wrong results, panics, errors nobody has classified. Ids are spelled as in `SUPPORTED.toml`.
 
 ### at_modifier (2)
 
@@ -113,8 +123,16 @@ Not native histograms, not a subquery, and the engine does not name a missing fe
 - `metric1_total offset min(range(), 8s) @ 50000..60000/5000`
 - `metric1_total offset range() @ 50000`
 
-### functions (33)
+### functions (41)
 
+- `label_join(testmetric, "dst", "-", "src", "src1", "src2") @ 0`
+- `label_join(testmetric, "dst", "-", "src", "src3", "src1") @ 0`
+- `label_join(testmetric, "dst", "", "emptysrc", "emptysrc1", "emptysrc2") @ 0`
+- `label_join(testmetric, "dst", ", ") @ 0`
+- `label_join(testmetric1, "dst", ", ", "src", "src1", "src2") @ 0`
+- `absent_over_time({job="grok"}[20m]) @ 1260000`
+- `absent_over_time({job="ingress"}[4m]) @ 300000`
+- `absent_over_time({job="ingress"}[4m]) @ 600000`
 - `step() @ 0..10000/5000`
 - `step() @ 0..20000/10000`
 - `step() @ 0..30000/15000`
@@ -149,11 +167,6 @@ Not native histograms, not a subquery, and the engine does not name a missing fe
 - `start() + range() @ 0..20000/10000`
 - `end() - range() @ 10000..50000/10000`
 
-### histograms (2)
-
-- `count(request_duration_seconds) @ 3000000`
-- `resets(histogram_with_reset[15m]) @ 600000`
-
 ### name_label_dropping (3)
 
 - `sum by (__name__) (rate({env="1"}[10m])) @ 600000`
@@ -163,6 +176,10 @@ Not native histograms, not a subquery, and the engine does not name a missing fe
 ### operators (1)
 
 - `-{job="api"} @ 0..1200000/1200000`
+
+### range_queries (1)
+
+- `some_metric_with_stale_marker[3m] @ 180000`
 
 ### type_and_unit (15)
 
@@ -182,40 +199,30 @@ Not native histograms, not a subquery, and the engine does not name a missing fe
 - `(http_requests_total{group="canary"} + 1) or http_requests_total{instance="1"} @ 3000000 #2`
 - `http_requests_total{job="api-server", instance="0", group="production"} == bool 100 @ 3000000 #2`
 
-## Left out: experimental syntax
-
-**273** more evals use syntax that stock Prometheus refuses unless an `--enable-feature` value is on. They are not part of the core language yet, so they are in no total above, in no row of the tables, and not in `SUPPORTED.toml`. The harness still evaluates them with every gate open; `docs/feature-flags.md` lists the flags.
-
-| evals | needs |
-|---:|---|
-| 141 | `promql-experimental-functions` |
-| 88 | `promql-extended-range-selectors` |
-| 44 | `promql-binop-fill-modifiers` |
-
 ## By file
 
-| file | evals | native histograms | subquery | passing | passing core | |
-|---|---:|---:|---:|---:|---:|---|
-| selectors | 31 | 0 | 0 | 31 (100%) | 31 of 31 (100%) | fully green |
-| extended_vectors | 30 | 0 | 0 | 30 (100%) | 30 of 30 (100%) | fully green |
-| literals | 25 | 0 | 0 | 25 (100%) | 25 of 25 (100%) | fully green |
-| trig_functions | 19 | 0 | 0 | 19 (100%) | 19 of 19 (100%) | fully green |
-| staleness | 17 | 0 | 0 | 17 (100%) | 17 of 17 (100%) | fully green |
-| collision | 2 | 0 | 0 | 2 (100%) | 2 of 2 (100%) | fully green |
-| fill-modifier | 1 | 0 | 0 | 1 (100%) | 1 of 1 (100%) | fully green |
-| type_and_unit | 58 | 0 | 0 | 43 (74%) | 43 of 58 (74%) |  |
-| range_queries | 16 | 7 | 0 | 11 (69%) | 8 of 9 (89%) |  |
-| operators | 213 | 165 | 0 | 141 (66%) | 47 of 48 (98%) |  |
-| name_label_dropping | 29 | 0 | 1 | 18 (62%) | 18 of 28 (64%) |  |
-| aggregators | 158 | 62 | 0 | 93 (59%) | 88 of 96 (92%) |  |
-| at_modifier | 69 | 0 | 29 | 35 (51%) | 35 of 40 (88%) |  |
-| functions | 383 | 240 | 4 | 193 (50%) | 85 of 139 (61%) |  |
-| duration_expression | 59 | 0 | 0 | 8 (14%) | 8 of 59 (14%) |  |
-| subquery | 34 | 3 | 29 | 2 (6%) | 2 of 2 (100%) |  |
-| histograms | 167 | 11 | 0 | 8 (5%) | 8 of 156 (5%) |  |
-| native_histograms | 514 | 514 | 0 | 0 (0%) | 0 of 0 (0%) |  |
-| info | 0 | 0 | 0 | 0 (0%) | 0 of 0 (0%) | all gated — experimental syntax |
-| limit | 0 | 0 | 0 | 0 (0%) | 0 of 0 (0%) | all gated — experimental syntax |
+| file | evals | native histograms | subquery | flag-gated | passing | passing core | |
+|---|---:|---:|---:|---:|---:|---:|---|
+| selectors | 31 | 0 | 0 | 0 | 31 (100%) | 31 of 31 (100%) | core green |
+| extended_vectors | 30 | 0 | 0 | 88 | 30 (100%) | 30 of 30 (100%) | core green |
+| literals | 25 | 0 | 0 | 0 | 25 (100%) | 25 of 25 (100%) | core green |
+| trig_functions | 19 | 0 | 0 | 0 | 19 (100%) | 19 of 19 (100%) | core green |
+| staleness | 17 | 0 | 0 | 0 | 17 (100%) | 17 of 17 (100%) | core green |
+| collision | 2 | 0 | 0 | 0 | 2 (100%) | 2 of 2 (100%) | core green |
+| subquery | 34 | 2 | 30 | 0 | 2 (6%) | 2 of 2 (100%) | core green |
+| fill-modifier | 1 | 0 | 0 | 44 | 1 (100%) | 1 of 1 (100%) | core green |
+| operators | 213 | 72 | 0 | 0 | 141 (66%) | 139 of 141 (99%) |  |
+| at_modifier | 69 | 0 | 29 | 2 | 35 (51%) | 35 of 40 (88%) |  |
+| range_queries | 16 | 2 | 0 | 2 | 11 (69%) | 11 of 14 (79%) |  |
+| aggregators | 158 | 35 | 0 | 2 | 93 (59%) | 93 of 123 (76%) |  |
+| type_and_unit | 58 | 0 | 0 | 0 | 43 (74%) | 43 of 58 (74%) |  |
+| functions | 383 | 99 | 5 | 30 | 193 (50%) | 193 of 279 (69%) |  |
+| name_label_dropping | 29 | 0 | 1 | 1 | 18 (62%) | 18 of 28 (64%) |  |
+| duration_expression | 59 | 0 | 0 | 0 | 8 (14%) | 8 of 59 (14%) |  |
+| histograms | 167 | 84 | 0 | 18 | 8 (5%) | 8 of 83 (10%) |  |
+| native_histograms | 514 | 511 | 0 | 7 | 0 (0%) | 0 of 3 (0%) |  |
+| info | 0 | 0 | 0 | 42 | 0 (0%) | 0 of 0 (0%) | no core evals |
+| limit | 0 | 0 | 0 | 37 | 0 (0%) | 0 of 0 (0%) | no core evals |
 
 ---
 

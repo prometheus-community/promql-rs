@@ -32,7 +32,7 @@ use std::collections::BTreeMap;
 
 use promql_parser::SeriesDescription;
 
-use super::script::{Command, Eval, Expected, Range, Script, Timing, Unsupported};
+use super::script::{Command, Eval, Expected, LoadBlock, Range, Script, Timing, Unsupported};
 use crate::result::{
     Engine, EngineError, Labels, LoadedSeries, Point, QueryResult, Sample, Series,
 };
@@ -87,9 +87,13 @@ pub enum Verdict {
     /// The query is experimental syntax: stock Prometheus refuses it unless
     /// the named `--enable-feature` values are on. Not part of the core
     /// language yet, so it is left out of the totals, the supported list and
-    /// the trials; the harness still runs it, with every gate open, so the
-    /// engine is not asked a different question than the script wrote.
-    Gated(String),
+    /// the trials. It still runs, with every gate open, and `verdict` is how
+    /// that went, so the report can say how far each flag's syntax is along
+    /// without a passing eval ever reaching the allowlist.
+    Gated {
+        flags: String,
+        verdict: Box<Verdict>,
+    },
 }
 
 impl Verdict {
@@ -122,11 +126,12 @@ pub struct Outcome {
     /// Whether the eval carried `expect warn`/`info` assertions that
     /// were parsed but not checked.
     pub unchecked_annotations: bool,
-    /// Native histograms anywhere in the eval's world: any series in an
-    /// active load block, or any expected row. Deliberately blunt — the
-    /// query is not matched against the series it reads, unlike
-    /// [`might_read`] — because the report wants one cheap, stable
-    /// partition of the corpus, not a per-eval dependency analysis.
+    /// The eval is about native histograms: an expected row is one, or a
+    /// selector in the query matches a series an active load block loads
+    /// as one. Matched by label matchers, not by whether a histogram sits
+    /// anywhere in the block: `operators.test` seeds one histogram series
+    /// next to the floats 165 evals read, and filing those under
+    /// histograms hid real float gaps.
     pub histograms: bool,
     /// The query contains a subquery. Counted for passing evals too, so
     /// the report's denominator does not move when one starts passing.
@@ -147,10 +152,10 @@ struct Block {
     /// block that 165 float evals also read from, and skipping all of
     /// them would throw away most of the file.
     missing: Vec<Option<String>>,
-    /// Whether any of the unparsed lines is a histogram descriptor. Reads
-    /// the verdict [`super::script`] already reached on each line rather
-    /// than sniffing `{{` a second time here.
-    histograms: bool,
+    /// Label sets of the series this block loads with native histogram
+    /// samples. `None` for a line whose labels could not be read, which
+    /// any selector is taken to match.
+    histograms: Vec<Option<Labels>>,
 }
 
 /// Whether a query could be reading one of the series we failed to load.
@@ -231,10 +236,7 @@ pub fn run_script(engine: &dyn Engine, script: &Script) -> Vec<Outcome> {
                     .unsupported()
                     .map(|u| metric_name(&u.text))
                     .collect(),
-                histograms: load
-                    .block
-                    .unsupported()
-                    .any(|u| u.reason == Unsupported::NativeHistogram),
+                histograms: histogram_series(&load.block),
             }),
             Command::Eval(eval) => {
                 let key = case_key(eval);
@@ -264,11 +266,150 @@ pub fn run_script(engine: &dyn Engine, script: &Script) -> Vec<Outcome> {
 }
 
 fn has_histograms(eval: &Eval, active: &[Block]) -> bool {
-    active.iter().any(|b| b.histograms)
-        || eval
-            .unsupported
+    eval.unsupported
+        .iter()
+        .any(|u| u.reason == Unsupported::NativeHistogram)
+        || selects_histogram(&eval.query, active)
+}
+
+/// The series a block holds as native histograms, as upstream's `loadCmd`
+/// would store them: every `{{…}}` line, and under `load_with_nhcb` the
+/// series `appendCustomHistogram` derives from classic `_bucket`, `_sum`
+/// and `_count` lines. The derived ones are floats in the text, so missing
+/// them would file `histogram_quantile(0.5, foo)` as a core failure.
+fn histogram_series(block: &LoadBlock) -> Vec<Option<Labels>> {
+    let mut out: Vec<Option<Labels>> = block
+        .unsupported()
+        .filter(|u| u.reason == Unsupported::NativeHistogram)
+        .map(|u| series_labels(&u.text))
+        .collect();
+    if block.with_nhcb {
+        for desc in block.parsed() {
+            let mut labels = labels_of(desc);
+            let Some(name) = labels.get(METRIC_NAME) else {
+                continue;
+            };
+            // `GetHistogramMetricBaseName`: first suffix that cuts wins.
+            let Some(base) = ["_bucket", "_sum", "_count"]
+                .iter()
+                .find_map(|s| name.strip_suffix(s))
+            else {
+                continue;
+            };
+            let base = base.to_string();
+            labels.insert(METRIC_NAME.to_string(), base);
+            labels.remove("le");
+            if !out.contains(&Some(labels.clone())) {
+                out.push(Some(labels));
+            }
+        }
+    }
+    out
+}
+
+const METRIC_NAME: &str = "__name__";
+
+/// The labels of a series line the series grammar rejects for its values.
+/// The label part alone, with a stand-in value, is a line it accepts, so
+/// quoting and `{__name__="…"}` spellings are read by the real grammar.
+fn series_labels(line: &str) -> Option<Labels> {
+    let line = line.trim();
+    let mut end = line
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+        .unwrap_or(line.len());
+    if line[end..].starts_with('{') && !line[end..].starts_with("{{") {
+        let mut quoted = false;
+        let mut escaped = false;
+        let close = line[end..].char_indices().find(|&(_, c)| {
+            match (quoted, escaped, c) {
+                (true, true, _) => escaped = false,
+                (true, false, '\\') => escaped = true,
+                (_, false, '"') => quoted = !quoted,
+                (false, _, '}') => return true,
+                _ => {}
+            }
+            false
+        })?;
+        end += close.0 + 1;
+    }
+    let desc = promql_parser::parse_series_desc(&format!("{} 1", &line[..end])).ok()?;
+    Some(labels_of(&desc))
+}
+
+/// Whether a selector in `query` matches a series an active block loads as
+/// a native histogram, by Prometheus's matcher rules: a label the series
+/// lacks compares as `""`, and a regex matches the whole value.
+fn selects_histogram(query: &str, active: &[Block]) -> bool {
+    use promql_engine::CompiledMatcher;
+    use promql_parser::ast::{LabelMatcher, MatchOp, VectorSelector};
+    use promql_parser::{Expr, ParserOptions};
+
+    let series: Vec<&Option<Labels>> = active.iter().flat_map(|b| &b.histograms).collect();
+    if series.is_empty() {
+        return false;
+    }
+    fn selectors<'a>(e: &'a Expr, out: &mut Vec<&'a VectorSelector>) {
+        match e {
+            Expr::VectorSelector(vs) => out.push(vs),
+            Expr::Binary(b) => {
+                selectors(&b.lhs, out);
+                selectors(&b.rhs, out);
+            }
+            Expr::Aggregate(a) => {
+                if let Some(p) = a.param.as_deref() {
+                    selectors(p, out);
+                }
+                selectors(&a.expr, out);
+            }
+            Expr::Call(c) => c.args.iter().for_each(|a| selectors(a, out)),
+            Expr::MatrixSelector(m) => selectors(&m.vector_selector, out),
+            Expr::Subquery(s) => selectors(&s.expr, out),
+            Expr::Paren(p) => selectors(&p.expr, out),
+            Expr::Unary(u) => selectors(&u.expr, out),
+            Expr::StepInvariant(e) => selectors(e, out),
+            Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::Duration(_) => {}
+        }
+    }
+    let Ok(expr) = promql_parser::Parser::new(ParserOptions::all()).parse_expr(query) else {
+        // No selectors to match, so fall back to the names it mentions.
+        // The histogram trim operators `</` and `>/` do not parse yet, and
+        // without this their evals would read as core failures.
+        let names: Vec<&str> = series
             .iter()
-            .any(|u| u.reason == Unsupported::NativeHistogram)
+            .filter_map(|l| l.as_ref()?.get(METRIC_NAME).map(String::as_str))
+            .collect();
+        return series.iter().any(|l| l.is_none())
+            || query
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+                .any(|word| names.contains(&word));
+    };
+    let mut found = Vec::new();
+    selectors(&expr, &mut found);
+    found.iter().any(|vs| {
+        // The parser keeps a bare name out of the matchers; upstream folds
+        // it into a `__name__` one, and so must the match.
+        let name = (!vs.name.is_empty()).then(|| LabelMatcher {
+            name: METRIC_NAME.to_string(),
+            op: MatchOp::Equal,
+            value: vs.name.clone(),
+            pos_range: Default::default(),
+        });
+        let Ok(matchers) = vs
+            .label_matchers
+            .iter()
+            .chain(&name)
+            .map(|m| CompiledMatcher::compile(m).map(|c| (m.name.as_str(), c)))
+            .collect::<Result<Vec<_>, _>>()
+        else {
+            return false;
+        };
+        series.iter().any(|labels| {
+            let Some(labels) = labels else { return true };
+            matchers
+                .iter()
+                .all(|(name, m)| m.matches(labels.get(*name).map_or("", String::as_str)))
+        })
+    })
 }
 
 /// Parsed with every gate open, so an experimental-syntax query is still
@@ -333,9 +474,17 @@ fn gating_flags(query: &str) -> Option<String> {
 }
 
 fn run_eval(engine: &dyn Engine, eval: &Eval, active: &[Block]) -> Verdict {
-    if let Some(flags) = gating_flags(&eval.query) {
-        return Verdict::Gated(flags);
+    let verdict = evaluate(engine, eval, active);
+    match gating_flags(&eval.query) {
+        Some(flags) => Verdict::Gated {
+            flags,
+            verdict: Box::new(verdict),
+        },
+        None => verdict,
     }
+}
+
+fn evaluate(engine: &dyn Engine, eval: &Eval, active: &[Block]) -> Verdict {
     if !eval.is_supported() {
         return Verdict::Skipped(format!(
             "{} expected row(s) we cannot read: {}",
@@ -979,26 +1128,137 @@ mod tests {
         }
     }
 
-    /// The report's partition rests on these two flags: a histogram
-    /// anywhere in the eval's world, however unrelated to the query, and
-    /// a subquery anywhere in the query.
-    #[test]
-    fn outcomes_flag_native_histograms_and_subqueries() {
-        let script = parse(
-            "t",
-            "load 1m\n  a 1 2\nclear\nload 1m\n  a 1 2\n  h {{schema:0 sum:1 count:1}}\n\n\
-             eval instant at 0m a\n  a 1\n\n\
-             eval instant at 0m sum(max_over_time(a[2m:1m]))\n  {} 1\n\n\
-             eval instant at 0m a\n  a {{schema:0 sum:1 count:1}}\n",
-        )
-        .expect("the snippet parses");
+    fn categories(input: &str) -> Vec<super::super::report::Category> {
+        let script = parse("t", input).expect("the snippet parses");
         let engine = Stub(|_: &str| Err(EngineError::Unsupported("x".into())));
-        let flags: Vec<_> = run_script(&engine, &script)
+        run_script(&engine, &script)
             .iter()
-            .map(|o| (o.histograms, o.subquery))
-            .collect();
-        assert_eq!(flags, [(true, false), (true, true), (true, false)]);
+            .map(super::super::report::category)
+            .collect()
+    }
 
+    const HIST: &str = "{{schema:0 sum:1 count:1}}";
+
+    #[test]
+    fn each_category_is_read_off_the_eval() {
+        use super::super::report::Category::*;
+        let script = format!(
+            "load 1m\n  a 1 2\n  h {HIST}\n\n\
+             eval instant at 0m mad_over_time(h[5m])\n  {{}} 1\n\n\
+             eval instant at 0m h\n  h 1\n\n\
+             eval instant at 0m sum(max_over_time(a[2m:1m]))\n  {{}} 1\n\n\
+             eval instant at 0m a\n  a 1\n\n\
+             eval instant at 0m a\n  a {HIST}\n"
+        );
+        assert_eq!(
+            categories(&script),
+            [
+                FlagGated,
+                NativeHistograms,
+                Subquery,
+                Core,
+                NativeHistograms
+            ]
+        );
+    }
+
+    /// The coarse rule this replaces filed 165 of `operators.test`'s evals
+    /// under histograms for one histogram series seeded beside them.
+    #[test]
+    fn a_float_eval_sharing_a_block_with_a_histogram_stays_core() {
+        use super::super::report::Category::*;
+        let script = format!(
+            "load 1m\n  a{{job=\"x\"}} 1 2\n  h{{job=\"y\"}} {HIST}\n\n\
+             eval instant at 0m a\n  a{{job=\"x\"}} 1\n\n\
+             eval instant at 0m sum({{job=\"x\"}})\n  {{}} 1\n\n\
+             eval instant at 0m a + ignoring(job) h\n  {{}} 1\n"
+        );
+        assert_eq!(categories(&script), [Core, Core, NativeHistograms]);
+    }
+
+    #[test]
+    fn a_selector_matching_a_histogram_by_its_matchers_is_native_histogram() {
+        use super::super::report::Category::*;
+        let script = format!(
+            "load 1m\n  a{{job=\"x\"}} 1 2\n  {{__name__=\"h\", job=\"y\"}} {HIST}\n\n\
+             eval instant at 0m sum({{job=\"y\"}})\n  {{}} 1\n\n\
+             eval instant at 0m count({{__name__=~\"a|h\", job!=\"x\"}})\n  {{}} 1\n\n\
+             eval instant at 0m count({{__name__=~\"a|h\", job=\"x\"}})\n  {{}} 1\n\n\
+             eval instant at 0m h{{job=\"x\"}}\n\n\
+             clear\n\n\
+             eval instant at 0m sum({{job=\"y\"}})\n"
+        );
+        assert_eq!(
+            categories(&script),
+            [NativeHistograms, NativeHistograms, Core, Core, Core]
+        );
+    }
+
+    /// `load_with_nhcb` stores a native histogram per classic one under the
+    /// name without `_bucket`; the classic floats stay readable as floats.
+    #[test]
+    fn load_with_nhcb_loads_the_derived_series_as_native_histograms() {
+        use super::super::report::Category::*;
+        let script = "load_with_nhcb 1m\n  \
+             foo_bucket{le=\"1\", job=\"x\"} 1\n  foo_bucket{le=\"+Inf\", job=\"x\"} 2\n\n\
+             eval instant at 0m histogram_quantile(0.5, foo{job=\"x\"})\n  {job=\"x\"} 1\n\n\
+             eval instant at 0m histogram_quantile(0.5, foo_bucket)\n  {job=\"x\"} 1\n\n\
+             eval instant at 0m foo{le=\"1\"}\n";
+        assert_eq!(categories(script), [NativeHistograms, Core, Core]);
+    }
+
+    /// A query that does not parse has no selectors; the series it names
+    /// are all there is to go on.
+    #[test]
+    fn an_unparsed_query_is_native_histogram_if_it_names_a_histogram() {
+        use super::super::report::Category::*;
+        let script = format!(
+            "load 1m\n  a 1 2\n  h_test {HIST}\n\n\
+             eval instant at 0m histogram_count(h_test </ 2)\n  {{}} 1\n\n\
+             eval instant at 0m a </ 2\n  {{}} 1\n\n\
+             eval instant at 0m h </ 2\n  {{}} 1\n"
+        );
+        assert_eq!(categories(&script), [NativeHistograms, Core, Core]);
+    }
+
+    #[test]
+    fn a_histogram_line_gives_up_its_labels_in_either_spelling() {
+        let labels = |pairs: &[(&str, &str)]| -> Option<Labels> {
+            Some(
+                pairs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            )
+        };
+        assert_eq!(
+            series_labels(&format!("h {HIST}x3")),
+            labels(&[("__name__", "h")])
+        );
+        assert_eq!(
+            series_labels(&format!("h{{a=\"}} \\\" {{\"}} 1 {HIST}")),
+            labels(&[("__name__", "h"), ("a", "} \" {")])
+        );
+        assert_eq!(
+            series_labels(&format!("{{__name__=\"h\", b=\"c\"}} {HIST}")),
+            labels(&[("__name__", "h"), ("b", "c")])
+        );
+    }
+
+    #[test]
+    fn a_gated_eval_still_runs_with_every_gate_open() {
+        let engine = Stub(|_: &str| Ok(matrix(&[(&[], &[(0, 1.0)])])));
+        assert_eq!(
+            verdicts("eval instant at 0 mad_over_time(x[5m])\n  {} 1\n", &engine),
+            [Verdict::Gated {
+                flags: "promql-experimental-functions".into(),
+                verdict: Box::new(Verdict::Pass),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_subquery_anywhere_in_the_query_is_found() {
         assert!(has_subquery("a + rate(b[5m:1m])"));
         assert!(!has_subquery("rate(b[5m])"));
     }

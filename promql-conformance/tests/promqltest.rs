@@ -168,7 +168,7 @@ fn gated(declared: &Supported, outcomes: &[Outcome]) -> Vec<Trial> {
 fn every_eval(outcomes: &[Outcome]) -> Vec<Trial> {
     outcomes
         .iter()
-        .filter(|o| !matches!(o.verdict, Verdict::Skipped(_) | Verdict::Gated(_)))
+        .filter(|o| !matches!(o.verdict, Verdict::Skipped(_) | Verdict::Gated { .. }))
         .map(|o| {
             let name = format!("{}/{}", o.file, o.id);
             let at = format!("{}.test:{}", o.file, o.line);
@@ -182,7 +182,7 @@ fn every_eval(outcomes: &[Outcome]) -> Vec<Trial> {
                 Verdict::Unsupported(feature) => Err(Failed::from(format!(
                     "{feature} is not supported yet\n  query: {query}\n  at:    {at}"
                 ))),
-                Verdict::Skipped(_) | Verdict::Gated(_) => Ok(()),
+                Verdict::Skipped(_) | Verdict::Gated { .. } => Ok(()),
             })
         })
         .collect()
