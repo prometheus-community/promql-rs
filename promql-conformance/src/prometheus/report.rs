@@ -272,6 +272,20 @@ pub fn inventory_markdown(outcomes: &[Outcome]) -> String {
         percent(core_passed, core_total),
     );
 
+    // The failing core evals are exactly the two reasons with work in
+    // them; the other two are parked areas.
+    let _ = write!(
+        out,
+        "## Core evals\n\n\
+         | | evals |\n|---|---:|\n\
+         | total | {core_total} |\n\
+         | passing | {core_passed} |\n\
+         | not passing | {} |\n\n\
+         The not-passing ones are the missing features and the unattributed failures \
+         below. Fixing those is what takes the core to 100%.\n\n",
+        core_total - core_passed,
+    );
+
     let failing: usize = counts.iter().map(|c| c.1).sum();
     let _ = write!(
         out,
@@ -339,7 +353,7 @@ pub fn inventory_markdown(outcomes: &[Outcome]) -> String {
 
     out.push_str(
         "\n## By file\n\n\
-         | file | evals | passing | native histograms | subquery | passing the rest | |\n\
+         | file | evals | native histograms | subquery | passing | passing core | |\n\
          |---|---:|---:|---:|---:|---:|---|\n",
     );
     for s in &stats {
@@ -354,13 +368,13 @@ pub fn inventory_markdown(outcomes: &[Outcome]) -> String {
         };
         let _ = writeln!(
             out,
-            "| {} | {} | {} ({:.0}%) | {} | {} | {} of {} ({:.0}%) | {note} |",
+            "| {} | {} | {} | {} | {} ({:.0}%) | {} of {} ({:.0}%) | {note} |",
             s.file,
             s.evals,
-            s.passed,
-            s.percent(),
             s.histograms,
             s.subqueries,
+            s.passed,
+            s.percent(),
             s.core_passed,
             s.core_evals(),
             s.core_percent(),
@@ -589,6 +603,7 @@ mod tests {
 
         let md = inventory_markdown(&reasoned());
         assert!(md.contains("**1 of 3** pass (33.3%)"), "{md}");
+        assert!(md.contains("| not passing | 2 |"), "{md}");
         assert!(md.contains("| 2 | native histograms |"), "{md}");
         assert!(md.contains("| 2 | subquery |"), "{md}");
         assert!(md.contains("| 1 | missing features |"), "{md}");

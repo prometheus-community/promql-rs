@@ -12,6 +12,16 @@ Against the vendored corpus: **677 of 1825 evals pass** (37.1%), and **186** are
 
 Excluding native histograms and subqueries: **467 of 760** pass (61.4%). An eval is excluded if any series in its load blocks or its expected rows is a native histogram, or its query contains a subquery, whether it passes or not, so the denominator holds still.
 
+## Core evals
+
+| | evals |
+|---|---:|
+| total | 760 |
+| passing | 467 |
+| not passing | 293 |
+
+The not-passing ones are the missing features and the unattributed failures below. Fixing those is what takes the core to 100%.
+
 ## Why evals fail
 
 | failing evals | reason |
@@ -184,28 +194,28 @@ Not native histograms, not a subquery, and the engine does not name a missing fe
 
 ## By file
 
-| file | evals | passing | native histograms | subquery | passing the rest | |
+| file | evals | native histograms | subquery | passing | passing core | |
 |---|---:|---:|---:|---:|---:|---|
-| selectors | 31 | 31 (100%) | 0 | 0 | 31 of 31 (100%) | fully green |
-| extended_vectors | 30 | 30 (100%) | 0 | 0 | 30 of 30 (100%) | fully green |
-| literals | 25 | 25 (100%) | 0 | 0 | 25 of 25 (100%) | fully green |
-| trig_functions | 19 | 19 (100%) | 0 | 0 | 19 of 19 (100%) | fully green |
-| staleness | 17 | 17 (100%) | 0 | 0 | 17 of 17 (100%) | fully green |
-| collision | 2 | 2 (100%) | 0 | 0 | 2 of 2 (100%) | fully green |
-| fill-modifier | 1 | 1 (100%) | 0 | 0 | 1 of 1 (100%) | fully green |
-| type_and_unit | 58 | 43 (74%) | 0 | 0 | 43 of 58 (74%) |  |
-| range_queries | 16 | 11 (69%) | 7 | 0 | 8 of 9 (89%) |  |
-| operators | 213 | 141 (66%) | 165 | 0 | 47 of 48 (98%) |  |
-| name_label_dropping | 29 | 18 (62%) | 0 | 1 | 18 of 28 (64%) |  |
-| aggregators | 158 | 93 (59%) | 62 | 0 | 88 of 96 (92%) |  |
-| at_modifier | 69 | 35 (51%) | 0 | 29 | 35 of 40 (88%) |  |
-| functions | 383 | 193 (50%) | 240 | 4 | 85 of 139 (61%) |  |
-| duration_expression | 59 | 8 (14%) | 0 | 0 | 8 of 59 (14%) |  |
-| subquery | 34 | 2 (6%) | 3 | 29 | 2 of 2 (100%) |  |
-| histograms | 167 | 8 (5%) | 11 | 0 | 8 of 156 (5%) |  |
-| native_histograms | 514 | 0 (0%) | 514 | 0 | 0 of 0 (0%) |  |
-| info | 0 | 0 (0%) | 0 | 0 | 0 of 0 (0%) | all gated — experimental syntax |
-| limit | 0 | 0 (0%) | 0 | 0 | 0 of 0 (0%) | all gated — experimental syntax |
+| selectors | 31 | 0 | 0 | 31 (100%) | 31 of 31 (100%) | fully green |
+| extended_vectors | 30 | 0 | 0 | 30 (100%) | 30 of 30 (100%) | fully green |
+| literals | 25 | 0 | 0 | 25 (100%) | 25 of 25 (100%) | fully green |
+| trig_functions | 19 | 0 | 0 | 19 (100%) | 19 of 19 (100%) | fully green |
+| staleness | 17 | 0 | 0 | 17 (100%) | 17 of 17 (100%) | fully green |
+| collision | 2 | 0 | 0 | 2 (100%) | 2 of 2 (100%) | fully green |
+| fill-modifier | 1 | 0 | 0 | 1 (100%) | 1 of 1 (100%) | fully green |
+| type_and_unit | 58 | 0 | 0 | 43 (74%) | 43 of 58 (74%) |  |
+| range_queries | 16 | 7 | 0 | 11 (69%) | 8 of 9 (89%) |  |
+| operators | 213 | 165 | 0 | 141 (66%) | 47 of 48 (98%) |  |
+| name_label_dropping | 29 | 0 | 1 | 18 (62%) | 18 of 28 (64%) |  |
+| aggregators | 158 | 62 | 0 | 93 (59%) | 88 of 96 (92%) |  |
+| at_modifier | 69 | 0 | 29 | 35 (51%) | 35 of 40 (88%) |  |
+| functions | 383 | 240 | 4 | 193 (50%) | 85 of 139 (61%) |  |
+| duration_expression | 59 | 0 | 0 | 8 (14%) | 8 of 59 (14%) |  |
+| subquery | 34 | 3 | 29 | 2 (6%) | 2 of 2 (100%) |  |
+| histograms | 167 | 11 | 0 | 8 (5%) | 8 of 156 (5%) |  |
+| native_histograms | 514 | 514 | 0 | 0 (0%) | 0 of 0 (0%) |  |
+| info | 0 | 0 | 0 | 0 (0%) | 0 of 0 (0%) | all gated — experimental syntax |
+| limit | 0 | 0 | 0 | 0 (0%) | 0 of 0 (0%) | all gated — experimental syntax |
 
 ---
 
