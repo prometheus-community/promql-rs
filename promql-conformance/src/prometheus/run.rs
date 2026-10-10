@@ -32,7 +32,7 @@ use std::collections::BTreeMap;
 
 use promql_parser::SeriesDescription;
 
-use super::script::{Command, Eval, Expected, Range, Script, Timing};
+use super::script::{Command, Eval, Expected, Range, Script, Timing, Unsupported};
 use crate::result::{
     Engine, EngineError, Labels, LoadedSeries, Point, QueryResult, Sample, Series,
 };
@@ -122,6 +122,15 @@ pub struct Outcome {
     /// Whether the eval carried `expect warn`/`info` assertions that
     /// were parsed but not checked.
     pub unchecked_annotations: bool,
+    /// Native histograms anywhere in the eval's world: any series in an
+    /// active load block, or any expected row. Deliberately blunt — the
+    /// query is not matched against the series it reads, unlike
+    /// [`might_read`] — because the report wants one cheap, stable
+    /// partition of the corpus, not a per-eval dependency analysis.
+    pub histograms: bool,
+    /// The query contains a subquery. Counted for passing evals too, so
+    /// the report's denominator does not move when one starts passing.
+    pub subquery: bool,
 }
 
 /// One `load` block's data, as an eval below it sees it.
@@ -138,6 +147,10 @@ struct Block {
     /// block that 165 float evals also read from, and skipping all of
     /// them would throw away most of the file.
     missing: Vec<Option<String>>,
+    /// Whether any of the unparsed lines is a histogram descriptor. Reads
+    /// the verdict [`super::script`] already reached on each line rather
+    /// than sniffing `{{` a second time here.
+    histograms: bool,
 }
 
 /// Whether a query could be reading one of the series we failed to load.
@@ -218,6 +231,10 @@ pub fn run_script(engine: &dyn Engine, script: &Script) -> Vec<Outcome> {
                     .unsupported()
                     .map(|u| metric_name(&u.text))
                     .collect(),
+                histograms: load
+                    .block
+                    .unsupported()
+                    .any(|u| u.reason == Unsupported::NativeHistogram),
             }),
             Command::Eval(eval) => {
                 let key = case_key(eval);
@@ -236,12 +253,47 @@ pub fn run_script(engine: &dyn Engine, script: &Script) -> Vec<Outcome> {
                         Expected::Nothing => 0,
                     },
                     unchecked_annotations: eval.expect.has_annotation_assertions(),
+                    histograms: has_histograms(eval, &active),
+                    subquery: has_subquery(&eval.query),
                 });
             }
         }
     }
 
     outcomes
+}
+
+fn has_histograms(eval: &Eval, active: &[Block]) -> bool {
+    active.iter().any(|b| b.histograms)
+        || eval
+            .unsupported
+            .iter()
+            .any(|u| u.reason == Unsupported::NativeHistogram)
+}
+
+/// Parsed with every gate open, so an experimental-syntax query is still
+/// asked the question; a query nobody parses has no subquery to report.
+fn has_subquery(query: &str) -> bool {
+    use promql_parser::{Expr, ParserOptions};
+    fn walk(e: &Expr) -> bool {
+        match e {
+            Expr::Subquery(_) => true,
+            Expr::Binary(b) => walk(&b.lhs) || walk(&b.rhs),
+            Expr::Aggregate(a) => a.param.as_deref().is_some_and(walk) || walk(&a.expr),
+            Expr::Call(c) => c.args.iter().any(walk),
+            Expr::MatrixSelector(m) => walk(&m.vector_selector),
+            Expr::Paren(p) => walk(&p.expr),
+            Expr::Unary(u) => walk(&u.expr),
+            Expr::StepInvariant(e) => walk(e),
+            Expr::VectorSelector(_)
+            | Expr::NumberLiteral(_)
+            | Expr::StringLiteral(_)
+            | Expr::Duration(_) => false,
+        }
+    }
+    promql_parser::Parser::new(ParserOptions::all())
+        .parse_expr(query)
+        .is_ok_and(|e| walk(&e))
 }
 
 fn case_key(eval: &Eval) -> String {
@@ -925,5 +977,29 @@ mod tests {
         ] {
             assert_eq!(gating_flags(query).as_deref(), flags, "{query}");
         }
+    }
+
+    /// The report's partition rests on these two flags: a histogram
+    /// anywhere in the eval's world, however unrelated to the query, and
+    /// a subquery anywhere in the query.
+    #[test]
+    fn outcomes_flag_native_histograms_and_subqueries() {
+        let script = parse(
+            "t",
+            "load 1m\n  a 1 2\nclear\nload 1m\n  a 1 2\n  h {{schema:0 sum:1 count:1}}\n\n\
+             eval instant at 0m a\n  a 1\n\n\
+             eval instant at 0m sum(max_over_time(a[2m:1m]))\n  {} 1\n\n\
+             eval instant at 0m a\n  a {{schema:0 sum:1 count:1}}\n",
+        )
+        .expect("the snippet parses");
+        let engine = Stub(|_: &str| Err(EngineError::Unsupported("x".into())));
+        let flags: Vec<_> = run_script(&engine, &script)
+            .iter()
+            .map(|o| (o.histograms, o.subquery))
+            .collect();
+        assert_eq!(flags, [(true, false), (true, true), (true, false)]);
+
+        assert!(has_subquery("a + rate(b[5m:1m])"));
+        assert!(!has_subquery("rate(b[5m])"));
     }
 }

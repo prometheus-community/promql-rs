@@ -444,6 +444,8 @@ mod tests {
             verdict,
             expected_rows: 1,
             unchecked_annotations: false,
+            histograms: false,
+            subquery: false,
         }
     }
 
