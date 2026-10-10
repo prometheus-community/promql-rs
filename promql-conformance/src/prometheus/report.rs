@@ -279,6 +279,9 @@ pub fn inventory_markdown(outcomes: &[Outcome]) -> String {
          Nothing here gates CI. This file is the roadmap, and the core line below is \
          the target: it reads 100% when the engine passes every eval that is neither \
          native histograms, subquery nor experimental syntax. \
+         An eval is flag-gated if a stock parser refuses its query at a feature gate, \
+         or by its file where the grammar has no productions to reach the gate with \
+         (`docs/feature-flags.md`, Conformance). \
          An eval is native-histogram if an expected row is a native histogram sample \
          or a selector in its query matches, by its label matchers, a series the active \
          load blocks load with native histogram samples (`{{…}}`, or derived by \

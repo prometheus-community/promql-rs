@@ -248,7 +248,7 @@ pub fn run_script(engine: &dyn Engine, script: &Script) -> Vec<Outcome> {
                     id,
                     line: eval.line,
                     query: eval.query.clone(),
-                    verdict: run_eval(engine, eval, &active),
+                    verdict: run_eval(engine, &script.name, eval, &active),
                     expected_rows: match &eval.expected {
                         Expected::Series(rows) => rows.len(),
                         Expected::Scalar(_) | Expected::Str(_) => 1,
@@ -449,33 +449,44 @@ fn case_key(eval: &Eval) -> String {
 /// when stock Prometheus parses it (or nobody does, which is the engine's
 /// or the script's business, not a gate's).
 ///
-/// A flag is needed when closing just that gate, with the rest open, makes
-/// the query stop parsing.
-fn gating_flags(query: &str) -> Option<String> {
-    use promql_parser::{ParserOptions, FEATURE_FLAGS};
-    if promql_parser::parse_expr(query).is_ok() {
+/// Read off the stock parse's errors, each of which names the gate that
+/// raised it. The parse with every gate open is no witness: `step()` and
+/// its siblings are gated but not ported, so they fail there too, and
+/// asking it first filed them as core failures.
+fn gating_flags(file: &str, query: &str) -> Option<String> {
+    use promql_parser::FEATURE_FLAGS;
+    let Err(stock) = promql_parser::parse_expr(query) else {
         return None;
-    }
-    let all = ParserOptions::all();
-    if promql_parser::Parser::new(all).parse_expr(query).is_err() {
-        return None;
-    }
+    };
     let needed: Vec<&str> = FEATURE_FLAGS
         .iter()
-        .filter(|f| {
-            let without = all.with_flag(f.flag, false).expect("a listed flag");
-            promql_parser::Parser::new(without)
-                .parse_expr(query)
-                .is_err()
-        })
         .map(|f| f.flag)
+        .filter(|&flag| stock.iter().any(|e| e.gate == Some(flag)))
         .collect();
-    (!needed.is_empty()).then(|| needed.join(", "))
+    if !needed.is_empty() {
+        return Some(needed.join(", "));
+    }
+    let parses = promql_parser::Parser::new(promql_parser::ParserOptions::all())
+        .parse_expr(query)
+        .is_ok();
+    GATED_BY_FILE
+        .iter()
+        .find(|(f, _)| !parses && *f == file)
+        .map(|(_, flag)| flag.to_string())
 }
 
-fn run_eval(engine: &dyn Engine, eval: &Eval, active: &[Block]) -> Verdict {
+/// Files whose experimental syntax has no productions yet, with the flag
+/// upstream needs to parse it. Without a production nothing reaches the
+/// gate, so the stock parse fails with a bare syntax error and only the
+/// file says which flag it is about. Applied to a query no option set
+/// parses, so the stable queries such a file compares against stay core.
+/// An entry goes when its productions are ported and the gate names
+/// itself.
+const GATED_BY_FILE: &[(&str, &str)] = &[("duration_expression", "promql-duration-expr")];
+
+fn run_eval(engine: &dyn Engine, file: &str, eval: &Eval, active: &[Block]) -> Verdict {
     let verdict = evaluate(engine, eval, active);
-    match gating_flags(&eval.query) {
+    match gating_flags(file, &eval.query) {
         Some(flags) => Verdict::Gated {
             flags,
             verdict: Box::new(verdict),
@@ -1111,6 +1122,9 @@ mod tests {
                 Some("promql-experimental-functions"),
             ),
             ("limitk(1, x)", Some("promql-experimental-functions")),
+            // Gated, then refused with the gate open too: not ported.
+            ("vector(step())", Some("promql-experimental-functions")),
+            ("end() - start()", Some("promql-experimental-functions")),
             ("x + fill(0) y", Some("promql-binop-fill-modifiers")),
             (
                 "rate(x[5m] anchored)",
@@ -1124,8 +1138,22 @@ mod tests {
                 ),
             ),
         ] {
-            assert_eq!(gating_flags(query).as_deref(), flags, "{query}");
+            assert_eq!(gating_flags("t", query).as_deref(), flags, "{query}");
         }
+    }
+
+    /// The duration productions are not ported, so a duration expression
+    /// fails with a bare syntax error whatever the options; its file is
+    /// all that says which flag it waits on.
+    #[test]
+    fn an_unparsed_query_in_a_gated_file_is_filed_under_its_flag() {
+        let file = "duration_expression";
+        assert_eq!(
+            gating_flags(file, "changes(x[26m+4m])").as_deref(),
+            Some("promql-duration-expr")
+        );
+        assert_eq!(gating_flags(file, "changes(x[30m])"), None);
+        assert_eq!(gating_flags("functions", "changes(x[26m+4m])"), None);
     }
 
     fn categories(input: &str) -> Vec<super::super::report::Category> {

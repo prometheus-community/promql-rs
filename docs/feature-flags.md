@@ -44,9 +44,14 @@ first three columns.
 ## Conformance
 
 Experimental syntax is not part of the core language yet, so the promqltest
-harness leaves it out of the count. An eval whose query stock Prometheus rejects
-but parses with every gate open is `Verdict::Gated`, naming the flags it needs
-(a flag is needed when closing just that gate stops the query parsing). It is in
+harness leaves it out of the count. An eval is `Verdict::Gated` when the stock
+parse of its query fails with a gate error, naming the flags of those errors.
+That holds whether or not the query parses with every gate open, which the
+unported `start()`, `end()`, `step()` and `range()` arms do not. Where nothing
+reaches a gate because the productions are missing, the harness falls back to
+the file: a query in `duration_expression.test` that no option set parses is
+filed under `promql-duration-expr` (`GATED_BY_FILE` in
+`promql-conformance/src/prometheus/run.rs`, until those productions land). It is in
 no total, no per-file ratio, no trial and not in `SUPPORTED.toml`;
 `UNSUPPORTED.md` lists how many there are per flag. The harness still evaluates
 the query with every gate open, upstream's `TestParserOpts`, so nothing else
