@@ -602,6 +602,7 @@ range_queries = [
     "metric @ 0..120000/60000 #2",
     "requests * 2 @ 0..120000/60000",
     "some_metric[1m] @ 60000",
+    "some_metric_with_stale_marker[3m] @ 180000",
     "some_nonexistent_metric[1m] @ 60000",
     "sort(series) @ 60000..120000/60000",
     "sort_desc(series) @ 60000..120000/60000",
