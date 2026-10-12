@@ -1,6 +1,6 @@
 //! A readable `Display` for a planned [`LogicalPlan`], and for the
 //! `ExecutionPlan` it lowers to ([`render_physical`]), for pinning in
-//! `promql-engine/tests/testdata/plans/`.
+//! `promql-engine/tests/plan/snapshots/`.
 //!
 //! `LogicalPlan::display_indent()` prints every node exactly, but this
 //! engine's own scalar and aggregate functions carry their PromQL
@@ -52,7 +52,7 @@ use crate::series_eval::SeriesEval;
 use crate::source::{SelectHints, SelectorTable, SeriesSetExec};
 use crate::{absent, aggregate, labels, selector, series, to_scalar};
 
-/// Renders `plan` the way `tests/testdata/plans/` pins it. See the module doc
+/// Renders `plan` the way `tests/plan/snapshots/` pins it. See the module doc
 /// comment for what "readable" means and why it is safe to pin.
 pub fn render(plan: &LogicalPlan) -> String {
     let single_scan = count_table_scans(plan) == 1;
@@ -776,8 +776,8 @@ fn utf8_literal<A: Arg>(e: &A) -> Option<&str> {
     }
 }
 
-/// Renders an `ExecutionPlan` the way the `physical:` blocks in
-/// `tests/testdata/plans/` pin it: one node per line, indented two spaces
+/// Renders an `ExecutionPlan` the way the `_physical` snapshots in
+/// `tests/plan/snapshots/` pin it: one node per line, indented two spaces
 /// per level, as `displayable(plan).indent(true)` lays it out.
 ///
 /// Only the two node kinds that carry this engine's calls are re-rendered,

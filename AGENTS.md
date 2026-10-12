@@ -33,9 +33,11 @@ draft.
    `PROMQL_PROMQLTEST_BLESS=1` and commit `SUPPORTED.toml` and `UNSUPPORTED.md` together
    with the code. Green: the gate passes without `BLESS`, and the pass count rose by the
    evals the feature targets. A lower count is a regression to fix.
-3. **Plan pins.** `promql-engine/tests/testdata/plans/*.yaml` pins the planner's output as
-   text. A changed pin is a design change: re-bless it in its own commit whose message
-   says why the shape moved. Green: every changed pin is explained in that commit.
+3. **Plan pins.** `promql-engine/tests/plan.rs` pins the planner's output as insta
+   snapshots in `promql-engine/tests/plan/snapshots/`. A changed pin is a design change:
+   re-bless it with `cargo insta review` (`INSTA_UPDATE=always cargo test` without
+   cargo-insta) in its own commit whose message says why the shape moved. Green: every
+   changed pin is explained in that commit.
 4. **Benchmarks.** `promql-engine/benches` (`kernels`, `engine`, `memory`); each file's
    doc comment says how to take a baseline on the base branch and compare. Green: no
    move beyond the five percent noise floor in the wrong direction, and the feature has
