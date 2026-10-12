@@ -37,7 +37,7 @@
 //! the series the query runs over, and an `assert_snapshot!` named after
 //! the test whose third argument is the query, so the `.snap` header shows
 //! it. Run `cargo insta test --review`: a case without a snapshot fails and
-//! the review prints the rendered plan. Read it before accepting — the
+//! the review prints the rendered plan. Read it before accepting. The
 //! point is to notice a shape you did not expect, not to record one.
 //!
 //! [`Case::physical`], asserted as a second snapshot named `<test>_physical`,

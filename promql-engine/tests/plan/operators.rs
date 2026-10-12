@@ -31,7 +31,7 @@ fn a_scalar_on_the_left_of_a_vector() {
 }
 
 /// A comparison without bool answers with the left sample as it stood,
-/// __name__ and all — and __name__ is the one label the match signature
+/// __name__ and all, and __name__ is the one label the match signature
 /// leaves out. So the aggregation answers with a series per name instead of
 /// one per match group, and the two Unnest nodes open that list into a row
 /// each before the top projection puts the name back among the group keys.
@@ -49,7 +49,7 @@ fn a_comparison_between_two_vectors() {
 }
 
 /// Both sides widened to one label schema, unioned, and grouped by the
-/// match signature — which for default matching is the result's own label
+/// match signature, which for default matching is the result's own label
 /// set. A label only one side carries is read as the empty string on the
 /// other, which is how the shape spells absent.
 #[test]
