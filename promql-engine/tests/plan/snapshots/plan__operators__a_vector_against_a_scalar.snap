@@ -1,0 +1,9 @@
+---
+source: promql-engine/tests/plan/operators.rs
+expression: http_requests_total * 2
+---
+Projection: labels{job, pod}, promql_elementwise(binary_0.samples, Utf8("*"), Float64(2), Float64(NULL))
+  SubqueryAlias: binary_0
+    Projection: labels, samples, block_start, block_end
+      SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+        TableScan: http_requests_total

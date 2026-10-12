@@ -1,0 +1,7 @@
+---
+source: promql-engine/tests/plan/functions.rs
+expression: "count_over_time(http_requests_total[10m])"
+---
+Projection: labels{job, pod}
+  SeriesEval: count_over_time(samples[10m], 600000..1200000 step 30s) per series per block
+    TableScan: http_requests_total

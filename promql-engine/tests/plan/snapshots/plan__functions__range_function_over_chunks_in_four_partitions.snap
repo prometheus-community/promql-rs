@@ -1,0 +1,7 @@
+---
+source: promql-engine/tests/plan/functions.rs
+expression: "rate(x[5m])"
+---
+Projection: labels{pod}
+  SeriesEval: rate(samples[5m], 600000..1200000 step 30s) per series per block
+    TableScan: x

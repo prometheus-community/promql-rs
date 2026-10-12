@@ -1,0 +1,9 @@
+---
+source: promql-engine/tests/plan/functions.rs
+expression: "scalar(temperature{city=\"oslo\"})"
+---
+Projection: labels{}, TimestampMillisecond(-9223372036854775808, None), TimestampMillisecond(9223372036854775807, None)
+  Aggregate: scalar(samples, 600000..1200000 step 30s) over the whole range
+    Projection: labels, samples, block_start, block_end
+      SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+        TableScan: temperature{city="oslo"}

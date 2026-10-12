@@ -1,0 +1,9 @@
+---
+source: promql-engine/tests/plan/aggregators.rs
+expression: "sum by (os_name, os_type, os_version) (sum_over_time(x[5m]))"
+---
+Projection: labels{os_name: __group__os_name, os_type: __group__os_type, os_version: __group__os_version}
+  Aggregate: sum by (os_name, os_type, os_version) (samples, 600000..1200000 step 30s) per block
+    Projection: labels{cloud … team (12 labels)}
+      SeriesEval: sum_over_time(samples[5m], 600000..1200000 step 30s) per series per block
+        TableScan: x

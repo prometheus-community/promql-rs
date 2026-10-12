@@ -1,0 +1,8 @@
+---
+source: promql-engine/tests/plan/functions.rs
+expression: "rate(x[5m])"
+---
+ProjectionExec: expr=[labels@0{pod}, samples@1, block_start@2, block_end@3]
+  SeriesEvalExec: kernel=Range(Rate), grid=Params { start_ms: 600000, end_ms: 1200000, step_ms: 30000, window_ms: 300000, offset_ms: 0, at_ms: None }
+    SeriesSetExec: x 300000..1200000 window=5m step=30s range=5m func=rate, partitioning=UnknownPartitioning(4)
+      DataSourceExec: partitions=4, partition_sizes=[2, 2, 0, 0]

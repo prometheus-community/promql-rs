@@ -1,0 +1,6 @@
+---
+source: promql-engine/tests/plan/range_queries.rs
+expression: "some_metric[1m]"
+---
+Projection: promql_matrix_selector(selector_0.samples, Int64(0), Int64(60000))
+  TableScan: some_metric

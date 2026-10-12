@@ -1,0 +1,9 @@
+---
+source: promql-engine/tests/plan/aggregators.rs
+expression: "sum by (pod) (rate(x[5m]))"
+---
+Projection: labels{pod: __group__pod}
+  Aggregate: sum by (pod) (samples, 600000..1200000 step 30s) per block
+    Projection: labels{i, pod}
+      SeriesEval: rate(samples[5m], 600000..1200000 step 30s) per series per block
+        TableScan: x

@@ -1,0 +1,10 @@
+---
+source: promql-engine/tests/plan/aggregators.rs
+expression: "sum by (os_name, os_type, os_version) (sum_over_time(x[5m]))"
+---
+ProjectionExec: expr=[labels{os_name: __group__os_name@2, os_type: __group__os_type@3, os_version: __group__os_version@4}, samples@5, block_start@0, block_end@1]
+  AggregateExec: mode=SinglePartitioned, gby=[block_start@1, block_end@2, __datafusion_extracted_1@3 as __group__os_name, __datafusion_extracted_2@4 as __group__os_type, __datafusion_extracted_3@5 as __group__os_version], aggr=[sum(samples@0, 600000..1200000 step 30s)], ordering_mode=PartiallySorted([0])
+    ProjectionExec: expr=[samples@1, block_start@2, block_end@3, labels@0.os_name as __datafusion_extracted_1, labels@0.os_type as __datafusion_extracted_2, labels@0.os_version as __datafusion_extracted_3]
+      SeriesEvalExec: kernel=Range(SumOverTime), grid=Params { start_ms: 600000, end_ms: 1200000, step_ms: 30000, window_ms: 300000, offset_ms: 0, at_ms: None }
+        SeriesSetExec: x 300000..1200000 window=5m step=30s range=5m func=sum_over_time by=(os_name, os_type, os_version), partitioning=UnknownPartitioning(1)
+          DataSourceExec: partitions=1, partition_sizes=[1]

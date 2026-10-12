@@ -1,0 +1,7 @@
+---
+source: promql-engine/tests/plan/selectors.rs
+expression: "rate(http_requests_total[5m] offset 5m)"
+---
+Projection: labels{job, pod}
+  SeriesEval: rate(samples[5m] offset 5m, 600000..1200000 step 30s) per series per block
+    TableScan: http_requests_total

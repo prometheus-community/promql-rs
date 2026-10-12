@@ -1,0 +1,7 @@
+---
+source: promql-engine/tests/plan/functions.rs
+expression: timestamp(temperature)
+---
+Projection: labels{city}
+  SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m, timestamp) per series per block
+    TableScan: temperature
