@@ -29,10 +29,14 @@ their provenance in an `UPSTREAM.md` and a per-file SHA-256 in a
 
 The design notes are in `docs/`:
 
-- `docs/engine.md`: how the engine bounds memory, and the Prometheus and Thanos
-  lineage it takes that from.
+- `docs/engine.md`: evaluation, retained state and its current limits, with
+  Prometheus and Thanos lineage.
 - `docs/series-source.md`: the `SeriesSource` trait and the Arrow shape a store
   returns.
+- [`docs/query-api.md`](docs/query-api.md): migrating query callers to prepared
+  execution, including raw streaming and metrics.
+- [`docs/feature-flags.md`](docs/feature-flags.md): the parser options carried by
+  the engine, off by default.
 - `docs/engine-blocks.md`: how a range function walks a block and crosses a
   block edge. `docs/engine-blocks.html` is the same walkthrough with diagrams.
 - `docs/parser-sync.md`: the translation discipline for the parser port and the
@@ -48,17 +52,36 @@ database.
 
 The engine turns an `Expr` into a DataFusion `LogicalPlan` that sits on top of
 whatever `ExecutionPlan` the store returned from `SeriesSource::select`. A
-series is a row from the store to the result, and the selector, aggregation, and
-range operators are DataFusion aggregate functions over the samples list. A
-series may arrive as several rows, and the engine folds them where it evaluates,
-so the whole series never exists as one array. `docs/engine.md` states the
-property that discipline buys. The unit of materialisation is the window, never
-the series.
+series is a row from the store to the result. The store supplies mandatory
+opaque IDs with each identity's chronological chunks contiguous within each
+logical time block and colocated in one partition. Order between IDs is
+unspecified. A typed `SeriesEval` boundary lowers to one streaming
+`SeriesEvalExec`, holding one current identity/fold per source partition;
+ordinary DataFusion aggregation combines its evaluated rows above it. A series
+may span any number of batches, and its ID may recur in later blocks. The
+engine folds chunks without concatenating a whole raw series. Numerical
+history follows the window's sample high water plus a bounded ingestion
+allowance. `docs/engine.md` describes this and the separate input/output
+and native aggregation state.
 
 The crate reaches Arrow only through `datafusion::arrow`. A direct `arrow`
 dependency would pin a second Arrow version for any consumer that patches
 DataFusion to a fork, and every `RecordBatch` a store hands over would then be a
 type mismatch.
+
+`SeriesSource::select` returns an execution-ready `Arc<dyn ExecutionPlan>`.
+The protected `SeriesSetExec` leaf keeps source-internal merges/exchanges out
+of outer optimization and declares only truthful block ordering, not labels
+or IDs ASC. `Engine::prepare_async` returns a `PreparedQuery` with its result-order
+policy; `Engine::execute_async` resets a fresh execution tree for each run without
+selecting or planning again. `PreparedQuery::physical_plan` exposes the physical
+template for inspection. `instant_query_async` returns a typed `InstantResult`,
+including scalars, strings and raw range-selector matrices. The latter filter
+chunks under their own sample timestamps rather than entering the step-grid
+fold. Public `value_type` and `ValueType` classify expressions without inspecting
+result rows. See the [query API migration guide](docs/query-api.md)
+for call-site changes and execution-state ownership. There is no alternate source
+layout or label-projection hint.
 
 `MemorySeriesSource` is an in-memory `SeriesSource` for tests and benchmarks.
 `promql-engine/benches` has three criterion targets, `kernels`, `engine`, and

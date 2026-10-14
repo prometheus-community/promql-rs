@@ -1,5 +1,7 @@
 # Plan pins for the topic of promql-conformance/testdata/prometheus/aggregators.test.
 # tests/plan.rs says what a case holds and how to add one.
+# SeriesEvalExec promises block_start order only, not label/ID or block_end
+# ordering. Native aggregates/exchanges therefore retain the [0] prefix.
 defaults:
   start_ms: 600000
   end_ms: 1200000
@@ -8,8 +10,8 @@ defaults:
 tests:
   - name: aggregation over an instant selector
     description: >
-      An ungrouped sum stacks on the selector aggregate: two aggregates,
-      the lower grouped by series, the upper by nothing.
+      An ungrouped sum consumes the selector's evaluated series, reducing
+      them to one unlabelled result per block.
     load:
       - http_requests_total{job="api", pod="api-1"} 0
       - http_requests_total{job="web", pod="web-1"} 0
@@ -19,7 +21,7 @@ tests:
       Projection: labels{}
         Aggregate: sum(samples, 600000..1200000 step 30s) per block
           Projection: labels, samples, block_start, block_end
-            Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+            SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
               TableScan: http_requests_total
 
   - name: grouped aggregation over a range function
@@ -36,15 +38,15 @@ tests:
       Projection: labels{job: __group__job}
         Aggregate: sum by (job) (samples, 600000..1200000 step 30s) per block
           Projection: labels{job, pod}
-            Aggregate: rate(samples[5m], 600000..1200000 step 30s) per series per block
+            SeriesEval: rate(samples[5m], 600000..1200000 step 30s) per series per block
               TableScan: http_requests_total
 
   - name: grouped aggregation over chunks in four partitions
     description: >
-      The rate aggregate runs SinglePartitioned per store partition. The
-      projection above it computes the group key as a new expression, so
-      Hash(labels) does not carry through it and the upper aggregate
-      splits into a Partial per partition, a hash shuffle on the block
+      The native rate fold runs locally in each store partition, with no
+      source hash scheme declared. The projection above it computes the
+      group key, and the upper aggregate splits into a Partial per
+      partition, a DataFusion hash shuffle on the block
       columns and the group key, and a FinalPartitioned. The shuffle keeps
       block order, so the Final emits a block once every partition has
       passed it instead of holding every block to the end. Its width is
@@ -60,16 +62,16 @@ tests:
       Projection: labels{pod: __group__pod}
         Aggregate: sum by (pod) (samples, 600000..1200000 step 30s) per block
           Projection: labels{pod}
-            Aggregate: rate(samples[5m], 600000..1200000 step 30s) per series per block
+            SeriesEval: rate(samples[5m], 600000..1200000 step 30s) per series per block
               TableScan: x
     physical: |
       ProjectionExec: expr=[labels{pod: __group__pod@2}, samples@3, block_start@0, block_end@1]
-        AggregateExec: mode=FinalPartitioned, gby=[block_start@0, block_end@1, __group__pod@2], aggr=[sum(samples[steps]@3, 600000..1200000 step 30s)], ordering_mode=PartiallySorted([0, 1])
-          RepartitionExec: partitioning=Hash([block_start@0, block_end@1, __group__pod@2], target_partitions), input_partitions=4, preserve_order=true, sort_exprs=block_start@0 ASC, block_end@1 ASC
-            AggregateExec: mode=Partial, gby=[block_start@1, block_end@2, __datafusion_extracted_1@3 as __group__pod], aggr=[sum(samples@0, 600000..1200000 step 30s)], ordering_mode=PartiallySorted([0, 1])
-              ProjectionExec: expr=[samples@3, block_start@0, block_end@1, labels@2.pod as __datafusion_extracted_1]
-                AggregateExec: mode=SinglePartitioned, gby=[block_start@2, block_end@3, labels@0], aggr=[rate(samples@1[5m], 600000..1200000 step 30s)], ordering_mode=Sorted
-                  SeriesSetExec: x 300000..1200000 window=5m step=30s range=5m func=rate by=(pod), partitioning=Hash([labels@0], 4)
+        AggregateExec: mode=FinalPartitioned, gby=[block_start@0, block_end@1, __group__pod@2], aggr=[sum(samples[steps]@3, 600000..1200000 step 30s)], ordering_mode=PartiallySorted([0])
+          RepartitionExec: partitioning=Hash([block_start@0, block_end@1, __group__pod@2], target_partitions), input_partitions=4, preserve_order=true, sort_exprs=block_start@0 ASC
+            AggregateExec: mode=Partial, gby=[block_start@1, block_end@2, __datafusion_extracted_1@3 as __group__pod], aggr=[sum(samples@0, 600000..1200000 step 30s)], ordering_mode=PartiallySorted([0])
+              ProjectionExec: expr=[samples@1, block_start@2, block_end@3, labels@0.pod as __datafusion_extracted_1]
+                SeriesEvalExec: kernel=Range(Rate), grid=Params { start_ms: 600000, end_ms: 1200000, step_ms: 30000, window_ms: 300000, offset_ms: 0, at_ms: None }
+                  SeriesSetExec: x 300000..1200000 window=5m step=30s range=5m func=rate by=(pod), partitioning=UnknownPartitioning(4)
                     DataSourceExec: partitions=4, partition_sizes=[2, 2, 0, 0]
 
   - name: grouped aggregation with every group in every partition
@@ -103,16 +105,16 @@ tests:
       Projection: labels{pod: __group__pod}
         Aggregate: sum by (pod) (samples, 600000..1200000 step 30s) per block
           Projection: labels{i, pod}
-            Aggregate: rate(samples[5m], 600000..1200000 step 30s) per series per block
+            SeriesEval: rate(samples[5m], 600000..1200000 step 30s) per series per block
               TableScan: x
     physical: |
       ProjectionExec: expr=[labels{pod: __group__pod@2}, samples@3, block_start@0, block_end@1]
-        AggregateExec: mode=FinalPartitioned, gby=[block_start@0, block_end@1, __group__pod@2], aggr=[sum(samples[steps]@3, 600000..1200000 step 30s)], ordering_mode=PartiallySorted([0, 1])
-          RepartitionExec: partitioning=Hash([block_start@0, block_end@1, __group__pod@2], target_partitions), input_partitions=4, preserve_order=true, sort_exprs=block_start@0 ASC, block_end@1 ASC
-            AggregateExec: mode=Partial, gby=[block_start@1, block_end@2, __datafusion_extracted_1@3 as __group__pod], aggr=[sum(samples@0, 600000..1200000 step 30s)], ordering_mode=PartiallySorted([0, 1])
-              ProjectionExec: expr=[samples@3, block_start@0, block_end@1, labels@2.pod as __datafusion_extracted_1]
-                AggregateExec: mode=SinglePartitioned, gby=[block_start@2, block_end@3, labels@0], aggr=[rate(samples@1[5m], 600000..1200000 step 30s)], ordering_mode=Sorted
-                  SeriesSetExec: x 300000..1200000 window=5m step=30s range=5m func=rate by=(pod), partitioning=Hash([labels@0], 4)
+        AggregateExec: mode=FinalPartitioned, gby=[block_start@0, block_end@1, __group__pod@2], aggr=[sum(samples[steps]@3, 600000..1200000 step 30s)], ordering_mode=PartiallySorted([0])
+          RepartitionExec: partitioning=Hash([block_start@0, block_end@1, __group__pod@2], target_partitions), input_partitions=4, preserve_order=true, sort_exprs=block_start@0 ASC
+            AggregateExec: mode=Partial, gby=[block_start@1, block_end@2, __datafusion_extracted_1@3 as __group__pod], aggr=[sum(samples@0, 600000..1200000 step 30s)], ordering_mode=PartiallySorted([0])
+              ProjectionExec: expr=[samples@1, block_start@2, block_end@3, labels@0.pod as __datafusion_extracted_1]
+                SeriesEvalExec: kernel=Range(Rate), grid=Params { start_ms: 600000, end_ms: 1200000, step_ms: 30000, window_ms: 300000, offset_ms: 0, at_ms: None }
+                  SeriesSetExec: x 300000..1200000 window=5m step=30s range=5m func=rate by=(pod), partitioning=UnknownPartitioning(4)
                     DataSourceExec: partitions=4, partition_sizes=[6, 12, 8, 6]
 
   - name: grouped aggregation over a wide label set
@@ -132,14 +134,14 @@ tests:
       Projection: labels{os_name: __group__os_name, os_type: __group__os_type, os_version: __group__os_version}
         Aggregate: sum by (os_name, os_type, os_version) (samples, 600000..1200000 step 30s) per block
           Projection: labels{cloud … team (12 labels)}
-            Aggregate: sum_over_time(samples[5m], 600000..1200000 step 30s) per series per block
+            SeriesEval: sum_over_time(samples[5m], 600000..1200000 step 30s) per series per block
               TableScan: x
     physical: |
       ProjectionExec: expr=[labels{os_name: __group__os_name@2, os_type: __group__os_type@3, os_version: __group__os_version@4}, samples@5, block_start@0, block_end@1]
-        AggregateExec: mode=SinglePartitioned, gby=[block_start@1, block_end@2, __datafusion_extracted_1@3 as __group__os_name, __datafusion_extracted_2@4 as __group__os_type, __datafusion_extracted_3@5 as __group__os_version], aggr=[sum(samples@0, 600000..1200000 step 30s)], ordering_mode=PartiallySorted([0, 1])
-          ProjectionExec: expr=[samples@3, block_start@0, block_end@1, labels@2.os_name as __datafusion_extracted_1, labels@2.os_type as __datafusion_extracted_2, labels@2.os_version as __datafusion_extracted_3]
-            AggregateExec: mode=SinglePartitioned, gby=[block_start@2, block_end@3, labels@0], aggr=[sum_over_time(samples@1[5m], 600000..1200000 step 30s)], ordering_mode=Sorted
-              SeriesSetExec: x 300000..1200000 window=5m step=30s range=5m func=sum_over_time by=(os_name, os_type, os_version), partitioning=Hash([labels@0], 1)
+        AggregateExec: mode=SinglePartitioned, gby=[block_start@1, block_end@2, __datafusion_extracted_1@3 as __group__os_name, __datafusion_extracted_2@4 as __group__os_type, __datafusion_extracted_3@5 as __group__os_version], aggr=[sum(samples@0, 600000..1200000 step 30s)], ordering_mode=PartiallySorted([0])
+          ProjectionExec: expr=[samples@1, block_start@2, block_end@3, labels@0.os_name as __datafusion_extracted_1, labels@0.os_type as __datafusion_extracted_2, labels@0.os_version as __datafusion_extracted_3]
+            SeriesEvalExec: kernel=Range(SumOverTime), grid=Params { start_ms: 600000, end_ms: 1200000, step_ms: 30000, window_ms: 300000, offset_ms: 0, at_ms: None }
+              SeriesSetExec: x 300000..1200000 window=5m step=30s range=5m func=sum_over_time by=(os_name, os_type, os_version), partitioning=UnknownPartitioning(1)
                 DataSourceExec: partitions=1, partition_sizes=[1]
 
   - name: ungrouped aggregation over chunks in four partitions
@@ -158,17 +160,16 @@ tests:
       Projection: labels{}
         Aggregate: sum(samples, 600000..1200000 step 30s) per block
           Projection: labels{pod}
-            Aggregate: rate(samples[5m], 600000..1200000 step 30s) per series per block
+            SeriesEval: rate(samples[5m], 600000..1200000 step 30s) per series per block
               TableScan: x
     physical: |
       ProjectionExec: expr=[{}, samples@2, block_start@0, block_end@1]
-        AggregateExec: mode=FinalPartitioned, gby=[block_start@0, block_end@1], aggr=[sum(samples[steps]@2, 600000..1200000 step 30s)], ordering_mode=Sorted
-          RepartitionExec: partitioning=Hash([block_start@0, block_end@1], target_partitions), input_partitions=4, preserve_order=true, sort_exprs=block_start@0 ASC, block_end@1 ASC
-            AggregateExec: mode=Partial, gby=[block_start@1, block_end@2], aggr=[sum(samples@0, 600000..1200000 step 30s)], ordering_mode=Sorted
-              ProjectionExec: expr=[samples@3, block_start@0, block_end@1]
-                AggregateExec: mode=SinglePartitioned, gby=[block_start@2, block_end@3, labels@0], aggr=[rate(samples@1[5m], 600000..1200000 step 30s)], ordering_mode=Sorted
-                  SeriesSetExec: x 300000..1200000 window=5m step=30s range=5m func=rate by=(), partitioning=Hash([labels@0], 4)
-                    DataSourceExec: partitions=4, partition_sizes=[2, 2, 0, 0]
+        AggregateExec: mode=FinalPartitioned, gby=[block_start@0, block_end@1], aggr=[sum(samples[steps]@2, 600000..1200000 step 30s)], ordering_mode=PartiallySorted([0])
+          RepartitionExec: partitioning=Hash([block_start@0, block_end@1], target_partitions), input_partitions=4, preserve_order=true, sort_exprs=block_start@0 ASC
+            AggregateExec: mode=Partial, gby=[block_start@1, block_end@2], aggr=[sum(samples@0, 600000..1200000 step 30s)], ordering_mode=PartiallySorted([0])
+              SeriesEvalExec: kernel=Range(Rate), grid=Params { start_ms: 600000, end_ms: 1200000, step_ms: 30000, window_ms: 300000, offset_ms: 0, at_ms: None }, labels pruned
+                SeriesSetExec: x 300000..1200000 window=5m step=30s range=5m func=rate by=(), partitioning=UnknownPartitioning(4)
+                  DataSourceExec: partitions=4, partition_sizes=[2, 2, 0, 0]
 
   - name: without resolves to the remaining keys at plan time
     description: >
@@ -185,5 +186,5 @@ tests:
       Projection: labels{job: __group__job}
         Aggregate: sum by (job) (samples, 600000..1200000 step 30s) per block
           Projection: labels{job, pod}
-            Aggregate: rate(samples[5m], 600000..1200000 step 30s) per series per block
+            SeriesEval: rate(samples[5m], 600000..1200000 step 30s) per series per block
               TableScan: http_requests_total

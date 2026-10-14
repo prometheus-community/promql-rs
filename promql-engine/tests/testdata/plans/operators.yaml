@@ -20,7 +20,7 @@ tests:
       Projection: labels{job, pod}, promql_elementwise(binary_0.samples, Utf8("*"), Float64(2), Float64(NULL))
         SubqueryAlias: binary_0
           Projection: labels, samples, block_start, block_end
-            Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+            SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
               TableScan: http_requests_total
 
   - name: a scalar on the left of a vector
@@ -36,7 +36,7 @@ tests:
       Projection: labels{job, pod}, promql_elementwise(binary_0.samples, Utf8("/"), Float64(NULL), Float64(600))
         SubqueryAlias: binary_0
           Projection: labels, samples, block_start, block_end
-            Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+            SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
               TableScan: http_requests_total
 
   - name: a comparison between two vectors
@@ -60,13 +60,13 @@ tests:
               Union
                 Projection: binary_0.labels{__name__, job, pod} AS labels, binary_0.samples, Boolean(false) AS __rhs
                   SubqueryAlias: binary_0
-                    Projection: selector_0.labels, samples, selector_0.block_start, selector_0.block_end
-                      Aggregate: vector_selector(selector_0.samples, 600000..1200000 step 30s, lookback 5m) per series per block
+                    Projection: labels, samples, block_start, block_end
+                      SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
                         TableScan: selector_0 requests
                 Projection: binary_1.labels{__name__, job, pod} AS labels, binary_1.samples, Boolean(true) AS __rhs
                   SubqueryAlias: binary_1
-                    Projection: selector_1.labels, samples, selector_1.block_start, selector_1.block_end
-                      Aggregate: vector_selector(selector_1.samples, 600000..1200000 step 30s, lookback 5m) per series per block
+                    Projection: labels, samples, block_start, block_end
+                      SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
                         TableScan: selector_1 errors
 
   - name: two vectors matched one to one
@@ -88,13 +88,13 @@ tests:
               Union
                 Projection: binary_0.labels{__name__, job, pod, zone: Utf8("")} AS labels, binary_0.samples, Boolean(false) AS __rhs
                   SubqueryAlias: binary_0
-                    Projection: selector_0.labels, samples, selector_0.block_start, selector_0.block_end
-                      Aggregate: vector_selector(selector_0.samples, 600000..1200000 step 30s, lookback 5m) per series per block
+                    Projection: labels, samples, block_start, block_end
+                      SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
                         TableScan: selector_0 requests
                 Projection: binary_1.labels{__name__, job, pod: Utf8(""), zone} AS labels, binary_1.samples, Boolean(true) AS __rhs
                   SubqueryAlias: binary_1
-                    Projection: selector_1.labels, samples, selector_1.block_start, selector_1.block_end
-                      Aggregate: vector_selector(selector_1.samples, 600000..1200000 step 30s, lookback 5m) per series per block
+                    Projection: labels, samples, block_start, block_end
+                      SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
                         TableScan: selector_1 errors
 
   - name: a fan-out matched on one label
@@ -118,13 +118,13 @@ tests:
               Union
                 Projection: binary_0.labels{__name__, job, pod, zone: Utf8("")} AS labels, binary_0.samples, Boolean(false) AS __rhs
                   SubqueryAlias: binary_0
-                    Projection: selector_0.labels, samples, selector_0.block_start, selector_0.block_end
-                      Aggregate: vector_selector(selector_0.samples, 600000..1200000 step 30s, lookback 5m) per series per block
+                    Projection: labels, samples, block_start, block_end
+                      SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
                         TableScan: selector_0 requests
                 Projection: binary_1.labels{__name__, job, pod: Utf8(""), zone} AS labels, binary_1.samples, Boolean(true) AS __rhs
                   SubqueryAlias: binary_1
-                    Projection: selector_1.labels, samples, selector_1.block_start, selector_1.block_end
-                      Aggregate: vector_selector(selector_1.samples, 600000..1200000 step 30s, lookback 5m) per series per block
+                    Projection: labels, samples, block_start, block_end
+                      SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
                         TableScan: selector_1 limit
 
   - name: a set operator matched on one label
@@ -148,13 +148,13 @@ tests:
               Union
                 Projection: binary_0.labels{__name__, job, pod, zone: Utf8("")} AS labels, binary_0.samples, Boolean(false) AS __rhs
                   SubqueryAlias: binary_0
-                    Projection: selector_0.labels, samples, selector_0.block_start, selector_0.block_end
-                      Aggregate: vector_selector(selector_0.samples, 600000..1200000 step 30s, lookback 5m) per series per block
+                    Projection: labels, samples, block_start, block_end
+                      SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
                         TableScan: selector_0 requests
                 Projection: binary_1.labels{__name__, job, pod: Utf8(""), zone} AS labels, binary_1.samples, Boolean(true) AS __rhs
                   SubqueryAlias: binary_1
-                    Projection: selector_1.labels, samples, selector_1.block_start, selector_1.block_end
-                      Aggregate: vector_selector(selector_1.samples, 600000..1200000 step 30s, lookback 5m) per series per block
+                    Projection: labels, samples, block_start, block_end
+                      SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
                         TableScan: selector_1 limit
 
   - name: a filtering comparison as an operand
@@ -181,13 +181,13 @@ tests:
                   SubqueryAlias: binary_1
                     Projection: binary_0.labels{__name__, job, pod}, promql_elementwise(binary_0.samples, Utf8(">"), Float64(100), Float64(NULL))
                       SubqueryAlias: binary_0
-                        Projection: selector_0.labels, samples, selector_0.block_start, selector_0.block_end
-                          Aggregate: vector_selector(selector_0.samples, 600000..1200000 step 30s, lookback 5m) per series per block
+                        Projection: labels, samples, block_start, block_end
+                          SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
                             TableScan: selector_0 requests
                 Projection: binary_2.labels{__name__, job, pod} AS labels, binary_2.samples, Boolean(true) AS __rhs
                   SubqueryAlias: binary_2
-                    Projection: selector_1.labels, samples, selector_1.block_start, selector_1.block_end
-                      Aggregate: vector_selector(selector_1.samples, 600000..1200000 step 30s, lookback 5m) per series per block
+                    Projection: labels, samples, block_start, block_end
+                      SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
                         TableScan: selector_1 errors
 
   - name: a fill value for a side with no series
@@ -211,11 +211,11 @@ tests:
               Union
                 Projection: binary_0.labels{__name__, job, pod, zone: Utf8("")} AS labels, binary_0.samples, Boolean(false) AS __rhs
                   SubqueryAlias: binary_0
-                    Projection: selector_0.labels, samples, selector_0.block_start, selector_0.block_end
-                      Aggregate: vector_selector(selector_0.samples, 600000..1200000 step 30s, lookback 5m) per series per block
+                    Projection: labels, samples, block_start, block_end
+                      SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
                         TableScan: selector_0 requests
                 Projection: binary_1.labels{__name__, job, pod: Utf8(""), zone} AS labels, binary_1.samples, Boolean(true) AS __rhs
                   SubqueryAlias: binary_1
-                    Projection: selector_1.labels, samples, selector_1.block_start, selector_1.block_end
-                      Aggregate: vector_selector(selector_1.samples, 600000..1200000 step 30s, lookback 5m) per series per block
+                    Projection: labels, samples, block_start, block_end
+                      SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
                         TableScan: selector_1 limit

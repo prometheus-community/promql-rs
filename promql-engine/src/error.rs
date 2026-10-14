@@ -3,9 +3,9 @@
 //! The variants are kept apart because callers treat them differently: a
 //! differential test counts [`EngineError::Unsupported`] as "not built
 //! yet" and collapses it, a user error ([`EngineError::is_user_error`]) is
-//! an answer (the reference engine also rejects some queries),
-//! [`EngineError::Schema`] is a store's bug, and everything else is
-//! DataFusion's or this crate's.
+//! an answer (the reference engine also rejects some queries), and
+//! [`EngineError::Schema`] identifies rejected series data. Source, Arrow,
+//! DataFusion and runtime failures keep their own categories.
 
 use datafusion::arrow::error::ArrowError;
 use datafusion::error::DataFusionError;
@@ -66,20 +66,22 @@ pub enum EngineError {
         source: regex::Error,
     },
 
-    /// A store handed back something other than the canonical series
-    /// schema. Reported at plan time, before anything executes.
+    /// Series data failed a schema or shape check, including explicit
+    /// series helpers and collected-result validation. Not limited to plan
+    /// time: trusted source batches are not audited at the source boundary.
     #[error("series source schema: {0}")]
     Schema(String),
 
-    /// [`EngineError::Schema`] for a store whose batch an Arrow kernel
-    /// could not process, with the Arrow error kept.
+    /// An Arrow failure from a series operation, with the original error
+    /// kept. Timing follows that operation, including result processing;
+    /// this does not imply source-boundary validation.
     #[error("series source schema: {0}")]
     Arrow(#[source] ArrowError),
 
-    /// A store broke the order it promised: a label set's chunks not
-    /// consecutive, series not label-sorted, blocks out of order, or a
-    /// label set's first sample timestamps going backwards. Found while executing, so it reaches
-    /// the caller through DataFusion, and is unwrapped from it again.
+    /// A source contract error explicitly reported by a source or adapter.
+    /// When raised during execution it travels through DataFusion and is
+    /// unwrapped here. Source identity and ordering are trusted, not audited
+    /// at runtime; label and ID sorting are not source requirements.
     #[error("series source order: {0}")]
     Source(String),
 
@@ -236,13 +238,15 @@ fn copied_io(e: &std::io::Error) -> std::io::Error {
 mod tests {
     use super::*;
 
-    /// A store-order violation is raised inside an `ExecutionPlan`, where
-    /// only a `DataFusionError` can be returned; callers must still be
-    /// able to match on the variant.
+    /// An explicitly reported source contract error must retain its variant
+    /// through an `ExecutionPlan`'s `DataFusionError` boundary.
     #[test]
     fn a_source_error_survives_the_trip_through_datafusion() {
-        let wrapped =
-            DataFusionError::External(Box::new(EngineError::Source("out of order".into())));
+        assert_eq!(
+            EngineError::Source("out of order".into()).to_string(),
+            "series source order: out of order"
+        );
+        let wrapped = crate::source::source_error("out of order".into());
         assert!(
             matches!(EngineError::from(wrapped), EngineError::Source(m) if m == "out of order")
         );

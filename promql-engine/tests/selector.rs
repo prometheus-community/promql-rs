@@ -196,7 +196,7 @@ fn a_label_set_given_twice_is_a_series_error() {
 }
 
 #[tokio::test]
-async fn the_plan_is_an_aggregate_over_a_scan_with_literal_parameters() {
+async fn the_plan_has_typed_evaluation_over_a_scan() {
     // `new`, not `blocking`: this test runs inside Tokio already, and an
     // engine holding its own runtime cannot be dropped there.
     let engine = Engine::new();
@@ -210,18 +210,29 @@ async fn the_plan_is_an_aggregate_over_a_scan_with_literal_parameters() {
         .await
         .unwrap();
 
-    let rendered = plan.display_indent().to_string();
-    assert!(
-        rendered.starts_with("Projection: selector_0.labels, samples, selector_0.block_start, selector_0.block_end\n  Aggregate: groupBy=[[selector_0.block_start, selector_0.block_end, selector_0.labels]], aggr=[[promql_vector_selector(selector_0.samples, selector_0.block_start, selector_0.block_end, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(30000), Int64(NULL), Boolean(false)) AS samples]]"),
-        "{rendered}"
+    let rendered = promql_engine::explain_plan(&plan);
+    assert!(rendered.contains("SeriesEval: vector_selector(samples offset 30s, 600000..1200000 step 30s, lookback 5m) per series per block"), "{rendered}");
+    let mut node = &plan;
+    while !matches!(node, LogicalPlan::Extension(_)) {
+        node = node.inputs()[0];
+    }
+    let LogicalPlan::Extension(extension) = node else {
+        unreachable!()
+    };
+    assert_eq!(extension.node.name(), "SeriesEval");
+    assert_eq!(
+        extension
+            .node
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect::<Vec<_>>(),
+        ["labels", "samples", "block_start", "block_end"]
     );
-    assert!(rendered.contains("TableScan: selector_0"), "{rendered}");
-    // The projection above the aggregate restores the canonical column
-    // order, the keys having moved to the front.
-    assert!(matches!(plan, LogicalPlan::Projection(_)));
 
-    // A different offset is a different call, so the two can never be
-    // folded into one by common-subexpression elimination.
+    // A different offset is a different typed evaluation, so the two can
+    // never be folded into one by common-subexpression elimination.
     let other = engine
         .plan_async(
             source.as_ref(),
@@ -230,5 +241,5 @@ async fn the_plan_is_an_aggregate_over_a_scan_with_literal_parameters() {
         )
         .await
         .unwrap();
-    assert_ne!(other.display_indent().to_string(), rendered);
+    assert_ne!(promql_engine::explain_plan(&other), rendered);
 }

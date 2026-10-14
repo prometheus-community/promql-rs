@@ -8,8 +8,9 @@
 //! each mapping one `Sample` to one `Sample` with `DropName: true`.
 //!
 //! So the kernel here rebuilds only the value array and hands back the
-//! timestamps, offsets and validity it was given: the shape of the input
-//! *is* the shape of the output, and a row is still a series.
+//! timestamps and validity it was given, rebasing sliced list offsets as
+//! needed. Only the referenced child span is mapped: a list slice retains
+//! unrelated backing samples that must not add work or output storage.
 //!
 //! The scalar arguments — `round`'s `to_nearest`, `clamp`'s bounds —
 //! arrive already folded to numbers. Upstream evaluates them per step,
@@ -514,7 +515,7 @@ impl ScalarUDFImpl for Elementwise {
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        if arg_types.first() != Some(&series::samples_type()) {
+        if !arg_types.first().is_some_and(series::is_samples_type) {
             return plan_err!(
                 "{NAME}: first argument must be {}, got {:?}",
                 series::samples_type(),
@@ -587,14 +588,26 @@ fn float_arg(args: &ScalarFunctionArgs, i: usize) -> Result<Option<f64>> {
 /// A function moves no sample between series, so a row is still a
 /// series and the timestamps keep their values. What the row boundaries
 /// do depends on the bound: a function rewrites every sample and the
-/// offsets come back untouched, while a comparison answers for some of
+/// offsets are rebased if sliced, while a comparison answers for some of
 /// them and nothing for the rest, so the rows are rebuilt around what
 /// survived — upstream's `keep`, which leaves a sample out of the
 /// Vector entirely.
 ///
 /// `None` is [`Func::bind`]'s empty result: every series comes back empty.
 pub fn apply(samples: &ListArray, bound: Option<Bound>) -> Result<ListArray> {
-    let entries = samples.values().as_struct();
+    let Some(bound) = bound else {
+        return Ok(empty_rows(samples.len(), samples.nulls().cloned()));
+    };
+
+    let offsets = samples.offsets();
+    let start = offsets[0] as usize;
+    let end = offsets[samples.len()] as usize;
+    let backing = samples.values().as_struct();
+    let entries = if start == 0 && end == backing.len() {
+        backing.clone()
+    } else {
+        backing.slice(start, end - start)
+    };
     let timestamps = entries
         .column_by_name(series::TIMESTAMP)
         .expect("validated by return_type");
@@ -602,10 +615,6 @@ pub fn apply(samples: &ListArray, bound: Option<Bound>) -> Result<ListArray> {
         .column_by_name(series::VALUE)
         .expect("validated by return_type")
         .as_primitive::<Float64Type>();
-
-    let Some(bound) = bound else {
-        return Ok(empty_rows(samples.len(), samples.nulls().cloned()));
-    };
 
     let mapped = match bound {
         Bound::Binary {
@@ -637,6 +646,17 @@ pub fn apply(samples: &ListArray, bound: Option<Bound>) -> Result<ListArray> {
             .collect(),
         _ => values.values().iter().map(|v| bound.value(*v)).collect(),
     };
+    let offsets = if start == 0 {
+        offsets.clone()
+    } else {
+        OffsetBuffer::new(
+            offsets
+                .iter()
+                .map(|o| o - start as i32)
+                .collect::<Vec<_>>()
+                .into(),
+        )
+    };
     let entries = StructArray::new(
         series::sample_fields(),
         vec![Arc::clone(timestamps), Arc::new(mapped)],
@@ -644,7 +664,7 @@ pub fn apply(samples: &ListArray, bound: Option<Bound>) -> Result<ListArray> {
     );
     Ok(ListArray::new(
         series::sample_item(),
-        samples.offsets().clone(),
+        offsets,
         Arc::new(entries),
         samples.nulls().cloned(),
     ))
@@ -653,9 +673,10 @@ pub fn apply(samples: &ListArray, bound: Option<Bound>) -> Result<ListArray> {
 /// [`apply`] for a comparison that drops samples: the rows are rebuilt
 /// from the ones `holds` kept, so the offsets move with them.
 ///
-/// `holds` spans the whole child array, and a sliced list's rows need
-/// not: only the stretch its offsets cover is filtered, or the samples
-/// outside it would land in the first and last rows.
+/// The kernel's `timestamps`, `values` and `holds` cover only the referenced
+/// child span, not the whole backing array. Original row offsets still
+/// address that backing array, so predicate counts subtract its first offset.
+/// Matrix selection shares this contract with filtering comparisons.
 pub(crate) fn filtered(
     samples: &ListArray,
     timestamps: &ArrayRef,
@@ -664,20 +685,19 @@ pub(crate) fn filtered(
 ) -> Result<ListArray> {
     let offsets = samples.offsets();
     let first = offsets[0] as usize;
-    let covered = offsets[samples.len()] as usize - first;
-    let predicate = FilterBuilder::new(&BooleanArray::new(holds.slice(first, covered), None))
+    let predicate = FilterBuilder::new(&BooleanArray::new(holds.clone(), None))
         .optimize()
         .build();
     let entries = StructArray::new(
         series::sample_fields(),
         vec![
-            predicate.filter(&timestamps.slice(first, covered))?,
-            predicate.filter(&values.slice(first, covered))?,
+            predicate.filter(timestamps.as_ref())?,
+            predicate.filter(values)?,
         ],
         None,
     );
     let kept = offsets.windows(2).map(|row| {
-        let (lo, hi) = (row[0] as usize, row[1] as usize);
+        let (lo, hi) = (row[0] as usize - first, row[1] as usize - first);
         holds.slice(lo, hi - lo).count_set_bits()
     });
     Ok(ListArray::new(
@@ -1057,6 +1077,182 @@ mod tests {
         );
     }
 
+    #[test]
+    fn apply_maps_only_the_referenced_child_span_and_shares_timestamps() {
+        fn selected_only(v: f64) -> f64 {
+            assert_eq!(v, -9.0, "unreferenced backing samples must not be mapped");
+            v.abs()
+        }
+        let backing = samples();
+        let input = backing.slice(1, 2);
+        assert_eq!(input.offsets().as_ref(), &[2, 2, 3]);
+        let out = apply(&input, Some(Bound::Map(selected_only))).unwrap();
+        assert_eq!(out.offsets().as_ref(), &[0, 0, 1]);
+        assert_eq!(values_of(&out), [9.0]);
+        assert_eq!(out.values().len(), 1);
+        let original_ts = backing
+            .values()
+            .as_struct()
+            .column_by_name(series::TIMESTAMP)
+            .unwrap()
+            .as_primitive::<TimestampMillisecondType>();
+        let mapped_ts = out
+            .values()
+            .as_struct()
+            .column_by_name(series::TIMESTAMP)
+            .unwrap()
+            .as_primitive::<TimestampMillisecondType>();
+        assert_eq!(mapped_ts.values().as_ref(), &[7]);
+        assert_eq!(
+            mapped_ts.values().as_ptr(),
+            original_ts.values()[2..].as_ptr()
+        );
+
+        let prefix = apply(
+            &backing.slice(0, 2),
+            Some(Bound::Map(|v| {
+                assert_ne!(v, -9.0, "unreferenced suffix must not be mapped");
+                v.abs()
+            })),
+        )
+        .unwrap();
+        assert_eq!(prefix.offsets().as_ref(), &[0, 2, 2]);
+        assert_eq!(values_of(&prefix), [1.0, 2.5]);
+        assert_eq!(prefix.values().len(), 2);
+
+        fn never_called(_: f64) -> f64 {
+            panic!("an empty referenced span must not map backing samples")
+        }
+        for input in [backing.slice(1, 1), backing.slice(2, 0)] {
+            let out = apply(&input, Some(Bound::Map(never_called))).unwrap();
+            assert_eq!(out.len(), input.len());
+            assert_eq!(out.offsets().to_vec(), vec![0; input.len() + 1]);
+            assert_eq!(out.values().len(), 0);
+        }
+    }
+
+    #[test]
+    fn sliced_null_and_empty_rows_keep_their_validity() {
+        let backing = samples();
+        let nullable = ListArray::new(
+            series::sample_item(),
+            backing.offsets().clone(),
+            Arc::clone(backing.values()),
+            Some(vec![true, true, false].into()),
+        );
+        let input = nullable.slice(1, 2);
+        for bound in [
+            Func::Abs.bind(None, None),
+            Func::Timestamp.bind(None, None),
+            Func::Binary {
+                op: crate::binary::Op::Lss,
+                return_bool: false,
+            }
+            .bind(Some(0.0), None),
+            None,
+        ] {
+            let out = apply(&input, bound).unwrap();
+            assert_eq!(out.nulls(), input.nulls());
+            assert_eq!(out.value_length(0), 0);
+            assert!(out.is_null(1));
+            assert_eq!(out.values().len(), usize::from(bound.is_some()));
+        }
+    }
+
+    #[test]
+    fn sliced_mapping_preserves_every_bound_functions_float_semantics() {
+        let vs = vec![
+            f64::from_bits(crate::selector::STALE_NAN_BITS),
+            -0.0,
+            0.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -2.5,
+            2.5,
+            f64::NAN,
+        ];
+        let batch = series::encode(
+            &["s".to_string()],
+            &[
+                series::Series::new(&[("s", "before")], vec![0], vec![99.0]).unwrap(),
+                series::Series::new(
+                    &[("s", "selected")],
+                    (0..vs.len() as i64).collect(),
+                    vs.clone(),
+                )
+                .unwrap(),
+                series::Series::new(&[("s", "after")], vec![0], vec![99.0]).unwrap(),
+            ],
+            series::ONE_BLOCK,
+        )
+        .unwrap();
+        let input = batch
+            .column_by_name(series::SAMPLES)
+            .unwrap()
+            .as_list::<i32>()
+            .slice(1, 1);
+        for name in [
+            "abs",
+            "ceil",
+            "floor",
+            "round",
+            "exp",
+            "ln",
+            "log2",
+            "log10",
+            "sqrt",
+            "sgn",
+            "clamp",
+            "clamp_min",
+            "clamp_max",
+            "sin",
+            "cos",
+            "tan",
+            "asin",
+            "acos",
+            "atan",
+            "sinh",
+            "cosh",
+            "tanh",
+            "asinh",
+            "acosh",
+            "atanh",
+            "deg",
+            "rad",
+            "day_of_month",
+            "day_of_week",
+            "day_of_year",
+            "days_in_month",
+            "hour",
+            "minute",
+            "month",
+            "year",
+        ] {
+            let bound = Func::parse(name)
+                .unwrap()
+                .bind(Some(0.5), Some(2.0))
+                .unwrap();
+            let expected: Vec<_> = vs.iter().map(|&v| bound.value(v).to_bits()).collect();
+            let out = apply(&input, Some(bound)).unwrap();
+            assert_eq!(out.offsets().as_ref(), &[0, vs.len() as i32]);
+            assert_eq!(out.values().len(), vs.len());
+            assert_eq!(
+                values_of(&out)
+                    .into_iter()
+                    .map(f64::to_bits)
+                    .collect::<Vec<_>>(),
+                expected,
+                "{name}"
+            );
+        }
+        let out = apply(&input, Func::Timestamp.bind(None, None)).unwrap();
+        assert_eq!(out.offsets().as_ref(), &[0, vs.len() as i32]);
+        assert_eq!(
+            values_of(&out),
+            (0..vs.len()).map(|t| t as f64 / 1000.0).collect::<Vec<_>>()
+        );
+    }
+
     /// The edge values as three rows, the middle one empty, timestamps
     /// counting up from zero across all of them.
     fn edge_samples() -> ListArray {
@@ -1186,6 +1382,45 @@ mod tests {
                             .unwrap()
                             .clone();
                         assert!(Arc::ptr_eq(&timestamps, &input_timestamps), "{what}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sliced_scalar_operators_preserve_bits_and_only_rebuild_referenced_samples() {
+        let backing = edge_samples();
+        for input in [
+            backing.slice(0, 2),
+            backing.slice(1, 2),
+            backing.slice(1, 1),
+            backing.slice(2, 0),
+        ] {
+            let covered = input.offsets()[input.len()] - input.offsets()[0];
+            for op in crate::binary::Op::ALL.into_iter().filter(|op| !op.is_set()) {
+                for return_bool in [false, true] {
+                    if return_bool && !op.is_comparison() {
+                        continue;
+                    }
+                    let func = Func::Binary { op, return_bool };
+                    for scalar in crate::binary::EDGES {
+                        for bound in [func.bind(Some(scalar), None), func.bind(None, Some(scalar))]
+                        {
+                            let out = apply(&input, bound).unwrap();
+                            assert_eq!(
+                                rows_of(&out),
+                                scalar_binop_by_hand(&input, bound.unwrap()),
+                                "{bound:?}"
+                            );
+                            assert_eq!(out.offsets()[0], 0);
+                            let expected_len = if op.is_comparison() && !return_bool {
+                                rows_of(&out).concat().len()
+                            } else {
+                                covered as usize
+                            };
+                            assert_eq!(out.values().len(), expected_len, "{bound:?}");
+                        }
                     }
                 }
             }

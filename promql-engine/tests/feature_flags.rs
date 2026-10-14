@@ -4,7 +4,9 @@
 //! only pins that the engine hands its options to the parser and does not
 //! keep a second set of defaults.
 
-use promql_engine::{Engine, EngineError, EngineOptions, MemorySeriesSource, RangeQuery};
+use promql_engine::{
+    series, Engine, EngineError, EngineOptions, InstantResult, MemorySeriesSource, RangeQuery,
+};
 use promql_parser::ParserOptions;
 
 const FUNCTIONS: ParserOptions = ParserOptions {
@@ -40,6 +42,10 @@ fn a_stock_engine_refuses_experimental_syntax_on_every_path() {
         .range_query(&source(), QUERY, &range())
         .unwrap_err();
     assert!(is_the_gate(&err), "range_query: {err}");
+    let err = blocking
+        .instant_query(&source(), QUERY, 60_000)
+        .unwrap_err();
+    assert!(is_the_gate(&err), "instant_query: {err}");
 
     let engine = Engine::new();
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -54,10 +60,17 @@ fn a_stock_engine_refuses_experimental_syntax_on_every_path() {
         .unwrap_err();
     assert!(is_the_gate(&err), "plan_async: {err}");
     let err = rt
-        .block_on(engine.physical_plan_async(&source(), QUERY, &range()))
-        .map(|_| ())
+        .block_on(engine.prepare_async(&source(), QUERY, &range()))
         .unwrap_err();
-    assert!(is_the_gate(&err), "physical_plan_async: {err}");
+    assert!(is_the_gate(&err), "prepare_async: {err}");
+    let err = rt
+        .block_on(engine.plan_instant_async(&source(), QUERY, 60_000))
+        .unwrap_err();
+    assert!(is_the_gate(&err), "plan_instant_async: {err}");
+    let err = rt
+        .block_on(engine.instant_query_async(&source(), QUERY, 60_000))
+        .unwrap_err();
+    assert!(is_the_gate(&err), "instant_query_async: {err}");
 
     let default = Engine::with_options(EngineOptions::default());
     let err = rt
@@ -77,6 +90,10 @@ fn an_engine_built_with_the_flag_parses_it_on_every_path() {
         .range_query(&source(), QUERY, &range())
         .unwrap_err();
     assert!(matches!(err, EngineError::Unsupported(_)), "{err}");
+    let err = blocking
+        .instant_query(&source(), QUERY, 60_000)
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Unsupported(_)), "{err}");
 
     let engine = Engine::with_options(options);
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -94,13 +111,49 @@ fn an_engine_built_with_the_flag_parses_it_on_every_path() {
                 .map(|_| ()),
         ),
         (
-            "physical_plan_async",
-            rt.block_on(engine.physical_plan_async(&source(), QUERY, &range()))
+            "prepare_async",
+            rt.block_on(engine.prepare_async(&source(), QUERY, &range()))
+                .map(|_| ()),
+        ),
+        (
+            "plan_instant_async",
+            rt.block_on(engine.plan_instant_async(&source(), QUERY, 60_000))
+                .map(|_| ()),
+        ),
+        (
+            "instant_query_async",
+            rt.block_on(engine.instant_query_async(&source(), QUERY, 60_000))
                 .map(|_| ()),
         ),
     ] {
         let err = result.unwrap_err();
         assert!(matches!(err, EngineError::Unsupported(_)), "{path}: {err}");
+    }
+}
+
+/// A supported gated function must reach execution through both preparation
+/// and the typed instant path, not just get past parsing to an unsupported node.
+#[tokio::test]
+async fn enabled_sort_executes_through_prepared_and_typed_instant_paths() {
+    let engine = Engine::with_options(EngineOptions { parser: FUNCTIONS });
+    let source = source();
+    let query = r#"sort_by_label_desc({__name__=~"x|y"}, "__name__")"#;
+    let prepared = engine
+        .prepare_async(&source, query, &RangeQuery::new(60_000, 60_000, 1))
+        .await
+        .unwrap();
+    let planned = engine.execute_async(&prepared).await.unwrap();
+    let InstantResult::Vector(instant) = engine
+        .instant_query_async(&source, query, 60_000)
+        .await
+        .unwrap()
+    else {
+        panic!("sort_by_label_desc must produce a vector");
+    };
+    for batches in [planned, instant] {
+        let rows = series::decode(&batches).unwrap();
+        let names: Vec<_> = rows.iter().map(|row| row.label("__name__")).collect();
+        assert_eq!(names, ["y", "x"]);
     }
 }
 

@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::num::{NonZeroU64, NonZeroUsize};
 
 use promql_engine::series::{coalesce, decode};
-use promql_engine::{InstantResult, MemorySeriesSource, RangeQuery};
+use promql_engine::{InstantResult, MemorySeriesSource, RangeQuery, SeriesIdEncoding};
 
 use crate::result::{Engine, EngineError, LoadedSeries, Point, QueryResult, Sample, Series};
 
@@ -35,6 +35,8 @@ pub enum SourceMode {
     Blocks(NonZeroU64),
     /// [`MemorySeriesSource::partitions`].
     Partitions(NonZeroUsize),
+    /// ID-contiguous one-sample chunks, tiny batches, blocks and source partitions.
+    Contiguous(SeriesIdEncoding),
 }
 
 const DEFAULT_BLOCK_MS: NonZeroU64 = NonZeroU64::new(60_000).unwrap();
@@ -44,7 +46,8 @@ impl SourceMode {
     /// The variable [`DataFusionEngine::new`] reads the mode from.
     pub const VAR: &'static str = "PROMQL_CONFORMANCE_SOURCE";
 
-    /// `plain`, `chunked[=<ms>]`, `blocks[=<ms>]` or `partitions[=<n>]`.
+    /// `plain`, `chunked[=<ms>]`, `blocks[=<ms>]`, `partitions[=<n>]`,
+    /// `contiguous-u64` or `contiguous-binary`.
     /// Bare `chunked` is one sample per chunk, so every window of the
     /// corpus crosses chunks; bare `blocks` is one minute, the step most
     /// of the corpus evaluates at, so most steps open a block; bare
@@ -56,12 +59,14 @@ impl SourceMode {
         };
         let bad = || {
             format!(
-                "{}={s:?}: expected plain, chunked[=<ms>], blocks[=<ms>] or partitions[=<n>]",
+                "{}={s:?}: expected plain, chunked[=<ms>], blocks[=<ms>], partitions[=<n>], contiguous-u64 or contiguous-binary",
                 Self::VAR
             )
         };
         match (mode, arg) {
             ("plain", None) => Ok(Self::Plain),
+            ("contiguous-u64", None) => Ok(Self::Contiguous(SeriesIdEncoding::UInt64)),
+            ("contiguous-binary", None) => Ok(Self::Contiguous(SeriesIdEncoding::FixedSizeBinary)),
             ("chunked", None) => Ok(Self::Chunked(0)),
             ("chunked", Some(ms)) => ms
                 .parse()
@@ -83,6 +88,12 @@ impl SourceMode {
             Self::Chunked(ms) => source.chunked(ms),
             Self::Blocks(ms) => source.blocks(ms),
             Self::Partitions(n) => source.partitions(n),
+            Self::Contiguous(id) => source
+                .with_ids(id)
+                .chunked(0)
+                .blocks(DEFAULT_BLOCK_MS)
+                .partitions(DEFAULT_PARTITIONS)
+                .rows_per_batch(NonZeroUsize::new(7).unwrap()),
         }
     }
 }
@@ -371,6 +382,14 @@ mod tests {
     #[test]
     fn source_modes_parse() {
         assert_eq!(SourceMode::parse("plain"), Ok(SourceMode::Plain));
+        assert_eq!(
+            SourceMode::parse("contiguous-u64"),
+            Ok(SourceMode::Contiguous(SeriesIdEncoding::UInt64))
+        );
+        assert_eq!(
+            SourceMode::parse("contiguous-binary"),
+            Ok(SourceMode::Contiguous(SeriesIdEncoding::FixedSizeBinary))
+        );
         assert_eq!(SourceMode::parse("chunked"), Ok(SourceMode::Chunked(0)));
         assert_eq!(
             SourceMode::parse("chunked=150000"),
@@ -399,6 +418,10 @@ mod tests {
             "chunked=-1",
             "partitions=0",
             "partitions=x",
+            "contiguous-u64=2",
+            "contiguous-binary=0",
+            "keyed-u64",
+            "keyed-binary",
         ] {
             assert!(SourceMode::parse(bad).is_err(), "{bad:?}");
         }
@@ -450,6 +473,8 @@ mod tests {
             SourceMode::Blocks(nz64(30_000)),
             SourceMode::Blocks(nz64(200_000)),
             SourceMode::Partitions(nz(4)),
+            SourceMode::Contiguous(SeriesIdEncoding::UInt64),
+            SourceMode::Contiguous(SeriesIdEncoding::FixedSizeBinary),
         ] {
             assert_eq!(run(mode), plain, "{mode:?}");
         }

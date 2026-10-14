@@ -1,8 +1,14 @@
-//! Micro benchmarks of the engine's kernels, DataFusion not involved.
+//! Numerical-kernel microbenchmarks and isolated preplanned series evaluation.
+//!
+//! `series_eval/*` includes DataFusion stream creation, the real executor and
+//! Arrow output construction/draining and execution-state reset, but excludes
+//! source selection/planning. Other groups drive public kernels/accumulators
+//! directly. `aggregate/singleton_spans` isolates legal descending span growth;
+//! benches/README.md gives the bounded serial comparison and profile commands.
 //!
 //! Every group is named `area/function` and parameterized by input size,
 //! so a tracker keys a stable history on ids like
-//! `selector/eval_series/plain/16000`. Names are chosen once: renaming a
+//! `series_eval/selector/plain/16000`. Names are chosen once: renaming a
 //! benchmark resets its history. Fixtures are deterministic and built
 //! outside the timed closure. To compare two states of the code:
 //!
@@ -22,18 +28,22 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Schema};
 use datafusion::common::ScalarValue;
+use datafusion::execution::TaskContext;
 use datafusion::logical_expr::function::AccumulatorArgs;
-use datafusion::logical_expr::{AggregateUDF, EmitTo, GroupsAccumulator};
+use datafusion::logical_expr::{EmitTo, GroupsAccumulator};
 use datafusion::physical_expr::expressions::{Column, Literal};
 use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::execution_plan::reset_plan_states;
+use datafusion::physical_plan::{collect, execute_stream, ExecutionPlan};
+use futures::StreamExt;
 use promql_engine::aggregate::{Grouped, Op};
 use promql_engine::binary::{self, Op as BinOp};
 use promql_engine::elementwise;
 use promql_engine::math::{self, FlagLane, Welford};
-use promql_engine::range::{self, Func};
-use promql_engine::selector::{self, STALE_NAN_BITS};
+use promql_engine::range::Func;
+use promql_engine::selector::STALE_NAN_BITS;
 use promql_engine::series::{self, Block, Series};
-use promql_engine::Params;
+use promql_engine::{Engine, MemorySeriesSource, Params, RangeQuery};
 
 #[path = "support/pprof.rs"]
 mod profiler;
@@ -235,172 +245,164 @@ fn math_reductions(c: &mut Criterion) {
     g.finish();
 }
 
-/// The selector or a range function as the plan runs it: its aggregate's
-/// accumulator, built from the same literal arguments the planner writes,
-/// fed a `samples` column and emptied. Params reach the kernel only as
-/// those literals, so this is the one public way in, and it keeps the
-/// output's Arrow building in the timed path because the plan pays it too.
-fn eval_series(
-    udaf: &AggregateUDF,
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+/// The sole evaluator is reached through a preplanned public engine query;
+/// benchmark-only wrappers must not keep the removed native UDAFs alive.
+fn selected_plan(
+    rt: &tokio::runtime::Runtime,
     func: Option<Func>,
     p: &Params,
-    samples: &ArrayRef,
-    groups: &[usize],
-    total: usize,
-) -> ArrayRef {
-    let mut args: Vec<ScalarValue> = func
-        .map(|f| ScalarValue::from(f.as_str()))
-        .into_iter()
-        .collect();
-    args.extend([
-        ScalarValue::Int64(Some(p.start_ms)),
-        ScalarValue::Int64(Some(p.end_ms)),
-        ScalarValue::Int64(Some(p.step_ms)),
-        ScalarValue::Int64(Some(p.window_ms)),
-        ScalarValue::Int64(Some(p.offset_ms)),
-        ScalarValue::Int64(p.at_ms),
-    ]);
-    // Only the selector picks between a sample's value and its time.
-    if func.is_none() {
-        args.push(ScalarValue::Boolean(Some(false)));
-    }
-    let mut exprs: Vec<Arc<dyn PhysicalExpr>> = vec![
-        Arc::new(Column::new(series::SAMPLES, 0)),
-        Arc::new(Column::new(series::BLOCK_START, 1)),
-        Arc::new(Column::new(series::BLOCK_END, 2)),
-    ];
-    // The function name sits between the block and the grid literals.
-    let mut args = args.into_iter();
-    if func.is_some() {
-        exprs.push(Arc::new(Literal::new(args.next().unwrap())));
-    }
-    // Every series folds in one block, so the block columns are literals.
-    exprs.extend(args.map(|v| Arc::new(Literal::new(v)) as Arc<dyn PhysicalExpr>));
-    let schema = Schema::new(vec![
-        Field::new(series::SAMPLES, series::samples_type(), false),
-        Field::new(series::BLOCK_START, series::timestamp_type(), false),
-        Field::new(series::BLOCK_END, series::timestamp_type(), false),
-    ]);
-    let fields: Vec<FieldRef> = exprs
-        .iter()
-        .map(|e| e.return_field(&schema).unwrap())
-        .collect();
-    let mut acc = udaf
-        .create_groups_accumulator(AccumulatorArgs {
-            return_field: Arc::new(Field::new(series::SAMPLES, series::samples_type(), false)),
-            schema: &schema,
-            ignore_nulls: false,
-            order_bys: &[],
-            is_reversed: false,
-            name: udaf.name(),
-            is_distinct: false,
-            exprs: &exprs,
-            expr_fields: &fields,
-        })
-        .unwrap();
-    let [start, end] = WHOLE.columns(samples.len());
-    acc.update_batch(&[Arc::clone(samples), start, end], groups, None, total)
-        .unwrap();
-    acc.evaluate(EmitTo::All).unwrap()
+    rows: Vec<Series>,
+) -> Arc<dyn ExecutionPlan> {
+    assert_eq!(p.offset_ms, 0);
+    let modifier = p
+        .at_ms
+        .map(|at| format!(" @ {}", at / 1000))
+        .unwrap_or_default();
+    let query = match func {
+        Some(func) => format!(
+            "{}(http_requests_total[{}ms]{modifier})",
+            func.as_str(),
+            p.window_ms
+        ),
+        None => format!("http_requests_total{modifier}"),
+    };
+    let source = MemorySeriesSource::try_new(rows).unwrap();
+    rt.block_on(Engine::new().prepare_async(
+        &source,
+        &query,
+        &RangeQuery::new(p.start_ms, p.end_ms, p.step_ms),
+    ))
+    .unwrap()
+    .physical_plan()
+    .clone()
 }
 
-/// A grid the literals got wrong answers no step, and the bench would then
-/// time an empty walk without anyone noticing.
-fn assert_answers(out: &ArrayRef) {
-    let out = out.as_list::<i32>();
-    assert!((0..out.len()).all(|r| !out.value(r).is_empty()));
+fn drain_plan(rt: &tokio::runtime::Runtime, plan: &Arc<dyn ExecutionPlan>, ctx: &Arc<TaskContext>) {
+    rt.block_on(async {
+        let plan = reset_plan_states(plan.clone()).unwrap();
+        let mut stream = execute_stream(plan, ctx.clone()).unwrap();
+        while let Some(batch) = stream.next().await {
+            black_box(batch.unwrap());
+        }
+    });
 }
 
-/// One series walked across the step grid: upstream's `evalSeries` loop.
+/// A benchmark must not silently time an empty grid or empty output.
+fn assert_answers(
+    rt: &tokio::runtime::Runtime,
+    plan: &Arc<dyn ExecutionPlan>,
+    ctx: &Arc<TaskContext>,
+) {
+    let plan = reset_plan_states(plan.clone()).unwrap();
+    let batches = rt.block_on(collect(plan, ctx.clone())).unwrap();
+    assert!(batches.iter().any(|batch| batch.num_rows() > 0));
+    for batch in batches {
+        let out = batch
+            .column_by_name(series::SAMPLES)
+            .unwrap()
+            .as_list::<i32>();
+        assert!((0..out.len()).all(|row| !out.value(row).is_empty()));
+    }
+}
+
+fn single_counter(ts: Vec<i64>, vs: Vec<f64>) -> Vec<Series> {
+    vec![Series::new(&[("__name__", "http_requests_total")], ts, vs).unwrap()]
+}
+
+/// One series walked across the grid by the real `SeriesEvalExec`.
 fn selector_eval_series(c: &mut Criterion) {
-    let udaf = selector::udaf();
-    let mut g = c.benchmark_group("selector/eval_series");
+    let rt = runtime();
+    let ctx = Arc::new(TaskContext::default());
+    let mut g = c.benchmark_group("series_eval/selector");
     for n in LENGTHS {
         let (ts, vs) = counter(n);
         let stale = with_stale(&vs, 100);
-        let plain = samples_of(&[(ts.clone(), vs)]);
-        let stale = samples_of(&[(ts, stale)]);
         let p = selector_params(n);
         let pinned = Params {
             at_ms: Some(p.end_ms),
             ..p
         };
         g.throughput(Throughput::Elements(n as u64));
-        for (name, column, p) in [
-            ("plain", &plain, &p),
-            ("stale_every_100", &stale, &p),
-            ("at_pinned", &plain, &pinned),
+        for (name, rows, p) in [
+            ("plain", single_counter(ts.clone(), vs.clone()), &p),
+            ("stale_every_100", single_counter(ts.clone(), stale), &p),
+            ("at_pinned", single_counter(ts, vs), &pinned),
         ] {
-            assert_answers(&eval_series(&udaf, None, p, column, &[0], 1));
+            let plan = selected_plan(&rt, None, p, rows);
+            assert_answers(&rt, &plan, &ctx);
             g.bench_function(BenchmarkId::new(name, n), |b| {
-                b.iter(|| eval_series(&udaf, None, p, black_box(column), &[0], 1))
+                b.iter(|| drain_plan(&rt, black_box(&plan), &ctx))
             });
         }
     }
     g.finish();
 }
 
-/// The vector selector over a whole Arrow column of series, one group per
-/// series, allocation of the output included.
+/// A thousand identities; output construction is timed, selection is not.
 fn selector_apply(c: &mut Criterion) {
     let (k, n) = (1_000usize, 1_000usize);
-    let all = labelled(k, n);
-    let batch = series::encode(&series::label_names_of(&all), &all, WHOLE).unwrap();
-    let samples = Arc::clone(batch.column_by_name(series::SAMPLES).unwrap());
-    let groups: Vec<usize> = (0..k).collect();
-    let udaf = selector::udaf();
-    let p = selector_params(n);
-    let mut g = c.benchmark_group("selector/apply");
+    let rt = runtime();
+    let ctx = Arc::new(TaskContext::default());
+    let plan = selected_plan(&rt, None, &selector_params(n), labelled(k, n));
+    assert_answers(&rt, &plan, &ctx);
+    let mut g = c.benchmark_group("series_eval/selector_apply");
     g.throughput(Throughput::Elements((k * n) as u64));
     g.bench_function(BenchmarkId::from_parameter(format!("{k}x{n}")), |b| {
-        b.iter(|| eval_series(&udaf, None, &p, black_box(&samples), &groups, k))
+        b.iter(|| drain_plan(&rt, black_box(&plan), &ctx))
     });
     g.finish();
 }
 
-/// One series through a range function across the step grid. The window
-/// buffer and the sweep are crate-private, so this drives them through the
-/// function's accumulator over a single row; the accumulator is one row's
-/// worth of overhead on top of the same walk.
+/// Buffer and sweep internals stay private; this times their production driver.
 fn range_function(c: &mut Criterion) {
-    let udaf = range::udaf();
-    let mut g = c.benchmark_group("range/range_function");
+    let rt = runtime();
+    let ctx = Arc::new(TaskContext::default());
+    let mut g = c.benchmark_group("series_eval/range");
     for n in LENGTHS {
         let (ts, vs) = counter(n);
         let stale = with_stale(&vs, 100);
-        let plain = samples_of(&[(ts.clone(), vs)]);
-        let stale = samples_of(&[(ts, stale)]);
         let p = range_params(n);
         g.throughput(Throughput::Elements(n as u64));
-        for (name, func, column) in [
-            ("rate", Func::Rate, &plain),
-            ("increase", Func::Increase, &plain),
-            ("count_over_time", Func::CountOverTime, &plain),
-            ("max_over_time", Func::MaxOverTime, &plain),
+        for (name, func, values) in [
+            ("rate", Func::Rate, &vs),
+            ("increase", Func::Increase, &vs),
+            ("count_over_time", Func::CountOverTime, &vs),
+            ("max_over_time", Func::MaxOverTime, &vs),
             ("rate_stale_every_100", Func::Rate, &stale),
         ] {
-            assert_answers(&eval_series(&udaf, Some(func), &p, column, &[0], 1));
+            let plan = selected_plan(
+                &rt,
+                Some(func),
+                &p,
+                single_counter(ts.clone(), values.clone()),
+            );
+            assert_answers(&rt, &plan, &ctx);
             g.bench_function(BenchmarkId::new(name, n), |b| {
-                b.iter(|| eval_series(&udaf, Some(func), &p, black_box(column), &[0], 1))
+                b.iter(|| drain_plan(&rt, black_box(&plan), &ctx))
             });
         }
     }
     g.finish();
 }
 
-/// `rate` over a whole Arrow column of series, one group per series.
+/// `rate` over a thousand identities through the sole executor.
 fn range_apply(c: &mut Criterion) {
     let (k, n) = (1_000usize, 1_000usize);
-    let all = labelled(k, n);
-    let batch = series::encode(&series::label_names_of(&all), &all, WHOLE).unwrap();
-    let samples = Arc::clone(batch.column_by_name(series::SAMPLES).unwrap());
-    let groups: Vec<usize> = (0..k).collect();
-    let udaf = range::udaf();
-    let p = range_params(n);
-    let mut g = c.benchmark_group("range/apply");
+    let rt = runtime();
+    let ctx = Arc::new(TaskContext::default());
+    let plan = selected_plan(&rt, Some(Func::Rate), &range_params(n), labelled(k, n));
+    assert_answers(&rt, &plan, &ctx);
+    let mut g = c.benchmark_group("series_eval/range_apply");
     g.throughput(Throughput::Elements((k * n) as u64));
     g.bench_function(BenchmarkId::new("rate", format!("{k}x{n}")), |b| {
-        b.iter(|| eval_series(&udaf, Some(Func::Rate), &p, black_box(&samples), &groups, k))
+        b.iter(|| drain_plan(&rt, black_box(&plan), &ctx))
     });
     g.finish();
 }
@@ -438,6 +440,42 @@ fn aggregate_add_series(c: &mut Criterion) {
     g.finish();
 }
 
+/// Singleton contributions in legal between-ID order. This isolates lane
+/// front growth in Prometheus `aggregation` (83962c35) from source/planner
+/// work. Ascending is the control; descending must not repeatedly move the
+/// entire accumulated span. Values and update order are never pre-reduced.
+fn aggregate_singleton_spans(c: &mut Criterion) {
+    let mut g = c.benchmark_group("aggregate/singleton_spans");
+    for steps in [1024usize, 8192] {
+        let end_ms = (steps as i64 - 1) * STEP_MS;
+        let groups = vec![0; steps];
+        g.throughput(Throughput::Elements(steps as u64));
+        for descending in [false, true] {
+            let rows: Vec<_> = (0..steps)
+                .map(|i| {
+                    let step = if descending { steps - 1 - i } else { i };
+                    (vec![step as i64 * STEP_MS], vec![1.0])
+                })
+                .collect();
+            let column = samples_of(&rows);
+            let mut probe = filled(Op::Sum, &column, &groups, end_ms, 1);
+            let result = probe.evaluate(EmitTo::All).unwrap();
+            let list = result.as_list::<i32>();
+            assert_eq!(list.len(), 1);
+            assert_eq!(list.value(0).len(), steps);
+            let name = if descending {
+                "descending"
+            } else {
+                "ascending"
+            };
+            g.bench_function(BenchmarkId::new(name, steps), |b| {
+                b.iter(|| filled(Op::Sum, black_box(&column), &groups, end_ms, 1))
+            });
+        }
+    }
+    g.finish();
+}
+
 /// The shuffle between the two aggregation phases: serializing one
 /// accumulator's state and merging it into another. Emitting the state
 /// consumes the accumulator's lanes, so each sample refills one outside
@@ -466,7 +504,7 @@ fn aggregate_state_merge(c: &mut Criterion) {
             |b| {
                 b.iter(|| {
                     let mut acc = Grouped::new(op, 0, end_ms, STEP_MS).unwrap();
-                    acc.merge_batch(std::slice::from_ref(black_box(&state)), &[0], None, 1)
+                    acc.merge_batch(std::slice::from_ref(black_box(&state)), &[0], 1)
                         .unwrap();
                     acc.evaluate(EmitTo::All).unwrap()
                 })
@@ -700,6 +738,7 @@ criterion_group! {
         range_function,
         range_apply,
         aggregate_add_series,
+        aggregate_singleton_spans,
         aggregate_state_merge,
         binary_pairing,
         elementwise_binary,

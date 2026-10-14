@@ -190,9 +190,8 @@ fn replay_against_chunked() {
 /// One chunk per batch, on top of `chunked(0)`'s one sample per chunk: every
 /// step lands in its own batch. Packing to `ROWS_PER_BATCH` (8192) leaves
 /// the whole corpus in one batch at 150s and 1h chunks, so without this
-/// the per-batch emit, the re-reserve of the still-open series and
-/// `SeriesSetExec`'s cross-batch `RowConverter` path would only be
-/// exercised by `tests/chunked.rs`, not by the recorded corpus.
+/// the per-batch emit and the re-reserve of the still-open series would
+/// only be exercised by `tests/chunked.rs`, not by the recorded corpus.
 #[test]
 fn replay_against_chunked_one_row_per_batch() {
     let corpus = load_corpus();

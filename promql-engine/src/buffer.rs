@@ -6,37 +6,138 @@
 //! buffer rather than kept as a slice of its batch. A retained slice would
 //! pin the whole batch's child buffers, other series' samples included, and
 //! every kernel indexes one contiguous slice; the copy replaces the
-//! staleness filter the range kernel pays anyway. A chunk that arrives with
-//! the buffer empty is walked where it lies and only its tail is copied,
-//! unless it needs `@`'s pinned window trimmed or a range kernel would
-//! otherwise see a stale marker — either sends it through the buffer
-//! instead, copying it whole.
+//! staleness filter the range kernel pays anyway. Ingestion is bounded, even
+//! for a second chunk or one containing stale markers. Ready steps drain
+//! before more samples enter, and unreachable future tails are never copied.
+//! Sample/step cursors survive a work-budget boundary; a range kernel's value
+//! calculation and amortised buffer compaction remain indivisible.
 //!
-//! Steps are evaluated as soon as their window can no longer change, not at
-//! series close. Otherwise the buffer would hold the whole series, which is
-//! 172,800 samples for a store that sends 30 days at 15 s as one block;
-//! evaluated eagerly it holds a window. The output row is still only
-//! visible once the series closes.
+//! Multi-step selectors and range kernels evaluate as soon as their window
+//! can no longer change, not at series close. Otherwise the buffer would hold
+//! the whole series, which is 172,800 samples for a store that sends 30 days
+//! at 15 s as one block; evaluated eagerly it holds a window. Exactly one
+//! selector step retains only its latest eligible original sample and emits
+//! it on close, with no history allocation. Row visibility and boundaries
+//! remain the caller's, not the numerical iterator's.
 //!
-//! Blocks are the caller's: `params` is the grid of the steps one block
+//! Blocks are the caller's: `EvalContext` is the grid of the steps one block
 //! answers, and `close` at the block edge leaves nothing of the series
 //! behind, so the reach-back a block repeats is folded afresh.
 
-use crate::aggregate::MAX_STEPS;
 use crate::params::{step_count, Params};
 use crate::range::{advance_range, Func, Sweep};
 use crate::selector::{advance_selector, is_stale, Pick};
-use crate::series::SamplesBuilder;
 
+/// Maximum new history between readiness/retirement checks, independent of
+/// the raw row size. This is an ingestion allowance, not a window-size cap.
+const INGEST_SAMPLES: usize = 256;
+
+/// Counts ingestion, edge movement, sweep queue pops, and evaluated steps.
+/// It bounds cursor progress, not elapsed time. A range value calculation is
+/// charged after its indivisible fold (so may overrun by that one call).
+/// Binary search, allocation and amortised compaction cannot be preempted.
+pub(crate) struct WorkBudget {
+    remaining: usize,
+}
+impl WorkBudget {
+    pub(crate) fn new(units: usize) -> Self {
+        Self { remaining: units }
+    }
+
+    pub(crate) fn take(&mut self) -> bool {
+        if self.remaining == 0 {
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
+
+    fn take_up_to(&mut self, count: usize) -> usize {
+        let count = count.min(self.remaining);
+        self.remaining -= count;
+        count
+    }
+
+    pub(crate) fn exhausted(&self) -> bool {
+        self.remaining == 0
+    }
+
+    pub(crate) fn account_kernel(&mut self, samples: usize) {
+        self.remaining = self.remaining.saturating_sub(samples);
+    }
+}
+
+/// Position in one raw row, retained until both ingestion and its ready steps
+/// complete. A row's final timestamp is claimed only after its reachable
+/// prefix is consumed (dead prefixes and future tails can be skipped).
+#[derive(Default)]
+pub(crate) struct PushCursor {
+    position: usize,
+    started: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Hash)]
 pub(crate) enum Kernel {
     Selector(Pick),
     Range(Func),
 }
 
+/// Immutable configuration belongs to the block, not to each series. The
+/// cached count changes only together with its grid.
+#[derive(Debug)]
+pub(crate) struct EvalContext {
+    kernel: Kernel,
+    params: Params,
+    steps: i128,
+}
+
+impl EvalContext {
+    pub(crate) fn new(kernel: Kernel, params: Params) -> Self {
+        Self {
+            kernel,
+            params,
+            steps: step_count(params.start_ms, params.end_ms, params.step_ms),
+        }
+    }
+
+    pub(crate) fn kernel(&self) -> Kernel {
+        self.kernel
+    }
+
+    pub(crate) fn params(&self) -> Params {
+        self.params
+    }
+
+    pub(crate) fn steps(&self) -> i128 {
+        self.steps
+    }
+
+    pub(crate) fn step_at(&self, i: i128) -> i64 {
+        (i128::from(self.params.start_ms) + i * i128::from(self.params.step_ms)) as i64
+    }
+
+    #[cfg(test)]
+    pub(crate) fn timestamps(&self) -> impl Iterator<Item = i64> + '_ {
+        (0..self.steps).map(|i| self.step_at(i))
+    }
+}
+
 pub(crate) struct BufferedSeriesIterator {
-    pub(crate) kernel: Kernel,
+    state: SeriesState,
+}
+
+/// A one-step selector needs neither history nor a sweep. Keeping these
+/// owners exclusive avoids adding a candidate to every range window.
+enum SeriesState {
+    Window(WindowBuffer),
+    Candidate {
+        sample: Option<(i64, f64)>,
+        last_t: Option<i64>,
+    },
+}
+
+pub(crate) struct WindowBuffer {
     pub(crate) sweep: Option<Sweep>,
-    pub(crate) params: Params,
     pub(crate) ts: Vec<i64>,
     pub(crate) vs: Vec<f64>,
     /// Absolute ordinal `i` lives at `[i - base]`.
@@ -47,20 +148,154 @@ pub(crate) struct BufferedSeriesIterator {
     pub(crate) hi: usize,
     /// Index into the step grid of the first step not yet evaluated.
     pub(crate) next_step: i128,
-    /// Overlap rule; stale markers count.
+    /// Readiness watermark of the consumed prefix; completed rows use this
+    /// for overlap, including timestamps claimed by filtered stale markers.
     pub(crate) last_t: Option<i64>,
+    /// `@` computes one value once, then emits it resumably over the grid.
+    pub(crate) pinned_value: Option<Option<f64>>,
 }
 
 impl BufferedSeriesIterator {
-    pub(crate) fn new(kernel: Kernel, params: Params) -> Self {
-        let sweep = match kernel {
+    pub(crate) fn new(context: &EvalContext) -> Self {
+        let state = if matches!(context.kernel(), Kernel::Selector(_)) && context.steps() == 1 {
+            SeriesState::Candidate {
+                sample: None,
+                last_t: None,
+            }
+        } else {
+            SeriesState::Window(WindowBuffer::new(context))
+        };
+        Self { state }
+    }
+
+    /// Chunks must ascend by first timestamp. The callback sees numerical
+    /// samples only; the caller owns visibility and Arrow row boundaries.
+    #[cfg(test)]
+    pub(crate) fn push(
+        &mut self,
+        context: &EvalContext,
+        ts: &[i64],
+        vs: &[f64],
+        emit: impl FnMut(i64, f64),
+    ) {
+        assert!(self.push_budgeted(
+            context,
+            ts,
+            vs,
+            &mut PushCursor::default(),
+            &mut WorkBudget::new(usize::MAX),
+            emit,
+        ));
+    }
+
+    /// True only when this row and all currently ready steps are consumed.
+    pub(crate) fn push_budgeted(
+        &mut self,
+        context: &EvalContext,
+        ts: &[i64],
+        vs: &[f64],
+        cursor: &mut PushCursor,
+        budget: &mut WorkBudget,
+        mut emit: impl FnMut(i64, f64),
+    ) -> bool {
+        debug_assert_eq!(ts.len(), vs.len());
+        match &mut self.state {
+            SeriesState::Window(window) => {
+                return window.push(context, ts, vs, cursor, budget, &mut emit);
+            }
+            SeriesState::Candidate { sample, last_t } => {
+                if !budget.take() {
+                    return false;
+                }
+                let Some(&last) = ts.last() else {
+                    return true;
+                };
+                let previous = *last_t;
+                // The full chunk claims overlap, even beyond the lookup or
+                // at a stale marker. An ineligible chunk keeps an older pick.
+                *last_t = previous.max(Some(last));
+                let p = context.params();
+                let first_start = p
+                    .at_ms
+                    .unwrap_or(p.start_ms)
+                    .saturating_sub(p.offset_ms)
+                    .saturating_sub(p.window_ms);
+                if last <= first_start {
+                    return true;
+                }
+                let end = p.at_ms.unwrap_or(p.start_ms) - p.offset_ms;
+                // Once an earlier chunk claims the lookup end, no later
+                // non-overlapping sample can change the candidate.
+                if previous.is_some_and(|last| last >= end) {
+                    return true;
+                }
+                let from = previous.map_or(0, |last| ts.partition_point(|t| *t <= last));
+                let ts = &ts[from..];
+                let vs = &vs[from..];
+                let hi = ts.partition_point(|t| *t <= end);
+                if hi > 0 && ts[hi - 1] > end - p.window_ms {
+                    *sample = Some((ts[hi - 1], vs[hi - 1]));
+                }
+            }
+        }
+        true
+    }
+
+    /// Emits remaining samples and resets numerics, retaining window/sweep
+    /// capacities. Repeated close without push emits nothing, not an empty row.
+    #[cfg(test)]
+    pub(crate) fn close(&mut self, context: &EvalContext, emit: impl FnMut(i64, f64)) {
+        assert!(self.close_budgeted(context, &mut WorkBudget::new(usize::MAX), emit));
+    }
+
+    /// False leaves the close cursor and all allocations alive for resumption.
+    pub(crate) fn close_budgeted(
+        &mut self,
+        context: &EvalContext,
+        budget: &mut WorkBudget,
+        mut emit: impl FnMut(i64, f64),
+    ) -> bool {
+        match &mut self.state {
+            SeriesState::Window(window) => {
+                return window.close(context, budget, &mut emit);
+            }
+            SeriesState::Candidate { sample, last_t } => {
+                if !budget.take() {
+                    return false;
+                }
+                if let Some((t, v)) = sample.take() {
+                    // `vectorSelectorSingle`: stale bits belong to the
+                    // original value, before timestamp's Pick conversion.
+                    if !is_stale(v) {
+                        let Kernel::Selector(pick) = context.kernel() else {
+                            unreachable!("candidate belongs to a selector");
+                        };
+                        emit(context.params().start_ms, pick.of(t, v));
+                    }
+                }
+                *last_t = None;
+            }
+        }
+        true
+    }
+
+    pub(crate) fn size(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + match &self.state {
+                SeriesState::Window(window) => window.heap_size(),
+                SeriesState::Candidate { .. } => 0,
+            }
+    }
+}
+
+impl WindowBuffer {
+    pub(crate) fn new(context: &EvalContext) -> Self {
+        let sweep = match context.kernel() {
             Kernel::Range(func) => Sweep::new(func),
             Kernel::Selector(_) => None,
         };
         Self {
-            kernel,
             sweep,
-            params,
             ts: Vec::new(),
             vs: Vec::new(),
             base: 0,
@@ -68,43 +303,146 @@ impl BufferedSeriesIterator {
             hi: 0,
             next_step: 0,
             last_t: None,
+            pinned_value: None,
         }
     }
 
-    /// Folds one chunk. Evaluates into `out`'s open row every step whose
-    /// window can no longer change, then trims the buffer below `lo`.
-    ///
-    /// Chunks of one series must ascend by first timestamp; `SeriesSetExec`
-    /// checks that with the labels at hand for the message, so this cannot
-    /// fail.
-    pub(crate) fn push(&mut self, ts: &[i64], vs: &[f64], out: &mut SamplesBuilder) {
-        debug_assert_eq!(ts.len(), vs.len());
+    fn push(
+        &mut self,
+        context: &EvalContext,
+        ts: &[i64],
+        vs: &[f64],
+        cursor: &mut PushCursor,
+        budget: &mut WorkBudget,
+        emit: &mut impl FnMut(i64, f64),
+    ) -> bool {
         let Some(&last) = ts.last() else {
-            return;
+            return true;
         };
-        if self.skip_chunk(ts) {
-            self.last_t = self.last_t.max(Some(last));
-            return;
+        let p = context.params();
+        // Prometheus `matrixIterSlice` / `vectorSelectorSingle` (83962c35):
+        // no sample after the last lookup can affect this grid. It still
+        // claims overlap when the row completes, including stale markers.
+        let final_end = p.at_ms.unwrap_or_else(|| {
+            if context.steps() > 0 {
+                context.step_at(context.steps() - 1)
+            } else {
+                p.start_ms
+            }
+        }) - p.offset_ms;
+        if !cursor.started {
+            cursor.position = self
+                .last_t
+                .map_or(0, |last| ts.partition_point(|t| *t <= last));
+            cursor.started = true;
         }
-        if self.ts.is_empty() && self.in_place(vs) {
-            self.push_in_place(ts, vs, out);
-            return;
+        loop {
+            // Do not ingest another allowance while a ready step is suspended.
+            if self.ready(context) {
+                self.advance_buffered(context, budget, emit);
+                self.reduce_delta();
+                if self.next_step >= context.steps() {
+                    self.retire_history();
+                }
+                if self.ready(context) {
+                    return false;
+                }
+            }
+            if cursor.position == ts.len() {
+                return true;
+            }
+            if budget.exhausted() {
+                return false;
+            }
+            if self.next_step >= context.steps()
+                || (matches!(context.kernel(), Kernel::Range(_)) && p.window_ms <= 0)
+            {
+                self.next_step = context.steps();
+                self.last_t = self.last_t.max(Some(last));
+                cursor.position = ts.len();
+                return true;
+            }
+            // Searches skip dead prefixes without scanning them. Overlap was
+            // removed only at row entry: equal timestamps within this row must
+            // not acquire a new precedence rule at an ingestion boundary.
+            let start = p
+                .at_ms
+                .unwrap_or_else(|| context.step_at(self.next_step))
+                .saturating_sub(p.offset_ms)
+                .saturating_sub(p.window_ms);
+            cursor.position += ts[cursor.position..].partition_point(|t| *t <= start);
+            if cursor.position == ts.len() || ts[cursor.position] > final_end {
+                self.last_t = self.last_t.max(Some(last));
+                cursor.position = ts.len();
+                continue;
+            }
+            let from = cursor.position;
+            let count = budget.take_up_to(INGEST_SAMPLES.min(ts.len() - from));
+            let until = from + count;
+            // Even a slice that straddles the last lookup copies no future tail.
+            let end = from + ts[from..until].partition_point(|t| *t <= final_end);
+            // A row may contain equal timestamps. Do not finalise a step
+            // halfway through such a run just because an allowance ended.
+            self.last_t = if until < ts.len() && ts[until] == ts[until - 1] {
+                ts[until - 1].checked_sub(1)
+            } else {
+                Some(ts[until - 1])
+            };
+            let (slice_ts, slice_vs) = (&ts[from..end], &vs[from..end]);
+            if self.ts.is_empty()
+                && p.at_ms.is_none()
+                && (matches!(context.kernel(), Kernel::Selector(_))
+                    || !slice_vs.iter().any(|v| is_stale(*v)))
+            {
+                // Keep the borrowed fast path for small ordinary rows, but
+                // inspect/walk at most one allowance, never the whole row.
+                // If a step suspends, copy only its reachable suffix before
+                // returning: ordinals survive the change of backing storage.
+                debug_assert_eq!(self.lo, self.base);
+                debug_assert_eq!(self.hi, self.base);
+                self.advance(context, slice_ts, slice_vs, budget, emit);
+                if self.next_step >= context.steps() {
+                    self.retire_history();
+                } else {
+                    let keep = self.lo - self.base;
+                    self.ts.extend_from_slice(&slice_ts[keep..]);
+                    self.vs.extend_from_slice(&slice_vs[keep..]);
+                    self.base = self.lo;
+                }
+            } else {
+                self.append(context, slice_ts, slice_vs);
+            }
+            cursor.position = until;
         }
-        self.append(ts, vs);
-        self.advance_buffered(false, out);
-        self.reduce_delta();
     }
 
-    /// Evaluates the remaining steps, finishes `out`'s row, resets for the
-    /// next series while keeping capacity.
-    pub(crate) fn close(&mut self, out: &mut SamplesBuilder) {
-        // With nothing buffered, no step left has a sample to read.
-        if !self.ts.is_empty() {
-            // Every sample is in: no window can change any more.
-            self.last_t = Some(i64::MAX);
-            self.advance_buffered(true, out);
+    fn ready(&self, context: &EvalContext) -> bool {
+        if self.next_step >= context.steps() {
+            return false;
         }
-        out.finish_row();
+        let p = context.params();
+        if matches!(context.kernel(), Kernel::Range(_)) && p.window_ms <= 0 {
+            return false;
+        }
+        let end = p.at_ms.unwrap_or_else(|| context.step_at(self.next_step)) - p.offset_ms;
+        self.last_t.is_some_and(|last| end <= last)
+    }
+
+    fn close(
+        &mut self,
+        context: &EvalContext,
+        budget: &mut WorkBudget,
+        emit: &mut impl FnMut(i64, f64),
+    ) -> bool {
+        // A pinned value may still need repetition after history is retired.
+        if !self.ts.is_empty() || self.pinned_value.is_some() {
+            self.last_t = Some(i64::MAX);
+            self.advance_buffered(context, budget, emit);
+            self.reduce_delta();
+            if self.ready(context) {
+                return false;
+            }
+        }
         self.ts.clear();
         self.vs.clear();
         self.base = 0;
@@ -112,122 +450,54 @@ impl BufferedSeriesIterator {
         self.hi = 0;
         self.next_step = 0;
         self.last_t = None;
+        self.pinned_value = None;
         if let Some(sweep) = self.sweep.as_mut() {
             sweep.reset();
         }
+        true
     }
 
-    pub(crate) fn size(&self) -> usize {
-        std::mem::size_of::<Self>()
-            + self.ts.capacity() * std::mem::size_of::<i64>()
+    fn heap_size(&self) -> usize {
+        self.ts.capacity() * std::mem::size_of::<i64>()
             + self.vs.capacity() * std::mem::size_of::<f64>()
-    }
-
-    pub(crate) fn steps(&self) -> i128 {
-        let p = &self.params;
-        step_count(p.start_ms, p.end_ms, p.step_ms)
-    }
-
-    /// An upper bound on what the open series still emits: one sample per
-    /// step not yet evaluated. Capped because the functions are reachable
-    /// from SQL, past the planner's grid check.
-    pub(crate) fn steps_left(&self) -> usize {
-        (self.steps() - self.next_step).clamp(0, MAX_STEPS as i128) as usize
-    }
-
-    /// The timestamp of step `i` on the grid.
-    pub(crate) fn step_at(&self, i: i128) -> i64 {
-        (i128::from(self.params.start_ms) + i * i128::from(self.params.step_ms)) as i64
+            + self.sweep.as_ref().map_or(0, Sweep::heap_size)
     }
 
     /// `ts`/`vs` are the series' samples from ordinal `base` on, the
     /// buffer's or a chunk's.
-    fn advance(&mut self, ts: &[i64], vs: &[f64], done: bool, out: &mut SamplesBuilder) {
-        match self.kernel {
-            Kernel::Selector(pick) => advance_selector(self, ts, vs, pick, out),
-            Kernel::Range(func) => advance_range(self, ts, vs, func, done, |t, v| out.push(t, v)),
+    fn advance(
+        &mut self,
+        context: &EvalContext,
+        ts: &[i64],
+        vs: &[f64],
+        budget: &mut WorkBudget,
+        emit: &mut impl FnMut(i64, f64),
+    ) {
+        match context.kernel() {
+            Kernel::Selector(pick) => advance_selector(self, context, ts, vs, pick, budget, emit),
+            Kernel::Range(func) => advance_range(self, context, ts, vs, func, budget, emit),
         }
     }
 
-    /// The kernels take the samples as slices so that a chunk can be walked
-    /// in place; the buffer is lent to them for the call, which moves no
-    /// samples.
-    fn advance_buffered(&mut self, done: bool, out: &mut SamplesBuilder) {
+    /// Lend the owned history without moving samples. Kernels keep absolute
+    /// ordinals, including when a budget suspends an edge walk mid-step.
+    fn advance_buffered(
+        &mut self,
+        context: &EvalContext,
+        budget: &mut WorkBudget,
+        emit: &mut impl FnMut(i64, f64),
+    ) {
         let (ts, vs) = (std::mem::take(&mut self.ts), std::mem::take(&mut self.vs));
-        self.advance(&ts, &vs, done, out);
+        self.advance(context, &ts, &vs, budget, emit);
         (self.ts, self.vs) = (ts, vs);
     }
 
-    /// Whether a chunk can be walked as it arrived. A pinned window is
-    /// trimmed on copy, and the range kernels must not see a stale marker,
-    /// so either goes through [`append`](Self::append).
-    fn in_place(&self, vs: &[f64]) -> bool {
-        self.params.at_ms.is_none()
-            && (matches!(self.kernel, Kernel::Selector(_)) || !vs.iter().any(|v| is_stale(*v)))
-    }
-
-    /// Walks the chunk's steps off the chunk itself, then copies what a
-    /// later step still reads. With nothing buffered the chunk's first
-    /// sample is ordinal `base`, so the kernels' ordinals, a sweep's
-    /// included, hold across the copy exactly as across `reduce_delta`.
-    fn push_in_place(&mut self, ts: &[i64], vs: &[f64], out: &mut SamplesBuilder) {
-        debug_assert!(self.lo == self.base && self.hi == self.base);
-        let from = self
-            .last_t
-            .map_or(0, |last| ts.partition_point(|t| *t <= last));
-        let (ts, vs) = (&ts[from..], &vs[from..]);
-        let Some(&last) = ts.last() else {
-            return;
-        };
-        self.last_t = Some(last);
-        self.advance(ts, vs, false, out);
-        let keep = self.lo - self.base;
-        self.ts.extend_from_slice(&ts[keep..]);
-        self.vs.extend_from_slice(&vs[keep..]);
-        self.base = self.lo;
-    }
-
-    /// A chunk that ends at or before every window's start, or arrives after
-    /// every step is answered, can only move the overlap reference. Two O(1)
-    /// reads decide it, so its samples are never walked.
-    fn skip_chunk(&self, ts: &[i64]) -> bool {
-        let p = &self.params;
-        let first_end = p.at_ms.unwrap_or(p.start_ms);
-        let first_start = first_end
-            .saturating_sub(p.offset_ms)
-            .saturating_sub(p.window_ms);
-        ts[ts.len() - 1] <= first_start || self.next_step >= self.steps()
-    }
-
-    /// Copies the chunk's samples that can still matter.
-    ///
-    /// The first chunk wins an overlap, as in Thanos's `chunkSeriesIterator`:
-    /// a sample at or before `last_t` is dropped. A stale marker claims its
-    /// timestamp before the range kernel filters it out, the way a store's
-    /// merge drops repeated timestamps before PromQL sees staleness.
-    fn append(&mut self, ts: &[i64], vs: &[f64]) {
-        let from = self
-            .last_t
-            .map_or(0, |last| ts.partition_point(|t| *t <= last));
-        let (ts, vs) = (&ts[from..], &vs[from..]);
-        let Some(&last) = ts.last() else {
-            return;
-        };
-        self.last_t = Some(last);
-
-        let p = &self.params;
-        let (ts, vs) = match p.at_ms {
-            // A pinned window never moves, so what lies outside it is dead
-            // on arrival.
-            Some(at) => {
-                let end = at - p.offset_ms;
-                let a = ts.partition_point(|t| *t <= end - p.window_ms);
-                let b = ts.partition_point(|t| *t <= end);
-                (&ts[a..b], &vs[a..b])
-            }
-            None => (ts, vs),
-        };
-        match self.kernel {
+    /// Copies at most one ingestion allowance. `push` already removed dead
+    /// prefixes/overlap and advanced the readiness watermark before filtering
+    /// stale markers: filtering must not give a later chunk a second claim.
+    fn append(&mut self, context: &EvalContext, ts: &[i64], vs: &[f64]) {
+        let p = context.params();
+        match context.kernel() {
             // Pinned, the selector reads only the latest sample of its window.
             Kernel::Selector(_) if p.at_ms.is_some() => {
                 if let (Some(&t), Some(&v)) = (ts.last(), vs.last()) {
@@ -252,8 +522,23 @@ impl BufferedSeriesIterator {
         }
     }
 
-    /// `ReduceDelta`: drop what no later step reads, once it is at least
-    /// half the buffer, so the shift is amortised over the samples it frees.
+    fn retire_history(&mut self) {
+        self.ts.clear();
+        self.vs.clear();
+        self.base = self.hi.max(self.lo);
+        self.lo = self.base;
+        self.hi = self.base;
+        if let Some(sweep) = &mut self.sweep {
+            sweep.reset();
+        }
+    }
+
+    /// Prometheus `ReduceDelta` (83962c35): retire at least half the buffer so
+    /// movement is amortised. Capacity follows the live-window high water plus
+    /// INGEST_SAMPLES, never the raw chunk length. Between ready steps, the old
+    /// window and the next window's arriving prefix can coexist; geometric Vec
+    /// growth and the deferred dead prefix add only constant factors. Capacity
+    /// is deliberately retained through the finish reservation checkpoint.
     fn reduce_delta(&mut self) {
         let cut = self.lo - self.base;
         if cut > 0 && cut >= self.ts.len() / 2 {
@@ -271,7 +556,7 @@ mod tests {
     use super::*;
     use crate::range::Func;
     use crate::selector::STALE_NAN_BITS;
-    use crate::series;
+    use crate::series::{self, SamplesBuilder};
 
     const M: i64 = 60_000;
 
@@ -297,14 +582,24 @@ mod tests {
             .collect()
     }
 
-    /// One series pushed as `chunks`, then closed.
+    fn window(it: &BufferedSeriesIterator) -> &WindowBuffer {
+        let SeriesState::Window(window) = &it.state else {
+            panic!("expected a multi-step selector or range window");
+        };
+        window
+    }
+
+    /// One series pushed as `chunks`, then closed. The Arrow owner, not
+    /// numerical close, creates its one (possibly empty) row.
     fn select(p: Params, chunks: &[(&[i64], &[f64])]) -> Vec<(i64, f64)> {
-        let mut it = BufferedSeriesIterator::new(Kernel::Selector(Pick::Value), p);
+        let context = EvalContext::new(Kernel::Selector(Pick::Value), p);
+        let mut it = BufferedSeriesIterator::new(&context);
         let mut out = SamplesBuilder::default();
         for (ts, vs) in chunks {
-            it.push(ts, vs, &mut out);
+            it.push(&context, ts, vs, |t, v| out.push(t, v));
         }
-        it.close(&mut out);
+        it.close(&context, |t, v| out.push(t, v));
+        out.finish_row();
         let mut rows = rows(&out.take_all());
         assert_eq!(rows.len(), 1);
         rows.pop().unwrap()
@@ -327,14 +622,16 @@ mod tests {
 
     #[test]
     fn a_step_is_answered_before_the_series_closes() {
-        let mut it = BufferedSeriesIterator::new(Kernel::Selector(Pick::Value), params());
+        let context = EvalContext::new(Kernel::Selector(Pick::Value), params());
+        let mut it = BufferedSeriesIterator::new(&context);
         let mut out = SamplesBuilder::default();
-        it.push(&[0, 90_000], &[1.0, 2.0], &mut out);
+        it.push(&context, &[0, 90_000], &[1.0, 2.0], |t, v| out.push(t, v));
         // 0 and 1m can no longer change once 90s is seen; 2m can.
-        assert_eq!(it.next_step, 2);
-        it.push(&[150_000], &[3.0], &mut out);
-        assert_eq!(it.next_step, 3);
-        it.close(&mut out);
+        assert_eq!(window(&it).next_step, 2);
+        it.push(&context, &[150_000], &[3.0], |t, v| out.push(t, v));
+        assert_eq!(window(&it).next_step, 3);
+        it.close(&context, |t, v| out.push(t, v));
+        out.finish_row();
         assert_eq!(
             rows(&out.take_all()),
             vec![vec![
@@ -382,14 +679,18 @@ mod tests {
             end_ms: 12 * M,
             ..params()
         };
-        let mut it = BufferedSeriesIterator::new(Kernel::Selector(Pick::Value), p);
+        let context = EvalContext::new(Kernel::Selector(Pick::Value), p);
+        let mut it = BufferedSeriesIterator::new(&context);
         let mut out = SamplesBuilder::default();
-        it.push(&[0, 5 * M], &[1.0, 2.0], &mut out);
-        assert!(it.ts.is_empty());
-        assert_eq!(it.last_t, Some(5 * M));
+        it.push(&context, &[0, 5 * M], &[1.0, 2.0], |t, v| out.push(t, v));
+        assert!(window(&it).ts.is_empty());
+        assert_eq!(window(&it).last_t, Some(5 * M));
         // Still the overlap reference: 5m again is a duplicate.
-        it.push(&[5 * M, 6 * M], &[7.0, 3.0], &mut out);
-        it.close(&mut out);
+        it.push(&context, &[5 * M, 6 * M], &[7.0, 3.0], |t, v| {
+            out.push(t, v)
+        });
+        it.close(&context, |t, v| out.push(t, v));
+        out.finish_row();
         assert_eq!(rows(&out.take_all()), vec![vec![(10 * M, 3.0)]],);
     }
 
@@ -408,14 +709,21 @@ mod tests {
 
     #[test]
     fn close_starts_the_next_series_from_nothing() {
-        let mut it = BufferedSeriesIterator::new(Kernel::Selector(Pick::Value), params());
+        let context = EvalContext::new(Kernel::Selector(Pick::Value), params());
+        let mut it = BufferedSeriesIterator::new(&context);
         let mut out = SamplesBuilder::default();
-        it.push(&[0, 3 * M], &[1.0, 2.0], &mut out);
-        it.close(&mut out);
+        it.push(&context, &[0, 3 * M], &[1.0, 2.0], |t, v| out.push(t, v));
+        it.close(&context, |t, v| out.push(t, v));
+        out.finish_row();
         // Earlier than the first series' last sample: not an overlap.
-        it.push(&[2 * M], &[5.0], &mut out);
-        it.close(&mut out);
-        it.close(&mut out);
+        it.push(&context, &[2 * M], &[5.0], |t, v| out.push(t, v));
+        it.close(&context, |t, v| out.push(t, v));
+        out.finish_row();
+        assert_eq!(out.rows(), 2);
+        it.close(&context, |_, _| panic!("a repeated close emitted a sample"));
+        assert_eq!(out.rows(), 2, "numeric close must not append an empty row");
+        // An explicit empty row still belongs to this Arrow owner.
+        out.finish_row();
         assert_eq!(
             rows(&out.take_all()),
             vec![
@@ -428,19 +736,25 @@ mod tests {
 
     #[test]
     fn the_buffer_holds_the_window_not_the_series() {
-        let mut it = BufferedSeriesIterator::new(
+        let context = EvalContext::new(
             Kernel::Selector(Pick::Value),
             Params {
                 end_ms: 1000 * M,
                 ..params()
             },
         );
+        let mut it = BufferedSeriesIterator::new(&context);
         let mut out = SamplesBuilder::default();
         for i in 0..1000 {
-            it.push(&[i * M], &[i as f64], &mut out);
-            assert!(it.ts.len() <= 4, "{} samples buffered at {i}", it.ts.len());
+            it.push(&context, &[i * M], &[i as f64], |t, v| out.push(t, v));
+            assert!(
+                window(&it).ts.len() <= 4,
+                "{} samples buffered at {i}",
+                window(&it).ts.len()
+            );
         }
-        it.close(&mut out);
+        it.close(&context, |t, v| out.push(t, v));
+        out.finish_row();
         assert_eq!(rows(&out.take_all())[0].len(), 1001);
     }
 
@@ -461,28 +775,31 @@ mod tests {
         }
     }
 
-    /// A 30-day series is one chunk from a store that keeps whole series, so
-    /// the buffer must not take a copy of a chunk to walk it.
+    /// Even one whole-series row must obey the ingestion allowance. Unlike
+    /// the former whole-row in-place special case, this bound also applies
+    /// with retained history and stale markers.
     #[test]
-    fn a_chunk_is_walked_in_place_and_only_its_tail_copied() {
+    fn a_chunk_is_ingested_in_bounded_slices() {
         let p = Params {
             end_ms: 1000 * M,
             ..params()
         };
         let (ts, vs): (Vec<i64>, Vec<f64>) = (0..1000).map(|i| (i * M, i as f64)).unzip();
         for func in kernels() {
-            let mut it = BufferedSeriesIterator::new(kernel(func), p);
+            let context = EvalContext::new(kernel(func), p);
+            let mut it = BufferedSeriesIterator::new(&context);
             let mut out = SamplesBuilder::default();
-            it.push(&ts, &vs, &mut out);
+            it.push(&context, &ts, &vs, |t, v| out.push(t, v));
             assert!(
-                it.ts.capacity() <= 5,
+                window(&it).ts.capacity() <= 4 * 5 + 2 * INGEST_SAMPLES,
                 "{}: {} samples of capacity after one chunk",
                 name(func),
-                it.ts.capacity()
+                window(&it).ts.capacity()
             );
             // A second chunk with the tail still buffered is appended to it.
-            it.push(&[1000 * M], &[1000.0], &mut out);
-            it.close(&mut out);
+            it.push(&context, &[1000 * M], &[1000.0], |t, v| out.push(t, v));
+            it.close(&context, |t, v| out.push(t, v));
+            out.finish_row();
             let whole = eval(
                 func,
                 p,
@@ -517,8 +834,7 @@ mod tests {
         Func::Resets,
     ];
 
-    /// `None` is the selector: `Kernel` is not `Copy`, and every sweep below
-    /// needs a fresh one per run.
+    /// `None` is the value selector; the sweeps use the same function set.
     fn kernel(func: Option<Func>) -> Kernel {
         func.map_or(Kernel::Selector(Pick::Value), Kernel::Range)
     }
@@ -534,12 +850,14 @@ mod tests {
 
     /// One series pushed as `chunks`, then closed, through any kernel.
     fn eval(func: Option<Func>, p: Params, chunks: &[(&[i64], &[f64])]) -> Vec<(i64, f64)> {
-        let mut it = BufferedSeriesIterator::new(kernel(func), p);
+        let context = EvalContext::new(kernel(func), p);
+        let mut it = BufferedSeriesIterator::new(&context);
         let mut out = SamplesBuilder::default();
         for (ts, vs) in chunks {
-            it.push(ts, vs, &mut out);
+            it.push(&context, ts, vs, |t, v| out.push(t, v));
         }
-        it.close(&mut out);
+        it.close(&context, |t, v| out.push(t, v));
+        out.finish_row();
         let mut rows = rows(&out.take_all());
         assert_eq!(rows.len(), 1);
         rows.pop().unwrap()
@@ -622,6 +940,319 @@ mod tests {
         ts.chunks(k).zip(vs.chunks(k)).collect()
     }
 
+    /// An independent fresh-window oracle: it does not share edge cursors,
+    /// sweeps, ingestion or pinned-value replication with the streaming walk.
+    fn fresh(kernel: Kernel, p: Params, ts: &[i64], vs: &[f64]) -> Vec<(i64, f64)> {
+        let context = EvalContext::new(kernel, p);
+        context
+            .timestamps()
+            .filter_map(|step| {
+                let end = p.at_ms.unwrap_or(step) - p.offset_ms;
+                let a = ts.partition_point(|t| *t <= end - p.window_ms);
+                let b = ts.partition_point(|t| *t <= end);
+                let value = match kernel {
+                    Kernel::Selector(pick) => {
+                        (a < b && !is_stale(vs[b - 1])).then(|| pick.of(ts[b - 1], vs[b - 1]))
+                    }
+                    Kernel::Range(func) => {
+                        let (ts, vs): (Vec<_>, Vec<_>) = ts[a..b]
+                            .iter()
+                            .copied()
+                            .zip(vs[a..b].iter().copied())
+                            .filter(|(_, v)| !is_stale(*v))
+                            .unzip();
+                        crate::range::evaluate(
+                            func,
+                            &crate::range::Window {
+                                ts: &ts,
+                                vs: &vs,
+                                range_start: end - p.window_ms,
+                                range_end: end,
+                                range_ms: p.window_ms,
+                            },
+                        )
+                    }
+                };
+                value.map(|v| (step, v))
+            })
+            .collect()
+    }
+
+    fn budgeted(
+        kernel: Kernel,
+        p: Params,
+        chunks: &[(&[i64], &[f64])],
+        units: usize,
+    ) -> Vec<(i64, f64)> {
+        let context = EvalContext::new(kernel, p);
+        let mut it = BufferedSeriesIterator::new(&context);
+        let mut out = Vec::new();
+        for &(ts, vs) in chunks {
+            let mut cursor = PushCursor::default();
+            loop {
+                let before = out.len();
+                let mut budget = WorkBudget::new(units);
+                let done = it.push_budgeted(&context, ts, vs, &mut cursor, &mut budget, |t, v| {
+                    out.push((t, v))
+                });
+                assert!(out.len() - before <= units);
+                if done {
+                    break;
+                }
+                assert!(budget.exhausted());
+            }
+        }
+        loop {
+            let before = out.len();
+            let mut budget = WorkBudget::new(units);
+            let done = it.close_budgeted(&context, &mut budget, |t, v| out.push((t, v)));
+            assert!(out.len() - before <= units);
+            if done {
+                break;
+            }
+            assert!(budget.exhausted());
+        }
+        it.close(&context, |_, _| panic!("resumed close emitted twice"));
+        out
+    }
+
+    #[test]
+    fn sample_and_step_budgets_match_fresh_kernels_bitwise() {
+        let (ts, vs) = a_rough_series();
+        for p in rough_grids().into_iter().chain([at_10m()]) {
+            for kernel in kernels()
+                .map(kernel)
+                .chain([Kernel::Selector(Pick::Timestamp)])
+            {
+                let expected = fresh(kernel, p, &ts, &vs);
+                for units in [1, 2, 7, 31, 255, 256, 257, 8192] {
+                    // Repeated heads include stale markers and conflicting
+                    // values. They must still lose after a budget boundary.
+                    let mut chunks = split(&ts, &vs, 3);
+                    chunks.insert(1, (&ts[..3], &[91., 92., 93.]));
+                    let got = budgeted(kernel, p, &chunks, units);
+                    assert_bits(&got, &expected, &format!("{kernel:?} {p:?} units={units}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_small_unpinned_range_row_still_borrows_its_samples() {
+        let ts: Vec<_> = (0..20).collect();
+        let vs: Vec<_> = (0..20).map(|i| i as f64).collect();
+        let p = Params {
+            start_ms: 19,
+            end_ms: 19,
+            step_ms: 1,
+            window_ms: 20,
+            offset_ms: 0,
+            at_ms: None,
+        };
+        for func in FUNCS {
+            let kernel = Kernel::Range(func);
+            let context = EvalContext::new(kernel, p);
+            let mut it = BufferedSeriesIterator::new(&context);
+            let mut out = Vec::new();
+            assert!(it.push_budgeted(
+                &context,
+                &ts,
+                &vs,
+                &mut PushCursor::default(),
+                &mut WorkBudget::new(8192),
+                |t, v| out.push((t, v))
+            ));
+            assert_eq!(window(&it).ts.capacity(), 0);
+            assert_eq!(window(&it).vs.capacity(), 0);
+            it.close(&context, |t, v| out.push((t, v)));
+            assert_bits(&out, &fresh(kernel, p, &ts, &vs), &func.as_str());
+        }
+    }
+
+    #[test]
+    fn one_indivisible_range_fold_is_charged_before_another_step_runs() {
+        let context = EvalContext::new(
+            Kernel::Range(Func::SumOverTime),
+            Params {
+                start_ms: 10_000,
+                end_ms: 10_009,
+                step_ms: 1,
+                window_ms: 20_000,
+                offset_ms: 0,
+                at_ms: None,
+            },
+        );
+        let ts: Vec<_> = (0..10_000).collect();
+        let vs = vec![1.; ts.len()];
+        let mut it = BufferedSeriesIterator::new(&context);
+        it.push(&context, &ts, &vs, |_, _| panic!("first step is not ready"));
+        let mut out = Vec::new();
+        assert!(
+            !it.close_budgeted(&context, &mut WorkBudget::new(20_000), |t, v| out
+                .push((t, v)))
+        );
+        assert_eq!(window(&it).next_step, 1);
+        assert_eq!(out, vec![(10_000, 10_000.)]);
+        assert!(!it.close_budgeted(&context, &mut WorkBudget::new(1), |t, v| out.push((t, v))));
+        assert_eq!(window(&it).next_step, 2);
+        it.close(&context, |t, v| out.push((t, v)));
+        assert_eq!(
+            out,
+            (10_000..10_010).map(|t| (t, 10_000.)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn suspended_sweep_pops_and_duplicate_runs_do_not_change_float_order() {
+        // A descending run makes min's queue long for max; the last value
+        // pops that queue. Equal timestamps cross many ingestion boundaries.
+        let ts: Vec<_> = (0..600).chain(std::iter::repeat_n(600, 600)).collect();
+        let vs: Vec<_> = (0..1200)
+            .map(|i| if i == 1199 { 1000. } else { 600. - i as f64 })
+            .collect();
+        let p = Params {
+            start_ms: 600,
+            end_ms: 605,
+            step_ms: 1,
+            window_ms: 1000,
+            offset_ms: 0,
+            at_ms: None,
+        };
+        for func in FUNCS {
+            let kernel = Kernel::Range(func);
+            let expected = fresh(kernel, p, &ts, &vs);
+            for units in [1, 2, 3, 257] {
+                assert_bits(
+                    &budgeted(kernel, p, &[(&ts, &vs)], units),
+                    &expected,
+                    &format!("{func:?} units={units}"),
+                );
+            }
+        }
+    }
+
+    fn assert_history_capacity(it: &BufferedSeriesIterator, bound: usize) {
+        let w = window(it);
+        assert!(
+            w.ts.capacity() <= bound,
+            "timestamp capacity {} > {bound}",
+            w.ts.capacity()
+        );
+        assert!(
+            w.vs.capacity() <= bound,
+            "value capacity {} > {bound}",
+            w.vs.capacity()
+        );
+        assert!(w.sweep.as_ref().map_or(0, Sweep::heap_size) <= bound * 8);
+    }
+
+    #[test]
+    fn huge_stale_and_second_chunks_bound_capacity_at_every_resume() {
+        let ts: Vec<_> = (0..200_000).collect();
+        let stale = f64::from_bits(STALE_NAN_BITS);
+        for stale_mode in 0..3 {
+            let vs: Vec<_> = ts
+                .iter()
+                .map(|t| {
+                    if stale_mode == 2 || (stale_mode == 1 && t % 3 == 0) {
+                        stale
+                    } else {
+                        (t % 17) as f64
+                    }
+                })
+                .collect();
+            let p = Params {
+                start_ms: 0,
+                end_ms: 200_000,
+                step_ms: 16,
+                window_ms: 32,
+                offset_ms: 0,
+                at_ms: None,
+            };
+            for kernel in [
+                Kernel::Selector(Pick::Value),
+                Kernel::Range(Func::Rate),
+                Kernel::Range(Func::MinOverTime),
+                Kernel::Range(Func::SumOverTime),
+            ] {
+                let context = EvalContext::new(kernel, p);
+                let mut it = BufferedSeriesIterator::new(&context);
+                // Nonempty history forces the old whole-append path, even
+                // without stale markers in the second chunk.
+                it.push(&context, &ts[..20], &vs[..20], |_, _| {});
+                let mut cursor = PushCursor::default();
+                loop {
+                    let done = it.push_budgeted(
+                        &context,
+                        &ts[20..],
+                        &vs[20..],
+                        &mut cursor,
+                        &mut WorkBudget::new(4096),
+                        |_, _| {},
+                    );
+                    // Conservative constant factors cover deferred front
+                    // retirement, both adjacent windows and geometric growth.
+                    assert_history_capacity(&it, 8 * 32 + 4 * INGEST_SAMPLES + 8);
+                    if done {
+                        break;
+                    }
+                }
+                it.close(&context, |_, _| {});
+                assert_history_capacity(&it, 8 * 32 + 4 * INGEST_SAMPLES + 8);
+            }
+        }
+    }
+
+    #[test]
+    fn huge_unreachable_future_tails_and_pinned_windows_never_determine_capacity() {
+        let ts: Vec<_> = (0..1_000_000).collect();
+        let vs = vec![1.; ts.len()];
+        for pinned in [false, true] {
+            let p = Params {
+                start_ms: 0,
+                end_ms: 17,
+                step_ms: 16,
+                window_ms: 32,
+                offset_ms: 7,
+                at_ms: pinned.then_some(1024),
+            };
+            for kernel in [
+                Kernel::Selector(Pick::Value),
+                Kernel::Range(Func::Rate),
+                Kernel::Range(Func::SumOverTime),
+            ] {
+                let context = EvalContext::new(kernel, p);
+                let mut it = BufferedSeriesIterator::new(&context);
+                let mut cursor = PushCursor::default();
+                let mut out = Vec::new();
+                loop {
+                    let done = it.push_budgeted(
+                        &context,
+                        &ts,
+                        &vs,
+                        &mut cursor,
+                        &mut WorkBudget::new(7),
+                        |t, v| out.push((t, v)),
+                    );
+                    // Only the actual final-grid/pinned window is copied, not
+                    // even one allowance of the million-sample future tail.
+                    assert_history_capacity(&it, 64);
+                    if done {
+                        break;
+                    }
+                }
+                it.close(&context, |t, v| out.push((t, v)));
+                assert_bits(
+                    &out,
+                    &fresh(kernel, p, &ts, &vs),
+                    &format!("{kernel:?} pinned={pinned}"),
+                );
+                assert_history_capacity(&it, 64);
+                assert!(window(&it).ts.is_empty());
+            }
+        }
+    }
+
     #[test]
     fn chunk_size_sweep() {
         let (ts, vs) = a_rough_series();
@@ -649,14 +1280,155 @@ mod tests {
     }
 
     #[test]
+    fn cached_context_grid_handles_empty_and_extreme_domains() {
+        let kernel = Kernel::Selector(Pick::Value);
+        for p in [
+            Params {
+                end_ms: -1,
+                ..params()
+            },
+            Params {
+                step_ms: 0,
+                ..params()
+            },
+        ] {
+            let context = EvalContext::new(kernel, p);
+            assert_eq!(context.kernel(), kernel);
+            assert_eq!(context.params(), p);
+            assert_eq!(context.steps(), 0);
+            assert_eq!(context.timestamps().count(), 0);
+        }
+        let context = EvalContext::new(
+            kernel,
+            Params {
+                start_ms: i64::MAX - 2,
+                end_ms: i64::MAX,
+                step_ms: 1,
+                ..params()
+            },
+        );
+        assert_eq!(context.steps(), 3);
+        assert_eq!(
+            context.timestamps().collect::<Vec<_>>(),
+            [i64::MAX - 2, i64::MAX - 1, i64::MAX]
+        );
+        let context = EvalContext::new(
+            kernel,
+            Params {
+                start_ms: i64::MIN,
+                end_ms: i64::MAX,
+                step_ms: 1,
+                ..params()
+            },
+        );
+        assert_eq!(context.steps(), i128::from(u64::MAX) + 1);
+    }
+
+    #[test]
+    fn one_step_candidate_has_no_heap_and_takes_original_sample_on_close() {
+        let stale = f64::from_bits(STALE_NAN_BITS);
+        let nan = f64::from_bits(0x7ff8_0000_0000_1234);
+        for pick in [Pick::Value, Pick::Timestamp] {
+            let context = EvalContext::new(Kernel::Selector(pick), at_10m());
+            let mut it = BufferedSeriesIterator::new(&context);
+            let inline = std::mem::size_of::<BufferedSeriesIterator>();
+            for value in [-0.0, nan, stale] {
+                it.push(&context, &[9 * M], &[value], |_, _| {
+                    panic!("candidate emitted before close")
+                });
+                // Beyond the lookup: still claims overlap, but does not
+                // erase the original sample or convert a stale marker.
+                it.push(&context, &[11 * M], &[stale], |_, _| {
+                    panic!("candidate emitted before close")
+                });
+                it.push(
+                    &context,
+                    &[9 * M, 10 * M, 12 * M],
+                    &[7.0, 8.0, 9.0],
+                    |_, _| panic!("candidate emitted before close"),
+                );
+                assert_eq!(it.size(), inline);
+                let SeriesState::Candidate { sample, last_t } = &it.state else {
+                    panic!("one step allocated a window");
+                };
+                let (t, v) = sample.unwrap();
+                assert_eq!(t, 9 * M);
+                assert_eq!(v.to_bits(), value.to_bits());
+                assert_eq!(*last_t, Some(12 * M));
+                let mut got = Vec::new();
+                it.close(&context, |t, v| got.push((t, v)));
+                if is_stale(value) {
+                    assert!(got.is_empty());
+                } else {
+                    let want = if pick == Pick::Value { value } else { 540.0 };
+                    assert_bits(&got, &[(10 * M, want)], &"one step");
+                }
+                let SeriesState::Candidate { sample, last_t } = &it.state else {
+                    unreachable!();
+                };
+                assert!(sample.is_none() && last_t.is_none());
+                it.close(&context, |_, _| panic!("candidate repeated on close"));
+                assert_eq!(it.size(), inline);
+            }
+        }
+    }
+
+    #[test]
+    fn close_keeps_all_window_and_sweep_allocations_and_reuses_them() {
+        for func in [
+            Func::Rate,
+            Func::MinOverTime,
+            Func::MaxOverTime,
+            Func::LastOverTime,
+        ] {
+            let context = EvalContext::new(Kernel::Range(func), params());
+            let mut it = BufferedSeriesIterator::new(&context);
+            it.push(
+                &context,
+                &[0, M, 2 * M, 3 * M],
+                &[3.0, 2.0, -0.0, 0.0],
+                |_, _| {},
+            );
+            let window = window(&it);
+            let heap = window.ts.capacity() * std::mem::size_of::<i64>()
+                + window.vs.capacity() * std::mem::size_of::<f64>()
+                + window.sweep.as_ref().map_or(0, Sweep::heap_size);
+            if matches!(func, Func::Rate | Func::MinOverTime | Func::MaxOverTime) {
+                assert!(window.sweep.as_ref().unwrap().heap_size() > 0);
+            }
+            assert_eq!(
+                it.size(),
+                std::mem::size_of::<BufferedSeriesIterator>() + heap
+            );
+            let before = it.size();
+            it.close(&context, |_, _| {});
+            assert_eq!(it.size(), before);
+            it.close(&context, |_, _| panic!("window repeated on close"));
+            assert_eq!(it.size(), before);
+            let mut got = Vec::new();
+            it.push(&context, &[0, M], &[1.0, 2.0], |t, v| got.push((t, v)));
+            it.close(&context, |t, v| got.push((t, v)));
+            let want = eval(Some(func), params(), &[(&[0, M], &[1.0, 2.0])]);
+            assert_bits(&got, &want, &func.as_str());
+        }
+    }
+
+    #[test]
     fn boundary_on_range_start() {
-        let mut it = BufferedSeriesIterator::new(Kernel::Range(Func::CountOverTime), at_10m());
+        let context = EvalContext::new(Kernel::Range(Func::CountOverTime), at_10m());
+        let mut it = BufferedSeriesIterator::new(&context);
         let mut out = SamplesBuilder::default();
-        it.push(&[3 * M, 4 * M, 5 * M], &[1.0, 2.0, 3.0], &mut out);
+        it.push(
+            &context,
+            &[3 * M, 4 * M, 5 * M],
+            &[1.0, 2.0, 3.0],
+            |t, v| out.push(t, v),
+        );
         // The window is open at its start, so 5m is outside it.
-        assert!(it.ts.is_empty(), "buffered {:?}", it.ts);
-        it.push(&[6 * M], &[4.0], &mut out);
-        it.close(&mut out);
+        assert!(window(&it).ts.is_empty(), "buffered {:?}", window(&it).ts);
+        it.push(&context, &[6 * M], &[4.0], |t, v| out.push(t, v));
+        it.close(&context, |t, v| out.push(t, v));
+        out.finish_row();
         assert_eq!(rows(&out.take_all()), vec![vec![(10 * M, 1.0)]]);
     }
 
@@ -666,16 +1438,20 @@ mod tests {
             end_ms: 11 * M,
             ..at_10m()
         };
-        let mut it = BufferedSeriesIterator::new(Kernel::Range(Func::CountOverTime), p);
+        let context = EvalContext::new(Kernel::Range(Func::CountOverTime), p);
+        let mut it = BufferedSeriesIterator::new(&context);
         let mut out = SamplesBuilder::default();
-        it.push(&[9 * M, 10 * M], &[1.0, 2.0], &mut out);
+        it.push(&context, &[9 * M, 10 * M], &[1.0, 2.0], |t, v| {
+            out.push(t, v)
+        });
         // 10m's window is closed at its end: nothing later can enter it.
-        assert_eq!(it.next_step, 1);
-        it.push(&[10 * M + 30 * S], &[3.0], &mut out);
-        assert_eq!(it.next_step, 1);
-        it.push(&[11 * M], &[4.0], &mut out);
-        assert_eq!(it.next_step, 2);
-        it.close(&mut out);
+        assert_eq!(window(&it).next_step, 1);
+        it.push(&context, &[10 * M + 30 * S], &[3.0], |t, v| out.push(t, v));
+        assert_eq!(window(&it).next_step, 1);
+        it.push(&context, &[11 * M], &[4.0], |t, v| out.push(t, v));
+        assert_eq!(window(&it).next_step, 2);
+        it.close(&context, |t, v| out.push(t, v));
+        out.finish_row();
         assert_eq!(
             rows(&out.take_all()),
             vec![vec![(10 * M, 2.0), (11 * M, 4.0)]]
@@ -761,13 +1537,15 @@ mod tests {
             .zip([15.0, 16.0, 3.0, 4.0, 5.0, 6.0])
             .unzip();
 
-        let mut it = BufferedSeriesIterator::new(Kernel::Range(Func::Rate), p);
+        let context = EvalContext::new(Kernel::Range(Func::Rate), p);
+        let mut it = BufferedSeriesIterator::new(&context);
         let mut out = SamplesBuilder::default();
-        it.push(&a0.0, &a0.1, &mut out);
+        it.push(&context, &a0.0, &a0.1, |t, v| out.push(t, v));
         // The lane at 420s closes before B.0 opens.
-        assert_eq!(it.next_step, 1);
-        it.push(&b0.0, &b0.1, &mut out);
-        it.close(&mut out);
+        assert_eq!(window(&it).next_step, 1);
+        it.push(&context, &b0.0, &b0.1, |t, v| out.push(t, v));
+        it.close(&context, |t, v| out.push(t, v));
+        out.finish_row();
         let got = rows(&out.take_all()).pop().unwrap();
 
         let want = [
@@ -913,26 +1691,27 @@ mod tests {
         };
         let (ts, vs): (Vec<i64>, Vec<f64>) = (0..1000).map(|i| (i * M, i as f64)).unzip();
         // A 5m window at 1m spacing holds five samples.
-        let window = 5;
+        let window_size = 5;
         for chunk in [1, 3, 10, 50] {
-            let mut it = BufferedSeriesIterator::new(Kernel::Range(Func::Rate), p);
+            let context = EvalContext::new(Kernel::Range(Func::Rate), p);
+            let mut it = BufferedSeriesIterator::new(&context);
             let mut out = SamplesBuilder::default();
             let empty = out.size();
             for (i, (cts, cvs)) in split(&ts, &vs, chunk).into_iter().enumerate() {
-                let steps = it.next_step;
-                it.push(cts, cvs, &mut out);
+                let steps = window(&it).next_step;
+                it.push(&context, cts, cvs, |t, v| out.push(t, v));
                 assert!(
-                    it.next_step > steps,
+                    window(&it).next_step > steps,
                     "chunk {chunk}: no step finalised at {i}"
                 );
                 // Every finalised step but the first, whose window holds one
                 // sample, has a rate, and `size` counts at least the samples
                 // held: they are in `out` before the row is finished.
-                let held = (it.next_step - 1) as usize * 16;
+                let held = (window(&it).next_step - 1) as usize * 16;
                 assert!(
                     out.size() >= empty + held,
                     "chunk {chunk}: out holds fewer than {} steps after chunk {i}",
-                    it.next_step - 1
+                    window(&it).next_step - 1
                 );
                 // What survives a push is the window of the first step not
                 // yet answered, plus a dead prefix `reduce_delta` keeps while
@@ -940,12 +1719,13 @@ mod tests {
                 // the chunk size. "Window plus one chunk" is the peak inside
                 // `push`, before the steps are walked.
                 assert!(
-                    it.ts.len() < 2 * window,
+                    window(&it).ts.len() < 2 * window_size,
                     "chunk {chunk}: {} samples buffered after chunk {i}",
-                    it.ts.len()
+                    window(&it).ts.len()
                 );
             }
-            it.close(&mut out);
+            it.close(&context, |t, v| out.push(t, v));
+            out.finish_row();
             assert_eq!(rows(&out.take_all())[0].len(), 1000);
         }
     }

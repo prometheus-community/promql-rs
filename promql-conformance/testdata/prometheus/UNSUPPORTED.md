@@ -8,7 +8,7 @@ PROMQL_PROMQLTEST_BLESS=1 cargo test -p promql-conformance --test promqltest
 
 Nothing here gates CI. This file is the roadmap, and the core line below is the target: it reads 100% when the engine passes every eval that is neither native histograms, subquery nor experimental syntax. An eval is flag-gated if a stock parser refuses its query at a feature gate, or by its file where the grammar has no productions to reach the gate with (`docs/feature-flags.md`, Conformance). An eval is native-histogram if an expected row is a native histogram sample or a selector in its query matches, by its label matchers, a series the active load blocks load with native histogram samples (`{{…}}`, or derived by `load_with_nhcb`). Each eval is in exactly one category, first match wins: flag-gated, native histograms, subquery, core. The category comes from the eval, never from whether it passes, so the denominators hold still.
 
-**Core: 683 of 871 evals pass (78.4%).**
+**Core: 684 of 871 evals pass (78.5%).**
 
 - Native histograms: 2 of 805 pass.
 - Subqueries: 0 of 65 pass.
@@ -18,15 +18,15 @@ Nothing here gates CI. This file is the roadmap, and the core line below is the 
   - `promql-extended-range-selectors`: 8 of 88
   - `promql-binop-fill-modifiers`: 44 of 44
 
-All but the flag-gated: **685 of 1741 evals pass** (39.3%).
+All but the flag-gated: **686 of 1741 evals pass** (39.4%).
 
 ## Core evals
 
 | | evals |
 |---|---:|
 | total | 871 |
-| passing | 683 |
-| not passing | 188 |
+| passing | 684 |
+| not passing | 187 |
 
 The not-passing ones are the missing features and the unattributed failures below. Fixing those is what takes the core to 100%.
 
@@ -37,8 +37,8 @@ Each failing core eval is filed under a missing feature the engine names, or lef
 | failing evals | reason |
 |---:|---|
 | 167 | missing features |
-| 21 | unattributed |
-| 188 | **total** |
+| 20 | unattributed |
+| 187 | **total** |
 
 ## Missing features
 
@@ -72,10 +72,6 @@ Core evals the engine does not name a missing feature for: wrong results, panics
 - `sum by (__name__) (metric_total{env="1"} or rate(metric_total{env="2"}[5m])) @ 600000`
 - `sum by (__name__) (rate(metric_total{env="2"}[5m]) or metric_total{env="1"}) @ 600000`
 
-### operators (1)
-
-- `-{job="api"} @ 0..1200000/1200000`
-
 ### type_and_unit (15)
 
 - `-http_requests_total{job="api-server",instance="0",group="production"} @ 3000000`
@@ -98,6 +94,7 @@ Core evals the engine does not name a missing feature for: wrong results, panics
 
 | file | evals | native histograms | subquery | flag-gated | passing | passing core | |
 |---|---:|---:|---:|---:|---:|---:|---|
+| operators | 213 | 72 | 0 | 0 | 143 (67%) | 141 of 141 (100%) | core green |
 | selectors | 31 | 0 | 0 | 0 | 31 (100%) | 31 of 31 (100%) | core green |
 | extended_vectors | 30 | 0 | 0 | 88 | 30 (100%) | 30 of 30 (100%) | core green |
 | literals | 25 | 0 | 0 | 0 | 25 (100%) | 25 of 25 (100%) | core green |
@@ -108,7 +105,6 @@ Core evals the engine does not name a missing feature for: wrong results, panics
 | collision | 2 | 0 | 0 | 0 | 2 (100%) | 2 of 2 (100%) | core green |
 | subquery | 34 | 2 | 30 | 0 | 2 (6%) | 2 of 2 (100%) | core green |
 | fill-modifier | 1 | 0 | 0 | 44 | 1 (100%) | 1 of 1 (100%) | core green |
-| operators | 213 | 72 | 0 | 0 | 142 (67%) | 140 of 141 (99%) |  |
 | at_modifier | 69 | 0 | 29 | 2 | 35 (51%) | 35 of 40 (88%) |  |
 | functions | 350 | 99 | 5 | 63 | 197 (56%) | 197 of 246 (80%) |  |
 | aggregators | 158 | 35 | 0 | 2 | 93 (59%) | 93 of 123 (76%) |  |

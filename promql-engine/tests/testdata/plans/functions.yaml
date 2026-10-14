@@ -8,8 +8,8 @@ defaults:
 tests:
   - name: range function over a different label set
     description: >
-      The range function is an aggregate grouped by the whole labels
-      struct, like the selector. rate drops __name__, so the labels are
+      The range function evaluates each complete series, like the
+      selector. rate drops __name__, so the labels are
       rebuilt field by field above it: dropped below, two series differing
       only in their name would fold into one group. The fields named here
       are this case's own, which is what shows that the projection follows
@@ -21,7 +21,7 @@ tests:
       rate(node_cpu_seconds_total[5m])
     plan: |
       Projection: labels{cpu, instance, mode}
-        Aggregate: rate(samples[5m], 600000..1200000 step 30s) per series per block
+        SeriesEval: rate(samples[5m], 600000..1200000 step 30s) per series per block
           TableScan: node_cpu_seconds_total
 
   - name: an elementwise function over a selector
@@ -38,7 +38,7 @@ tests:
       Projection: labels{city}, promql_elementwise(abs_0.samples, Utf8("abs"), Float64(NULL), Float64(NULL))
         SubqueryAlias: abs_0
           Projection: labels, samples, block_start, block_end
-            Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+            SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
               TableScan: temperature
 
   - name: vector of a scalar
@@ -78,7 +78,7 @@ tests:
       Projection: labels{city}, promql_elementwise(day_of_week_0.samples, Utf8("day_of_week"), Float64(NULL), Float64(NULL))
         SubqueryAlias: day_of_week_0
           Projection: labels, samples, block_start, block_end
-            Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+            SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
               TableScan: temperature
 
   - name: a date function without a vector
@@ -107,7 +107,7 @@ tests:
       timestamp(temperature)
     plan: |
       Projection: labels{city}
-        Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m, timestamp) per series per block
+        SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m, timestamp) per series per block
           TableScan: temperature
 
   - name: timestamp over another function
@@ -125,14 +125,13 @@ tests:
           Projection: labels{city}, promql_elementwise(abs_0.samples, Utf8("abs"), Float64(NULL), Float64(NULL))
             SubqueryAlias: abs_0
               Projection: labels, samples, block_start, block_end
-                Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+                SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
                   TableScan: temperature
 
   - name: count over time
     description: >
-      A counting function takes the same aggregate as rate; only the
-      function-name literal differs, so one registration serves the whole
-      family.
+      A counting function uses the same evaluation boundary as rate;
+      only the selected kernel and window differ.
     load:
       - http_requests_total{job="api", pod="api-1"} 0
       - http_requests_total{job="web", pod="web-1"} 0
@@ -140,15 +139,15 @@ tests:
       count_over_time(http_requests_total[10m])
     plan: |
       Projection: labels{job, pod}
-        Aggregate: count_over_time(samples[10m], 600000..1200000 step 30s) per series per block
+        SeriesEval: count_over_time(samples[10m], 600000..1200000 step 30s) per series per block
           TableScan: http_requests_total
 
   - name: range function over chunks in four partitions
     description: >
       Four store partitions, each series whole in one of them and chunked
-      within it. Each partition's Partial folds its own series Sorted and
-      emits them finished; a merge on labels hands them in order to one
-      Final, which stays Sorted too.
+      within it. Each partition's contiguous evaluator emits complete
+      evaluated series. No raw shuffle or cross-partition finalizer is
+      needed, and no particular source hash scheme is declared.
     chunked_ms: 150000
     partitions: 4
     load:
@@ -158,12 +157,12 @@ tests:
       rate(x[5m])
     plan: |
       Projection: labels{pod}
-        Aggregate: rate(samples[5m], 600000..1200000 step 30s) per series per block
+        SeriesEval: rate(samples[5m], 600000..1200000 step 30s) per series per block
           TableScan: x
     physical: |
-      ProjectionExec: expr=[labels@2{pod}, samples@3, block_start@0, block_end@1]
-        AggregateExec: mode=SinglePartitioned, gby=[block_start@2, block_end@3, labels@0], aggr=[rate(samples@1[5m], 600000..1200000 step 30s)], ordering_mode=Sorted
-          SeriesSetExec: x 300000..1200000 window=5m step=30s range=5m func=rate, partitioning=Hash([labels@0], 4)
+      ProjectionExec: expr=[labels@0{pod}, samples@1, block_start@2, block_end@3]
+        SeriesEvalExec: kernel=Range(Rate), grid=Params { start_ms: 600000, end_ms: 1200000, step_ms: 30000, window_ms: 300000, offset_ms: 0, at_ms: None }
+          SeriesSetExec: x 300000..1200000 window=5m step=30s range=5m func=rate, partitioning=UnknownPartitioning(4)
             DataSourceExec: partitions=4, partition_sizes=[2, 2, 0, 0]
 
   - name: sort over an instant selector
@@ -184,7 +183,7 @@ tests:
     plan: |
       Sort: isnan(get_field(array_element(samples, Int64(-1)), Utf8("value"))) ASC NULLS LAST, array_element(samples, Int64(-1)).value ASC NULLS LAST
         Projection: labels, samples, block_start, block_end
-          Aggregate: vector_selector(samples, 1200000..1200000 step 30s, lookback 5m) per series per block
+          SeriesEval: vector_selector(samples, 1200000..1200000 step 30s, lookback 5m) per series per block
             TableScan: http_requests_total
   - name: absent of a selector
     description: >
@@ -201,7 +200,7 @@ tests:
       Projection: labels{city: Utf8("oslo")}, TimestampMillisecond(-9223372036854775808, None), TimestampMillisecond(9223372036854775807, None)
         Aggregate: absent(samples, 600000..1200000 step 30s) over the whole range
           Projection: labels, samples, block_start, block_end
-            Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+            SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
               TableScan: temperature{city="oslo",region=~"eu.*"}
 
   - name: absent of an aggregation
@@ -218,7 +217,7 @@ tests:
           Projection: labels{}
             Aggregate: sum(samples, 600000..1200000 step 30s) per block
               Projection: labels, samples, block_start, block_end
-                Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+                SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
                   TableScan: temperature
 
   - name: absent_over_time of a range selector
@@ -235,7 +234,7 @@ tests:
       Projection: labels{city: Utf8("oslo")}, TimestampMillisecond(-9223372036854775808, None), TimestampMillisecond(9223372036854775807, None)
         Aggregate: absent(samples, 600000..1200000 step 30s) over the whole range
           Projection: labels{city}
-            Aggregate: present_over_time(samples[5m], 600000..1200000 step 30s) per series per block
+            SeriesEval: present_over_time(samples[5m], 600000..1200000 step 30s) per series per block
               TableScan: temperature{city="oslo"}
 
   - name: sort over absent
@@ -256,7 +255,7 @@ tests:
         Projection: labels{city: Utf8("oslo")}, TimestampMillisecond(-9223372036854775808, None), TimestampMillisecond(9223372036854775807, None)
           Aggregate: absent(samples, 1200000..1200000 step 30s) over the whole range
             Projection: labels, samples, block_start, block_end
-              Aggregate: vector_selector(samples, 1200000..1200000 step 30s, lookback 5m) per series per block
+              SeriesEval: vector_selector(samples, 1200000..1200000 step 30s, lookback 5m) per series per block
                 TableScan: temperature{city="oslo"}
 
   - name: scalar of a vector
@@ -273,5 +272,5 @@ tests:
       Projection: labels{}, TimestampMillisecond(-9223372036854775808, None), TimestampMillisecond(9223372036854775807, None)
         Aggregate: scalar(samples, 600000..1200000 step 30s) over the whole range
           Projection: labels, samples, block_start, block_end
-            Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+            SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
               TableScan: temperature{city="oslo"}

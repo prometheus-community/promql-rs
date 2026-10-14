@@ -480,6 +480,7 @@ operators = [
     "-{__name__=~'testmetric1|testmetric2'} @ 0",
     '-{job="api"} @ 0',
     '-{job="api"} @ 0 #2',
+    '-{job="api"} @ 0..1200000/1200000',
     '-{job="api"} @ 1200000',
     '0 * http_requests_total{group="canary", instance="0", job="api-server"} % 0 @ 3000000',
     '0 * http_requests_total{group="canary", instance="0", job="api-server"} / 0 @ 3000000',

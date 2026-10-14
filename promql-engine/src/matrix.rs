@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{ArrayRef, AsArray, BooleanBufferBuilder, ListArray};
+use datafusion::arrow::array::{Array, ArrayRef, AsArray, BooleanBufferBuilder, ListArray};
 use datafusion::arrow::buffer::BooleanBuffer;
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion::common::{plan_err, ScalarValue};
@@ -128,8 +128,14 @@ impl ScalarUDFImpl for MatrixSelector {
 
 /// Keep, in every row of `samples`, the samples `window` holds.
 pub fn apply(samples: &ListArray, window: Window) -> Result<ListArray> {
-    let entries = samples.values().as_struct();
-    let (ts, vs) = series::sample_slices(entries);
+    // A list slice retains the entire backing child. `filtered` counts
+    // predicates relative to the first referenced offset, as elementwise
+    // comparisons do; passing a backing-wide predicate misassigns rows.
+    let offsets = samples.offsets();
+    let start = offsets[0] as usize;
+    let end = offsets[samples.len()] as usize;
+    let entries = samples.values().as_struct().slice(start, end - start);
+    let (ts, vs) = series::sample_slices(&entries);
     let mut holds = BooleanBufferBuilder::new(ts.len());
     for (t, v) in ts.iter().zip(vs) {
         holds.append(window.holds(*t, *v));

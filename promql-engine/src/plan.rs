@@ -7,7 +7,8 @@
 //! differential suite counts those by feature, so a precise name is how
 //! progress becomes a number rather than "red".
 //!
-//! Every node is stock DataFusion with one of this crate's functions in it:
+//! Selector and range evaluation share a typed logical boundary; everything
+//! above it is stock DataFusion with one of this crate's functions in it:
 //!
 //! ```text
 //! sum by (pod) (rate(http_requests_total[5m]))
@@ -16,19 +17,15 @@
 //!   Aggregate: groupBy=[block_start, block_end, get_field(labels, 'pod') AS __group__pod],
 //!              aggr=[promql_aggregate(samples, 'sum') AS samples]
 //!     Projection: promql_labels(…without __name__) AS labels, samples, block_start, block_end
-//!       Aggregate: groupBy=[block_start, block_end, labels],
-//!                  aggr=[promql_range_function(samples, block_start, block_end, 'rate', …) AS samples]
+//!       SeriesEval: rate(samples[5m], …) per series per block
 //!         TableScan: selector_0        ← SelectorTable over SeriesSource::select
 //! ```
 //!
-//! Every group key leads with the block. The store's plan is ordered by
-//! block, then labels, so the selector and range aggregates run Sorted
-//! over it and close a series at the block edge as well as at the next
-//! label set; an aggregation above holds one partial per group and step
-//! of the open block and emits when the block's last series has passed.
-//! Each node projects back to the canonical column order, because an
-//! Aggregate puts its keys first and everything above reads the shape by
-//! position through [`series::validate`].
+//! SeriesEval lowers directly to the sole ID-contiguous evaluator, producing
+//! canonical evaluated rows without exposing store IDs. Every upper group
+//! key leads with the block so an aggregation holds partials for one block.
+//! Each node projects back to canonical column order, because everything
+//! above reads the shape by position through [`series::validate`].
 //!
 //! The `__group__` prefix on a group key keeps a label named `labels`
 //! or `samples` from colliding with the engine's own columns; see
@@ -52,15 +49,17 @@ use promql_parser::token::ItemType;
 use crate::absent;
 use crate::aggregate::{self, Op};
 use crate::binary;
+use crate::buffer::Kernel;
 use crate::elementwise;
 use crate::error::EngineError;
 use crate::labels;
 use crate::matcher::{effective_matchers, METRIC_NAME};
 use crate::matrix;
 use crate::params::{step_count, Params};
-use crate::range::{self, Func};
+use crate::range::Func;
 use crate::selector;
 use crate::series::{Block, Series, BLOCK_END, BLOCK_START, LABELS, SAMPLES};
+use crate::series_eval::SeriesEval;
 use crate::sort;
 use crate::source::{Grouping, SelectHints, SelectorTable, SeriesSource};
 use crate::to_scalar;
@@ -607,19 +606,9 @@ impl Planner<'_> {
         check_selector_bounds(params.at_ms, params.offset_ms)?;
         let hints = self.hints(&params, None, above);
         let (builder, label_names) = self.scan(vs, hints).await?;
-        // Grouped by the block and the whole label set, so every chunk of
-        // a label set in a block folds into one group.
-        let builder = builder.aggregate(
-            series_keys(),
-            vec![selector::call(
-                col(SAMPLES),
-                col(BLOCK_START),
-                col(BLOCK_END),
-                &params,
-                pick,
-            )
-            .alias(SAMPLES)],
-        )?;
+        let eval =
+            SeriesEval::try_new(builder.build()?, Kernel::Selector(pick), params)?.into_plan();
+        let builder = LogicalPlanBuilder::from(eval);
         let (labels_expr, label_names) = match pick {
             selector::Pick::Value => (col(LABELS), label_names),
             // `funcTimestamp` emits with `DropName`. Above the grouping,
@@ -1243,17 +1232,8 @@ impl Planner<'_> {
             },
         );
         let (builder, input_names) = self.scan(vs, hints).await?;
-        let builder = builder.aggregate(
-            series_keys(),
-            vec![range::call(
-                col(SAMPLES),
-                col(BLOCK_START),
-                col(BLOCK_END),
-                func,
-                &params,
-            )
-            .alias(SAMPLES)],
-        )?;
+        let eval = SeriesEval::try_new(builder.build()?, Kernel::Range(func), params)?.into_plan();
+        let builder = LogicalPlanBuilder::from(eval);
         // `__name__` is dropped above the grouping, not below it: below, two
         // series differing only in their name would fold into one group.
         if !func.drops_metric_name() {
@@ -1372,12 +1352,6 @@ impl Planner<'_> {
             label_names: keys,
         })
     }
-}
-
-/// The group key of a selector or range aggregate: one group per label
-/// set and block.
-fn series_keys() -> Vec<datafusion::logical_expr::Expr> {
-    vec![col(BLOCK_START), col(BLOCK_END), col(LABELS)]
 }
 
 /// The canonical columns with the one block [`Planner::scalar_series`]
@@ -1574,7 +1548,6 @@ mod tests {
     use std::sync::Mutex;
 
     use async_trait::async_trait;
-    use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::SessionContext;
     use promql_parser::ast::{Expr, LabelMatcher};
 
@@ -1596,7 +1569,7 @@ mod tests {
             state: &dyn Session,
             matchers: &[LabelMatcher],
             hints: SelectHints,
-        ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
             self.seen.lock().unwrap().push(hints.clone());
             self.inner.select(state, matchers, hints).await
         }

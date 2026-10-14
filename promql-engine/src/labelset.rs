@@ -16,101 +16,83 @@
 //! Upstream errors only when two such series share a timestamp, and
 //! merges them into one series when they do not. Two metrics alike in
 //! every label but the name, sampled over windows that do not overlap,
-//! are exactly that under a name-dropping call, so it is reachable here
-//! and the merge is a known gap: the result then carries both rows where
-//! upstream carries one series. Closing it needs an Arrow concat pass
-//! over the colliding rows' points, so only the error is mirrored.
+//! are exactly that under a name-dropping call. Finalization orders row
+//! indices and checks each label run once. Disjoint sample bounds need
+//! no timestamp walk; connected overlaps use borrowed heads, not copies
+//! of all timestamps. Arrow output retains separate buffer-sharing rows;
+//! matrix consumers must merge interleaved spans within a label run.
 
-use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
+use std::sync::Arc;
 
 use datafusion::arrow::array::{AsArray, RecordBatch, StringViewArray};
 use datafusion::arrow::datatypes::TimestampMillisecondType;
-use datafusion::arrow::error::ArrowError;
-use datafusion::arrow::row::{RowConverter, SortField};
-use datafusion::error::DataFusionError;
 
 use crate::error::EngineError;
-use crate::series::{BLOCK_START, LABELS, SAMPLES, TIMESTAMP};
+use crate::series::{self, BLOCK_START, LABELS, SAMPLES, TIMESTAMP};
 
 /// Prometheus's own sentence, word for word: the conformance suite
 /// compares error text, not error kinds.
 pub const SAME_LABELSET: &str = "vector cannot contain metrics with the same labelset";
 
-/// Reject a result that carries one label set on two series.
-///
-/// Called on the final batches, with empty rows already dropped: a series
-/// that produced no points is not in upstream's result matrix and cannot
-/// collide with anything in it.
-pub fn reject_same_labelset(batches: &[RecordBatch]) -> Result<(), EngineError> {
-    let Some(first) = batches.first() else {
-        return Ok(());
-    };
-    let labels = first
-        .schema()
-        .field_with_name(LABELS)
-        .map_err(EngineError::Arrow)?
-        .data_type()
-        .clone();
-    // Row format rather than a hash: `create_hashes` would report a
-    // collision as a duplicate label set, and this error is an answer the
-    // user sees, not a heuristic.
-    let converter = RowConverter::new(vec![SortField::new(labels)]).map_err(arrow_error)?;
-    // Label sets first, and timestamps only for a label set that turned
-    // up twice: upstream reaches for the timestamps from behind a
-    // `ContainsSameLabelset` guard as well, and a result whose rows are
-    // all distinct is every query that answers with a number.
-    let mut seen: HashMap<Vec<u8>, Vec<Location>> = HashMap::new();
-    for (batch, b) in batches.iter().enumerate() {
-        let column = b
-            .column_by_name(LABELS)
-            .ok_or_else(|| EngineError::Schema(format!("no {LABELS} column")))?;
-        let rows = converter
-            .convert_columns(std::slice::from_ref(column))
-            .map_err(arrow_error)?;
-        for (row, bytes) in rows.iter().enumerate() {
-            seen.entry(bytes.as_ref().to_vec())
-                .or_default()
-                .push(Location { batch, row });
-        }
+/// The collector's single result organization pass, after Prometheus's
+/// `cleanupMetricLabels` and `sort.Sort(mat)` (`promql/engine.go` at 83962c35).
+/// Validation precedes downcasts; empty rows cannot collide. An explicit
+/// instant sort still uses label-ordered indices for checking, but its output
+/// order must not be replaced by matrix label ordering.
+pub(crate) fn finalize(
+    batches: &[RecordBatch],
+    ordered: bool,
+) -> Result<Vec<RecordBatch>, EngineError> {
+    let mut validated = None;
+    let batches = batches
+        .iter()
+        .map(|batch| {
+            let schema = batch.schema();
+            if !validated.as_ref().is_some_and(|s| Arc::ptr_eq(s, &schema)) {
+                series::validate(&schema)?;
+            }
+            validated = Some(schema);
+            Ok(series::drop_empty(batch))
+        })
+        .collect::<Result<Vec<_>, EngineError>>()?;
+    let rows = OrderedRows::new(&batches)?;
+    rows.reject_same_labelset()?;
+    if ordered {
+        drop(rows);
+        Ok(batches)
+    } else {
+        Ok(rows.into_batches(&batches))
     }
-
-    for rows in seen.values().filter(|rows| rows.len() > 1) {
-        let mut timestamps = Vec::new();
-        for at in rows {
-            timestamps.extend(timestamps_of(&batches[at.batch], at.row)?);
-        }
-        timestamps.sort_unstable();
-        if timestamps.windows(2).any(|w| w[0] == w[1]) {
-            return Err(EngineError::Query(SAME_LABELSET.into()));
-        }
-    }
-    Ok(())
 }
 
-/// The result's rows in the order Prometheus returns a range query's
-/// matrix: `sort.Sort(mat)` in `promql/engine.go`, which compares label
-/// sets pair by pair, `labels.Compare`. The plan ends in as many
-/// partitions as the store has and they finish in any order, so without
-/// this the order would change from run to run.
-///
-/// The `labels` struct's own order, which `SeriesSetExec` declares, is
-/// not that order: it compares field by field with `""` for an absent
-/// label, so `{app="q"}` sorts after `{i="0"}` there and before it here.
-///
-/// A label set that lived in several blocks is several rows, and they
-/// come out block by block, so a consumer that walks the result sees
-/// each series' points in time order without concatenating anything.
-pub fn sort_by_labelset(batches: &[RecordBatch]) -> Result<Vec<RecordBatch>, EngineError> {
-    let mut columns = Vec::with_capacity(batches.len());
-    let mut starts = Vec::with_capacity(batches.len());
-    for batch in batches {
-        let labels = batch
-            .column_by_name(LABELS)
-            .ok_or_else(|| EngineError::Schema(format!("no {LABELS} column")))?
-            .as_struct();
-        // `compare` pairs fields by position across batches.
-        if columns.is_empty() || batch.schema_ref() == batches[0].schema_ref() {
+/// `labels.Compare`, then block start, with stable ties. Struct ordering
+/// with empty values is not Prometheus's sparse-label ordering. One row
+/// index ordering serves both duplicate checking and zero-copy output.
+struct OrderedRows<'a> {
+    columns: Vec<Vec<&'a StringViewArray>>,
+    timestamps: Vec<&'a [i64]>,
+    offsets: Vec<&'a [i32]>,
+    order: Vec<(usize, usize)>,
+    already_sorted: bool,
+}
+
+impl<'a> OrderedRows<'a> {
+    /// Input schemas have already been validated by the collector.
+    fn new(batches: &'a [RecordBatch]) -> Result<Self, EngineError> {
+        let mut columns = Vec::with_capacity(batches.len());
+        let mut starts = Vec::with_capacity(batches.len());
+        let mut timestamps = Vec::with_capacity(batches.len());
+        let mut offsets = Vec::with_capacity(batches.len());
+        for batch in batches {
+            // `compare` pairs fields by position across batches.
+            if batch.schema_ref() != batches[0].schema_ref() {
+                return Err(EngineError::Schema(
+                    "result batches differ in schema".into(),
+                ));
+            }
+            let labels = batch.column_by_name(LABELS).expect("validated").as_struct();
             columns.push(
                 labels
                     .columns()
@@ -118,54 +100,151 @@ pub fn sort_by_labelset(batches: &[RecordBatch]) -> Result<Vec<RecordBatch>, Eng
                     .map(|c| c.as_string_view())
                     .collect(),
             );
-        } else {
-            return Err(EngineError::Schema(
-                "result batches differ in schema".into(),
-            ));
+            starts.push(
+                batch
+                    .column_by_name(BLOCK_START)
+                    .expect("validated")
+                    .as_primitive::<TimestampMillisecondType>(),
+            );
+            let samples = batch
+                .column_by_name(SAMPLES)
+                .expect("validated")
+                .as_list::<i32>();
+            offsets.push(samples.value_offsets());
+            timestamps.push(
+                samples
+                    .values()
+                    .as_struct()
+                    .column_by_name(TIMESTAMP)
+                    .expect("validated")
+                    .as_primitive::<TimestampMillisecondType>()
+                    .values()
+                    .as_ref(),
+            );
         }
-        starts.push(
-            batch
-                .column_by_name(BLOCK_START)
-                .ok_or_else(|| EngineError::Schema(format!("no {BLOCK_START} column")))?
-                .as_primitive::<TimestampMillisecondType>(),
-        );
+        let mut order: Vec<(usize, usize)> = batches
+            .iter()
+            .enumerate()
+            .flat_map(|(b, batch)| (0..batch.num_rows()).map(move |row| (b, row)))
+            .collect();
+        let cmp = |x: &(usize, usize), y: &(usize, usize)| {
+            compare(&columns, *x, *y)
+                .then_with(|| starts[x.0].value(x.1).cmp(&starts[y.0].value(y.1)))
+        };
+        let already_sorted = order.is_sorted_by(|x, y| cmp(x, y) != Ordering::Greater);
+        if !already_sorted {
+            order.sort_by(cmp);
+        }
+        Ok(Self {
+            columns,
+            timestamps,
+            offsets,
+            order,
+            already_sorted,
+        })
     }
-    let mut order: Vec<(usize, usize)> = batches
+
+    fn timestamps_at(&self, (batch, row): (usize, usize)) -> &'a [i64] {
+        let offsets = self.offsets[batch];
+        &self.timestamps[batch][offsets[row] as usize..offsets[row + 1] as usize]
+    }
+
+    fn reject_same_labelset(&self) -> Result<(), EngineError> {
+        let mut from = 0;
+        while from < self.order.len() {
+            let mut to = from + 1;
+            while to < self.order.len()
+                && compare(&self.columns, self.order[from], self.order[to]) == Ordering::Equal
+            {
+                to += 1;
+            }
+            if to - from > 1 {
+                let mut last = None;
+                let disjoint = self.order[from..to]
+                    .iter()
+                    .map(|&at| self.timestamps_at(at))
+                    .filter(|s| !s.is_empty())
+                    .all(|span| {
+                        let separated = last.is_none_or(|last| last < span[0]);
+                        last = span.last().copied();
+                        separated
+                    });
+                // Ordinary block-local results need only first/last
+                // timestamp bounds, not a copy or a sample walk.
+                if !disjoint {
+                    let mut spans: Vec<&[i64]> = self.order[from..to]
+                        .iter()
+                        .map(|&at| self.timestamps_at(at))
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if !spans.is_sorted_by_key(|s| s[0]) {
+                        spans.sort_by_key(|s| s[0]);
+                    }
+                    let mut start = 0;
+                    while start < spans.len() {
+                        let mut end = start + 1;
+                        let mut last = *spans[start].last().expect("nonempty");
+                        while end < spans.len() && spans[end][0] <= last {
+                            last = last.max(*spans[end].last().expect("nonempty"));
+                            end += 1;
+                        }
+                        if end - start > 1 {
+                            reject_overlapping_timestamps(&spans[start..end])?;
+                        }
+                        start = end;
+                    }
+                }
+            }
+            from = to;
+        }
+        Ok(())
+    }
+
+    fn into_batches(self, batches: &[RecordBatch]) -> Vec<RecordBatch> {
+        if self.already_sorted {
+            return batches.to_vec();
+        }
+        // Reordering nested samples would copy almost the entire answer.
+        // Adjacent row runs instead retain their input's Arrow buffers.
+        let mut runs = Vec::new();
+        let mut run: Option<(usize, usize, usize)> = None;
+        for (b, row) in self.order {
+            run = match run {
+                Some((rb, start, len)) if rb == b && start + len == row => {
+                    Some((rb, start, len + 1))
+                }
+                Some((rb, start, len)) => {
+                    runs.push(batches[rb].slice(start, len));
+                    Some((b, row, 1))
+                }
+                None => Some((b, row, 1)),
+            };
+        }
+        runs.extend(run.map(|(b, start, len)| batches[b].slice(start, len)));
+        runs
+    }
+}
+
+/// Only connected overlapping bounds reach this walk. Evaluated timestamps
+/// ascend within each row, so one borrowed head per span detects exact
+/// duplicates without an owned timestamp vector for the whole label set.
+fn reject_overlapping_timestamps(spans: &[&[i64]]) -> Result<(), EngineError> {
+    let mut heads: BinaryHeap<_> = spans
         .iter()
         .enumerate()
-        .flat_map(|(b, batch)| (0..batch.num_rows()).map(move |row| (b, row)))
+        .map(|(row, span)| Reverse((span[0], row, 0usize)))
         .collect();
-    let cmp = |x: &(usize, usize), y: &(usize, usize)| {
-        compare(&columns, *x, *y).then_with(|| starts[x.0].value(x.1).cmp(&starts[y.0].value(y.1)))
-    };
-    // A single store partition, and label sets that all carry the same
-    // names, come out of the plan in this order already.
-    if order.is_sorted_by(|x, y| cmp(x, y) != Ordering::Greater) {
-        return Ok(batches.to_vec());
+    let mut previous = None;
+    while let Some(Reverse((time, row, point))) = heads.pop() {
+        if previous == Some(time) {
+            return Err(EngineError::Query(SAME_LABELSET.into()));
+        }
+        previous = Some(time);
+        if let Some(&time) = spans[row].get(point + 1) {
+            heads.push(Reverse((time, row, point + 1)));
+        }
     }
-    order.sort_by(cmp);
-    // Slices of the input rather than `interleave_record_batch`: the
-    // samples are nearly the whole result (a 30d selector over 1000
-    // series is ~650 MB of them) and interleave copies every one, while
-    // `RecordBatch::slice` only bumps the Arc'd buffers. The cost is more,
-    // shorter batches, one per run of rows that stayed adjacent. A store
-    // that hashes series across partitions interleaves them row by row,
-    // so expect about one batch per series; consumers already take any
-    // number of batches.
-    let mut runs: Vec<RecordBatch> = Vec::new();
-    let mut run: Option<(usize, usize, usize)> = None;
-    for (b, row) in order {
-        run = match run {
-            Some((rb, start, len)) if rb == b && start + len == row => Some((rb, start, len + 1)),
-            Some((rb, start, len)) => {
-                runs.push(batches[rb].slice(start, len));
-                Some((b, row, 1))
-            }
-            None => Some((b, row, 1)),
-        };
-    }
-    runs.extend(run.map(|(b, start, len)| batches[b].slice(start, len)));
-    Ok(runs)
+    Ok(())
 }
 
 /// `labels.Compare` of two rows, read off the columns without collecting
@@ -190,32 +269,6 @@ fn compare(columns: &[Vec<&StringViewArray>], x: (usize, usize), y: (usize, usiz
         };
     }
     Ordering::Equal
-}
-
-/// Where one row of the result sits, so the second pass can go back to it.
-struct Location {
-    batch: usize,
-    row: usize,
-}
-
-/// The timestamps of one row's points.
-fn timestamps_of(batch: &RecordBatch, row: usize) -> Result<Vec<i64>, EngineError> {
-    let points = batch
-        .column_by_name(SAMPLES)
-        .ok_or_else(|| EngineError::Schema(format!("no {SAMPLES} column")))?
-        .as_list::<i32>()
-        .value(row);
-    Ok(points
-        .as_struct()
-        .column_by_name(TIMESTAMP)
-        .ok_or_else(|| EngineError::Schema(format!("no {TIMESTAMP} field")))?
-        .as_primitive::<TimestampMillisecondType>()
-        .values()
-        .to_vec())
-}
-
-fn arrow_error(e: ArrowError) -> EngineError {
-    EngineError::DataFusion(DataFusionError::ArrowError(Box::new(e), None))
 }
 
 #[cfg(test)]
@@ -251,7 +304,7 @@ mod tests {
                 .unwrap()
             })
             .collect();
-        reject_same_labelset(&batches)
+        finalize(&batches, false).map(|_| ())
     }
 
     #[test]
@@ -294,6 +347,158 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn interleaved_same_block_rows_are_checked_by_exact_timestamps() {
+        check(vec![vec![
+            row("p", "x", vec![0, 4]),
+            row("p", "x", vec![1, 3]),
+            row("p", "x", vec![2, 6]),
+        ]])
+        .unwrap();
+
+        // Interior duplicate in a connected overlap, not equal endpoints
+        // or adjacent span starts.
+        let error = check(vec![vec![
+            row("p", "x", vec![0, 10]),
+            row("p", "x", vec![2, 8]),
+            row("p", "x", vec![5, 8, 12]),
+        ]])
+        .unwrap_err();
+        assert_eq!(error.to_string(), SAME_LABELSET);
+    }
+
+    #[test]
+    fn finalization_orders_sliced_blocks_without_copying_samples() {
+        let source_rows = vec![row("ignored", "x", vec![99]), row("p", "x", vec![0, 2])];
+        let names = label_names_of(&source_rows);
+        let early = encode(&names, &source_rows).slice(1, 1);
+        let late = series::with_block(
+            &encode(&names, &[row("p", "x", vec![4, 6])]),
+            series::Block {
+                start_ms: 4,
+                end_ms: 8,
+            },
+        )
+        .unwrap();
+        let early = series::with_block(
+            &early,
+            series::Block {
+                start_ms: 0,
+                end_ms: 4,
+            },
+        )
+        .unwrap();
+        let batches = [late, early];
+        let buffers: Vec<_> = batches.iter().map(values_buffer).collect();
+        let finalized = finalize(&batches, false).unwrap();
+        let decoded = series::decode(&finalized).unwrap();
+        assert_eq!(
+            decoded.iter().map(|s| s.timestamps()).collect::<Vec<_>>(),
+            [&[0, 2][..], &[4, 6][..]]
+        );
+        for batch in &finalized {
+            assert!(
+                buffers.contains(&values_buffer(batch)),
+                "samples were copied"
+            );
+        }
+
+        let boundary = series::with_block(
+            &encode(&names, &[row("p", "x", vec![2, 6])]),
+            series::Block {
+                start_ms: 4,
+                end_ms: 8,
+            },
+        )
+        .unwrap();
+        // Actual sample bounds, not declared blocks, decide duplicates.
+        let error = finalize(&[batches[1].clone(), boundary], false).unwrap_err();
+        assert_eq!(error.to_string(), SAME_LABELSET);
+    }
+
+    #[test]
+    fn finalization_validates_schemas_and_drops_empty_colliding_rows() {
+        let names = vec!["__name__".to_owned(), "pod".to_owned()];
+        let populated = encode(&names, &[row("p", "x", vec![0])]);
+        let empty = encode(&names, &[row("p", "x", vec![])]);
+        for ordered in [false, true] {
+            let result = finalize(&[empty.clone(), populated.clone()], ordered).unwrap();
+            assert_eq!(series::decode(&result).unwrap().len(), 1);
+            assert!(finalize(&[], ordered).unwrap().is_empty());
+
+            let missing_column = populated.project(&[0, 1, 2]).unwrap();
+            assert!(matches!(
+                finalize(&[missing_column], ordered),
+                Err(EngineError::Schema(_))
+            ));
+            let different_labels = encode(
+                &["pod".to_owned()],
+                &[Series::new(&[("pod", "p")], vec![1], vec![1.0]).unwrap()],
+            );
+            assert!(matches!(
+                finalize(&[populated.clone(), different_labels], ordered),
+                Err(EngineError::Schema(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn explicit_order_is_preserved_while_nonadjacent_labels_are_checked() {
+        let names = vec!["__name__".to_owned(), "pod".to_owned()];
+        let batches = [
+            encode(&names, &[row("z", "x", vec![0])]),
+            encode(&names, &[row("a", "x", vec![0])]),
+            encode(&names, &[row("z", "x", vec![2])]),
+        ];
+        let finalized = finalize(&batches, true).unwrap();
+        let decoded = series::decode(&finalized).unwrap();
+        assert_eq!(
+            decoded.iter().map(|s| s.label("pod")).collect::<Vec<_>>(),
+            ["z", "a", "z"]
+        );
+        for (input, output) in batches.iter().zip(&finalized) {
+            assert!(Arc::ptr_eq(input.column(1), output.column(1)));
+        }
+        let collision = encode(&names, &[row("z", "x", vec![0, 2])]);
+        let error =
+            finalize(&[batches[0].clone(), batches[1].clone(), collision], true).unwrap_err();
+        assert_eq!(error.to_string(), SAME_LABELSET);
+    }
+
+    #[test]
+    fn ordinary_disjoint_blocks_borrow_timestamp_spans() {
+        let names = vec!["__name__".to_owned(), "pod".to_owned()];
+        let batches: Vec<_> = (0..4)
+            .map(|block| {
+                let start = block * 10_000;
+                series::with_block(
+                    &encode(&names, &[row("p", "x", (start..start + 10_000).collect())]),
+                    series::Block {
+                        start_ms: start,
+                        end_ms: start + 10_000,
+                    },
+                )
+                .unwrap()
+            })
+            .collect();
+        let rows = OrderedRows::new(&batches).unwrap();
+        assert_eq!(rows.order.len(), 4);
+        for (batch, input) in batches.iter().enumerate() {
+            let samples = input.column_by_name(SAMPLES).unwrap().as_list::<i32>();
+            let timestamps = samples
+                .values()
+                .as_struct()
+                .column_by_name(TIMESTAMP)
+                .unwrap()
+                .as_primitive::<TimestampMillisecondType>();
+            assert_eq!(
+                rows.timestamps_at((batch, 0)).as_ptr(),
+                timestamps.values().as_ptr()
+            );
+        }
+        rows.reject_same_labelset().unwrap();
+    }
+
     /// Every ordering of label sets that differ in which names they carry,
     /// split over two batches, against `labels.Compare` written the obvious
     /// way: pair lists compared lexicographically.
@@ -317,7 +522,7 @@ mod tests {
         let names = label_names_of(&series);
         let (front, back) = series.split_at(4);
         let batches = [encode(&names, front), encode(&names, back)];
-        let sorted = crate::series::decode(&sort_by_labelset(&batches).unwrap()).unwrap();
+        let sorted = crate::series::decode(&finalize(&batches, false).unwrap()).unwrap();
         let got: Vec<Vec<(&str, &str)>> = sorted.iter().map(|s| s.labels().collect()).collect();
         let mut want = sets.clone();
         want.sort();
@@ -354,7 +559,7 @@ mod tests {
         let batches = [encode(&names, &odd), encode(&names, &even)];
         let inputs: Vec<*const u8> = batches.iter().map(values_buffer).collect();
 
-        let sorted = sort_by_labelset(&batches).unwrap();
+        let sorted = finalize(&batches, false).unwrap();
         assert_eq!(sorted.len(), 6);
         for batch in &sorted {
             assert!(

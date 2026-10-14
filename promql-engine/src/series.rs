@@ -11,6 +11,7 @@
 //! samples      List<Struct<timestamp: Timestamp(ms), value: Float64>>
 //! block_start  Timestamp(ms)                 window ends the block answers, from here
 //! block_end    Timestamp(ms)                 to here, exclusive
+//! series_id    UInt64 | FixedSizeBinary(n>0) mandatory for raw sources, absent from results
 //! ```
 //!
 //! A store cuts its answer into blocks along its own time units and
@@ -19,9 +20,8 @@
 //! and its series hold every sample those windows reach, so nothing per
 //! series has to survive a block edge; `docs/series-source.md` is the
 //! contract. A store that keeps whole series stamps the whole select as
-//! one block. The columns are plain timestamps rather than run-end
-//! encoded because the fold groups on them, and DataFusion's group
-//! values do not take a run-end array.
+//! one block. The canonical helpers here emit plain block timestamps;
+//! stores build their own raw batches and add the mandatory identity.
 //!
 //! Label values are `Utf8View`, one 16-byte view per label per series with
 //! values up to 12 bytes inline. Within one series a value appears exactly
@@ -34,7 +34,12 @@
 //! the set never changes. A batch is many such series side by side and
 //! nothing more. Each row keeps its own complete label set and its own
 //! samples; rows share only the schema, the union of their label names.
-//! A label set with several chunks in a block arrives once per chunk;
+//! A label set with several chunks in a block arrives once per chunk.
+//! A raw source carries an opaque `series_id`: chunks of that ID must be
+//! consecutive and chronological within each block and stay in one partition.
+//! Its one-to-one mapping to full raw labels is a trusted source requirement;
+//! ordering between different IDs is unspecified. Evaluated output drops
+//! that internal ID and retains the four-column shape.
 //! [`encode`] is for a store that holds each series whole, so it refuses
 //! two series with one label set, unable to tell a second chunk from a
 //! duplicate. Merging series by the labels that survive an aggregation is
@@ -47,19 +52,19 @@
 //! timestamp and its value cannot drift apart by construction.
 //!
 //! A [`Series`] is one row of it, held as its label set and samples. A
-//! store puts rows together with [`encode`], the engine reads them back
-//! with [`decode`], and every consumer checks the shape through
-//! [`validate`], so there is exactly one definition of the shape in
-//! code, here.
+//! store can put rows together with [`encode`], then attach its IDs before
+//! selection; consumers read evaluated rows with [`decode`]. [`validate`]
+//! checks the canonical batch schema.
 //!
-//! The same shape comes out of every operator: an instant vector over a
+//! The four-column evaluated shape comes out of every operator: an instant vector over a
 //! range query is again one row per series with a list of samples, now at
 //! step timestamps, in the block that answered them. That is what lets
 //! operators stack, and why a label set seen in several blocks leaves as
 //! several rows.
 
+use std::cmp::Reverse;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -69,11 +74,12 @@ use datafusion::arrow::array::{
     TimestampMillisecondArray,
 };
 use datafusion::arrow::buffer::OffsetBuffer;
-use datafusion::arrow::compute::{concat, filter, filter_record_batch};
+use datafusion::arrow::compute::{concat, filter, FilterBuilder};
 use datafusion::arrow::datatypes::{
     DataType, Field, FieldRef, Fields, Float64Type, Schema, SchemaRef, TimeUnit,
     TimestampMillisecondType,
 };
+use datafusion::arrow::error::ArrowError;
 
 use crate::error::SeriesError;
 
@@ -91,6 +97,8 @@ pub const TIMESTAMP: &str = "timestamp";
 pub const VALUE: &str = "value";
 pub const BLOCK_START: &str = "block_start";
 pub const BLOCK_END: &str = "block_end";
+/// Mandatory opaque raw-source identity, never part of evaluated output.
+pub const SERIES_ID: &str = "series_id";
 /// Arrow's conventional name for a list's element field.
 pub const LIST_ITEM: &str = "item";
 
@@ -200,8 +208,9 @@ pub fn block_of(batch: &RecordBatch, row: usize) -> Block {
     }
 }
 
-/// Check a schema against the canonical shape, naming the first thing
-/// wrong with it.
+/// Check the canonical evaluated shape or that shape followed by a raw
+/// source's ID, naming the first thing wrong with it. This explicit utility
+/// is not a source-boundary audit; raw sources must supply IDs themselves.
 ///
 /// Strict on purpose. A store that gets this slightly wrong — a nullable
 /// child, nanoseconds, plain `Utf8` — would otherwise fail somewhere
@@ -209,12 +218,29 @@ pub fn block_of(batch: &RecordBatch, row: usize) -> Block {
 /// the batch.
 pub fn validate(schema: &Schema) -> Result<(), SeriesError> {
     let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-    if names != [LABELS, SAMPLES, BLOCK_START, BLOCK_END] {
+    if names != [LABELS, SAMPLES, BLOCK_START, BLOCK_END]
+        && names != [LABELS, SAMPLES, BLOCK_START, BLOCK_END, SERIES_ID]
+    {
         return Err(invalid!(
             "expected exactly the columns `{LABELS}`, `{SAMPLES}`, `{BLOCK_START}` and \
-             `{BLOCK_END}`, in that order, got {}",
+             `{BLOCK_END}`, optionally followed by `{SERIES_ID}`, in that order, got {}",
             names.join(", ")
         ));
+    }
+
+    if let Ok(id) = schema.field_with_name(SERIES_ID) {
+        if id.is_nullable() {
+            return Err(invalid!("`{SERIES_ID}` must not be nullable"));
+        }
+        if !matches!(
+            id.data_type(),
+            DataType::UInt64 | DataType::FixedSizeBinary(1..)
+        ) {
+            return Err(invalid!(
+                "`{SERIES_ID}` must be UInt64 or FixedSizeBinary(n > 0), got {}",
+                id.data_type()
+            ));
+        }
     }
 
     let labels = schema
@@ -258,7 +284,7 @@ pub fn validate(schema: &Schema) -> Result<(), SeriesError> {
     if samples.is_nullable() {
         return Err(invalid!("`{SAMPLES}` must not be nullable"));
     }
-    if samples.data_type() != &samples_type() {
+    if !is_samples_type(samples.data_type()) {
         return Err(invalid!(
             "`{SAMPLES}` is {}, expected {}",
             samples.data_type(),
@@ -279,6 +305,21 @@ pub fn validate(schema: &Schema) -> Result<(), SeriesError> {
         }
     }
     Ok(())
+}
+
+/// Field metadata is not part of the numerical shape. Arrow's recursive
+/// comparison also ignores names, so retain the canonical item/child names.
+pub(crate) fn is_samples_type(data_type: &DataType) -> bool {
+    let expected = samples_type();
+    match (data_type, &expected) {
+        (DataType::List(item), DataType::List(expected_item)) => {
+            item.name() == expected_item.name()
+                && data_type.equals_datatype(&expected)
+                && matches!(item.data_type(), DataType::Struct(fields)
+                    if fields.iter().map(|field| field.name().as_str()).eq([TIMESTAMP, VALUE]))
+        }
+        _ => false,
+    }
 }
 
 /// The label names a canonical schema carries, in field order.
@@ -569,12 +610,16 @@ pub fn decode(batches: &[RecordBatch]) -> Result<Vec<Series>, SeriesError> {
     Ok(out)
 }
 
-/// [`decode`]'s series with each label set's blocks joined into one
-/// series, for a caller that wants Prometheus's matrix rather than the
-/// engine's rows. The result is sorted by label set then block, so the
-/// blocks of a label set are consecutive and in time order, and joining
-/// them is one concat per label set. Timestamps stay strictly ascending
-/// because blocks do not overlap and a block answers each step once.
+/// [`decode`]'s evaluated rows joined into a Prometheus matrix, following
+/// `mergeSeriesWithSameLabelset` in `promql/engine.go` at 83962c35.
+///
+/// Equal label sets must be consecutive, as in a finalized range result;
+/// their order is retained. Chronological disjoint spans need only one
+/// concat. Name removal can also leave equal-label rows whose timestamps
+/// interleave within a block, so those spans are merged by timestamp.
+/// Duplicate timestamps return [`SeriesError::Invalid`] with Prometheus's
+/// same-labelset diagnostic; ordinary engine finalization rejects them
+/// before decoding. This is not the raw source's first-chunk-wins policy.
 pub fn coalesce(series: Vec<Series>) -> Result<Vec<Series>, SeriesError> {
     let mut out: Vec<Series> = Vec::with_capacity(series.len());
     let mut run: Vec<Series> = Vec::new();
@@ -583,8 +628,7 @@ pub fn coalesce(series: Vec<Series>) -> Result<Vec<Series>, SeriesError> {
             0 => {}
             1 => out.push(run.pop().expect("one")),
             _ => {
-                let parts: Vec<&dyn Array> = run.iter().map(|s| &s.samples as &dyn Array).collect();
-                let samples = concat(&parts)?.as_struct().clone();
+                let samples = coalesce_samples(run)?;
                 out.push(Series {
                     labels: run[0].labels.clone(),
                     samples,
@@ -604,12 +648,73 @@ pub fn coalesce(series: Vec<Series>) -> Result<Vec<Series>, SeriesError> {
     Ok(out)
 }
 
+fn coalesce_samples(run: &[Series]) -> Result<StructArray, SeriesError> {
+    let mut last = None;
+    let chronological = run
+        .iter()
+        .map(Series::timestamps)
+        .filter(|ts| !ts.is_empty())
+        .all(|ts| {
+            let separated = last.is_none_or(|last| last < ts[0]);
+            last = ts.last().copied();
+            separated
+        });
+    if chronological {
+        let parts: Vec<&dyn Array> = run.iter().map(|s| &s.samples as &dyn Array).collect();
+        return Ok(concat(&parts)?.as_struct().clone());
+    }
+
+    // Match concat's schema check on the merge path too: silently choosing
+    // the first span's metadata would accept schemas concat rejects.
+    if run
+        .iter()
+        .skip(1)
+        .any(|s| s.samples.data_type() != run[0].samples.data_type())
+    {
+        return Err(ArrowError::InvalidArgumentError(
+            "cannot coalesce samples with different data types".into(),
+        )
+        .into());
+    }
+    let spans: Vec<_> = run.iter().map(|s| sample_slices(&s.samples)).collect();
+    let len = spans.iter().map(|(ts, _)| ts.len()).sum();
+    let mut timestamps = Vec::with_capacity(len);
+    let mut values = Vec::with_capacity(len);
+    let mut heads: BinaryHeap<_> = spans
+        .iter()
+        .enumerate()
+        .filter_map(|(row, (ts, _))| ts.first().map(|&t| Reverse((t, row, 0usize))))
+        .collect();
+    while let Some(Reverse((t, row, point))) = heads.pop() {
+        if timestamps.last() == Some(&t) {
+            return Err(invalid!("{}", crate::labelset::SAME_LABELSET));
+        }
+        timestamps.push(t);
+        // Copy, never recompute: signed zero and NaN payloads belong to
+        // the evaluated result just as much as ordinary finite values do.
+        values.push(spans[row].1[point]);
+        if let Some(&next) = spans[row].0.get(point + 1) {
+            heads.push(Reverse((next, row, point + 1)));
+        }
+    }
+    Ok(StructArray::try_new(
+        run[0].samples.fields().clone(),
+        vec![
+            Arc::new(TimestampMillisecondArray::from(timestamps)),
+            Arc::new(Float64Array::from(values)),
+        ],
+        None,
+    )?)
+}
+
 /// A canonical batch with every empty-samples row removed.
 ///
 /// Pulled out of [`decode`] so the engine's public API can hand back
 /// Arrow batches with this one piece of decode's semantics already
 /// applied: the module doc on [`decode`] explains why dropping empty
-/// series can't be a plan-side filter instead.
+/// series can't be a plan-side filter instead. Empty rows occupy no child
+/// samples, so only row-sized columns and offsets need filtering; copying
+/// the sample children would duplicate the answer for no semantic change.
 pub fn drop_empty(batch: &RecordBatch) -> RecordBatch {
     let samples = batch
         .column_by_name(SAMPLES)
@@ -621,7 +726,41 @@ pub fn drop_empty(batch: &RecordBatch) -> RecordBatch {
     let mask = BooleanArray::from_iter(
         (0..batch.num_rows()).map(|row| Some(samples.value_length(row) > 0)),
     );
-    filter_record_batch(batch, &mask).expect("mask has one entry per row")
+    let predicate = FilterBuilder::new(&mask).optimize().build();
+    let mut offsets = Vec::with_capacity(predicate.count() + 1);
+    // Sliced lists may start inside their retained child array.
+    offsets.push(samples.offsets()[0]);
+    for row in 0..batch.num_rows() {
+        if mask.value(row) {
+            offsets.push(samples.offsets()[row + 1]);
+        }
+    }
+    let DataType::List(item) = samples.data_type() else {
+        unreachable!("validated samples list")
+    };
+    let kept: ArrayRef = Arc::new(ListArray::new(
+        item.clone(),
+        OffsetBuffer::new(offsets.into()),
+        Arc::clone(samples.values()),
+        None,
+    ));
+    let columns = batch
+        .schema()
+        .fields()
+        .iter()
+        .zip(batch.columns())
+        .map(|(field, column)| {
+            if field.name() == SAMPLES {
+                Arc::clone(&kept)
+            } else {
+                predicate
+                    .filter(column.as_ref())
+                    .expect("mask has one entry per row")
+            }
+        })
+        .collect();
+    RecordBatch::try_new(batch.schema(), columns)
+        .expect("canonical columns with matching row counts")
 }
 
 /// Drop the label columns no row in `batch` carries.
@@ -789,8 +928,8 @@ pub(crate) fn sample_slices(s: &StructArray) -> (&[i64], &[f64]) {
 }
 
 /// Rows of a samples column under construction. Arrow in, Arrow out: the
-/// buffers are those of the canonical samples column, handed over without
-/// a copy, so a kernel writes its output once.
+/// batch owner hands these buffers to the canonical column without a copy.
+/// Numerical scratch can append samples, but does not own row boundaries.
 ///
 /// The row after the last finished one is open: samples pushed since, not
 /// yet visible to [`take_first`](Self::take_first).
@@ -812,14 +951,17 @@ impl Default for SamplesBuilder {
 }
 
 impl SamplesBuilder {
-    pub(crate) fn reserve(&mut self, samples: usize) {
-        self.ts.reserve(samples);
-        self.vs.reserve(samples);
-    }
-
     pub(crate) fn push(&mut self, t: i64, v: f64) {
         self.ts.push(t);
         self.vs.push(v);
+    }
+
+    /// Bulk append to the open row, without introducing a row boundary.
+    /// Keep ordinary Vec growth for callers whose final size is unknown.
+    pub(crate) fn append_samples(&mut self, ts: &[i64], vs: &[f64]) {
+        debug_assert_eq!(ts.len(), vs.len());
+        self.ts.extend_from_slice(ts);
+        self.vs.extend_from_slice(vs);
     }
 
     /// Past `i32::MAX` samples the offsets cannot say where a row ends, and
@@ -838,14 +980,12 @@ impl SamplesBuilder {
     ///
     /// The head keeps the vectors' allocations and becomes the Arrow
     /// buffers; what is copied is the tail, the rows after `n` plus the
-    /// open one, which in sorted mode is a single series.
+    /// open one, whose samples may still be arriving.
     ///
     /// `split_off` leaves the head's capacity exactly as it was before the
-    /// split: `reserve`'s room for the still-open series behind it, which
-    /// an emit hands to Arrow uncounted otherwise. Only shrunk past a 2x
-    /// slack, so the one head that is genuinely most of the buffer (an
-    /// `EmitTo::All` with nothing left open) skips a copy of the whole
-    /// thing for a percent-scale reservation remainder.
+    /// split, including unused capacity behind it. Shrink only past 2x
+    /// slack, so a head holding most of the samples avoids a whole-buffer
+    /// copy for a small capacity remainder.
     pub(crate) fn take_first(&mut self, n: usize) -> ListArray {
         let end = self.offsets[n];
         let ts = self.ts.split_off(end as usize);
@@ -933,6 +1073,156 @@ mod tests {
             ]
         );
         assert!(coalesce(Vec::new()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn coalesce_merges_interleaved_samples_without_changing_float_bits() {
+        let nan = f64::from_bits(0x7ff8_0000_0000_1234);
+        let negative_nan = f64::from_bits(0xfff8_0000_0000_5678);
+        let stale = f64::from_bits(crate::selector::STALE_NAN_BITS);
+        let row = |points: &[(i64, f64)]| series(&[("pod", "p")], points);
+        let joined = coalesce(vec![
+            row(&[(i64::MIN, -0.0), (0, 0.0), (4, stale)]),
+            row(&[(1, f64::INFINITY), (3, nan)]),
+            row(&[]),
+            row(&[(2, f64::NEG_INFINITY), (i64::MAX, negative_nan)]),
+        ])
+        .unwrap();
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined[0].labels().collect::<Vec<_>>(), [("pod", "p")]);
+        assert_eq!(joined[0].timestamps(), [i64::MIN, 0, 1, 2, 3, 4, i64::MAX]);
+        assert_eq!(
+            joined[0]
+                .values()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            [
+                -0.0,
+                0.0,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                nan,
+                stale,
+                negative_nan
+            ]
+            .map(f64::to_bits),
+        );
+    }
+
+    #[test]
+    fn coalesce_handles_reversed_disjoint_spans_and_empty_rows() {
+        let row = |points: &[(i64, f64)]| series(&[], points);
+        let joined = coalesce(vec![
+            row(&[(20, 2.0)]),
+            row(&[]),
+            row(&[(0, 0.0), (10, 1.0)]),
+        ])
+        .unwrap();
+        assert_eq!(joined[0].timestamps(), [0, 10, 20]);
+        assert_eq!(joined[0].values(), [0.0, 1.0, 2.0]);
+        let empty = coalesce(vec![row(&[]), row(&[])]).unwrap();
+        assert_eq!(empty.len(), 1);
+        assert!(empty[0].timestamps().is_empty());
+    }
+
+    #[test]
+    fn coalesce_chronological_and_single_row_paths_preserve_bits() {
+        let stale = f64::from_bits(crate::selector::STALE_NAN_BITS);
+        let nan = f64::from_bits(0x7ff8_0000_0000_1234);
+        let row = |points: &[(i64, f64)]| series(&[], points);
+        let single = row(&[(0, -0.0), (1, stale), (2, nan)]);
+        let joined = coalesce(vec![single.clone()]).unwrap();
+        for (before, after) in single
+            .samples
+            .columns()
+            .iter()
+            .zip(joined[0].samples.columns())
+        {
+            assert!(Arc::ptr_eq(before, after), "single row was copied");
+        }
+        let joined = coalesce(vec![
+            row(&[]),
+            row(&[(i64::MIN, -0.0)]),
+            row(&[]),
+            row(&[(0, stale), (1, nan)]),
+            row(&[(i64::MAX, 0.0)]),
+            row(&[]),
+        ])
+        .unwrap();
+        assert_eq!(joined[0].timestamps(), [i64::MIN, 0, 1, i64::MAX]);
+        assert_eq!(
+            joined[0]
+                .values()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            [-0.0, stale, nan, 0.0].map(f64::to_bits),
+        );
+    }
+
+    #[test]
+    fn coalesce_rejects_duplicate_evaluated_timestamps() {
+        for spans in [
+            vec![vec![0, 1], vec![1, 2]],
+            vec![vec![0, 10], vec![2, 8], vec![5, 8, 12]],
+            vec![vec![i64::MIN], vec![i64::MIN]],
+        ] {
+            let rows = spans
+                .into_iter()
+                .enumerate()
+                .map(|(i, ts)| {
+                    let vs = vec![i as f64; ts.len()];
+                    Series::new(&[], ts, vs).unwrap()
+                })
+                .collect();
+            let error = coalesce(rows).unwrap_err();
+            assert!(
+                matches!(&error, SeriesError::Invalid(message) if message == crate::labelset::SAME_LABELSET),
+                "{error:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn coalesce_preserves_fields_and_checks_sample_schema_on_both_paths() {
+        let metadata = HashMap::from([("origin".into(), "preserved".into())]);
+        let decorate = |mut row: Series| {
+            row.labels = StructArray::new(
+                row.labels
+                    .fields()
+                    .iter()
+                    .map(|f| Arc::new(f.as_ref().clone().with_metadata(metadata.clone())))
+                    .collect(),
+                row.labels.columns().to_vec(),
+                None,
+            );
+            row.samples = StructArray::new(
+                row.samples
+                    .fields()
+                    .iter()
+                    .map(|f| Arc::new(f.as_ref().clone().with_metadata(metadata.clone())))
+                    .collect(),
+                row.samples.columns().to_vec(),
+                None,
+            );
+            row
+        };
+        // The second span takes either chronological concat or timestamp
+        // merge. Both must keep child metadata, not rebuild canonical fields.
+        for next in [[5, 6], [1, 3]] {
+            let first = decorate(series(&[("pod", "p")], &[(0, -0.0), (4, 4.0)]));
+            let second = series(&[("pod", "p")], &[(next[0], 1.0), (next[1], 2.0)]);
+            let result = coalesce(vec![first.clone(), decorate(second.clone())]).unwrap();
+            assert_eq!(result[0].samples.data_type(), first.samples.data_type());
+            assert_eq!(result[0].labels.data_type(), first.labels.data_type());
+            assert!(Arc::ptr_eq(
+                result[0].labels.column(0),
+                first.labels.column(0)
+            ));
+            let error = coalesce(vec![first, second]).unwrap_err();
+            assert!(matches!(error, SeriesError::Arrow(_)), "{error:?}");
+        }
     }
 
     #[test]
@@ -1096,6 +1386,51 @@ mod tests {
 
         // Nothing to narrow and nothing to clip hands the batch back.
         assert_eq!(clip(&narrowed, 0, 9000).unwrap().num_rows(), 1);
+    }
+
+    #[test]
+    fn validate_accepts_only_a_final_non_nullable_fixed_width_id() {
+        let canonical = schema(&["pod".into()]);
+        validate(&canonical).unwrap();
+        let with_id = |ty, nullable| {
+            let mut fields = canonical.fields().to_vec();
+            fields.push(Arc::new(Field::new(SERIES_ID, ty, nullable)));
+            Schema::new(fields)
+        };
+        for ty in [
+            DataType::UInt64,
+            DataType::FixedSizeBinary(1),
+            DataType::FixedSizeBinary(16),
+        ] {
+            let raw = with_id(ty, false);
+            validate(&raw).unwrap();
+        }
+        for ty in [
+            DataType::Int64,
+            DataType::Binary,
+            DataType::FixedSizeBinary(0),
+            DataType::FixedSizeBinary(-1),
+        ] {
+            let err = validate(&with_id(ty, false)).unwrap_err();
+            assert!(
+                err.to_string().contains("UInt64 or FixedSizeBinary(n > 0)"),
+                "{err}"
+            );
+        }
+        assert!(validate(&with_id(DataType::UInt64, true))
+            .unwrap_err()
+            .to_string()
+            .contains("must not be nullable"));
+
+        let mut fields = with_id(DataType::UInt64, false).fields().to_vec();
+        fields.swap(3, 4);
+        assert!(validate(&Schema::new(fields))
+            .unwrap_err()
+            .to_string()
+            .contains("exactly"));
+        let mut fields = with_id(DataType::UInt64, false).fields().to_vec();
+        fields.push(Arc::new(Field::new("extra", DataType::UInt64, false)));
+        assert!(validate(&Schema::new(fields)).is_err());
     }
 
     #[test]
@@ -1267,6 +1602,198 @@ mod tests {
         assert_eq!(decode(&[restamped]).unwrap().len(), 1);
     }
 
+    #[test]
+    fn drop_empty_preserves_nested_metadata_for_sliced_and_empty_results() {
+        let input = encode(
+            &["pod".into()],
+            &[
+                series(&[("pod", "before")], &[(0, 1.), (1, 2.)]),
+                series(&[("pod", "empty")], &[]),
+                series(&[("pod", "after")], &[(2, -0.)]),
+            ],
+            ONE_BLOCK,
+        )
+        .unwrap();
+        let metadata = std::collections::HashMap::from([("source".into(), "preserved".into())]);
+        for (item_metadata, child_metadata) in [(true, false), (false, true), (true, true)] {
+            let fields: Fields = sample_fields()
+                .iter()
+                .map(|field| {
+                    Arc::new(if child_metadata {
+                        field.as_ref().clone().with_metadata(metadata.clone())
+                    } else {
+                        field.as_ref().clone()
+                    })
+                })
+                .collect();
+            let item = Field::new("item", DataType::Struct(fields.clone()), false);
+            let item = if item_metadata {
+                item.with_metadata(metadata.clone())
+            } else {
+                item
+            };
+            let original = input.column(1).as_list::<i32>();
+            let samples = ListArray::new(
+                Arc::new(item),
+                original.offsets().clone(),
+                Arc::new(StructArray::new(
+                    fields,
+                    original.values().as_struct().columns().to_vec(),
+                    None,
+                )),
+                None,
+            );
+            let mut fields = input.schema().fields().to_vec();
+            fields[1] = Arc::new(
+                Field::new(SAMPLES, samples.data_type().clone(), false)
+                    .with_metadata(metadata.clone()),
+            );
+            let mut columns = input.columns().to_vec();
+            columns[1] = Arc::new(samples);
+            let decorated = RecordBatch::try_new(
+                Arc::new(Schema::new_with_metadata(fields, metadata.clone())),
+                columns,
+            )
+            .unwrap();
+            for (start, len, offsets) in
+                [(0, 3, vec![0, 2, 3]), (1, 2, vec![2, 3]), (1, 1, vec![2])]
+            {
+                let input = decorated.slice(start, len);
+                let output = drop_empty(&input);
+                validate(&output.schema()).unwrap();
+                assert_eq!(output.schema(), input.schema());
+                let before = input.column(1).as_list::<i32>();
+                let after = output.column(1).as_list::<i32>();
+                assert_eq!(after.data_type(), before.data_type());
+                assert_eq!(after.offsets().to_vec(), offsets);
+                assert!(Arc::ptr_eq(after.values(), before.values()));
+                let expected = decode(&[input]).unwrap();
+                let actual = decode(&[output]).unwrap();
+                assert_eq!(actual.len(), expected.len());
+                for (actual, expected) in actual.iter().zip(expected) {
+                    assert_eq!(actual.timestamps(), expected.timestamps());
+                    assert_eq!(
+                        actual
+                            .values()
+                            .iter()
+                            .map(|v| v.to_bits())
+                            .collect::<Vec<_>>(),
+                        expected
+                            .values()
+                            .iter()
+                            .map(|v| v.to_bits())
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn drop_empty_keeps_sample_children_and_gathers_only_row_columns() {
+        let stale = f64::from_bits(crate::selector::STALE_NAN_BITS);
+        let all = [
+            series(&[("pod", "before")], &[(0, 1.0), (1, 2.0)]),
+            series(&[("pod", "empty-before")], &[]),
+            series(&[("pod", "a")], &[(2, stale), (3, -0.0)]),
+            series(&[("pod", "empty-between")], &[]),
+            series(&[("pod", "b")], &[(4, 0.0)]),
+            series(&[("pod", "empty-after")], &[]),
+            series(&[("pod", "after")], &[(5, 3.0)]),
+        ];
+        let batch = encode(&["pod".to_owned()], &all, ONE_BLOCK).unwrap();
+        let mut fields = batch.schema().fields().to_vec();
+        fields.push(Arc::new(Field::new(SERIES_ID, DataType::UInt64, false)));
+        let mut columns = batch.columns().to_vec();
+        columns[2] = Arc::new(TimestampMillisecondArray::from(
+            (0..all.len() as i64).map(|i| i * 10).collect::<Vec<_>>(),
+        ));
+        columns[3] = Arc::new(TimestampMillisecondArray::from(
+            (0..all.len() as i64)
+                .map(|i| i * 10 + 10)
+                .collect::<Vec<_>>(),
+        ));
+        columns.push(Arc::new(datafusion::arrow::array::UInt64Array::from(
+            (0..all.len() as u64).collect::<Vec<_>>(),
+        )));
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+        for (start, len, expected_offsets) in [
+            (0, 7, vec![0, 2, 4, 5, 6]),
+            (1, 5, vec![2, 4, 5]),
+            (1, 1, vec![2]),
+            (3, 1, vec![4]),
+            (5, 1, vec![5]),
+        ] {
+            let input = batch.slice(start, len);
+            let out = drop_empty(&input);
+            validate(&out.schema()).unwrap();
+            let original = input.column_by_name(SAMPLES).unwrap().as_list::<i32>();
+            let kept = out.column_by_name(SAMPLES).unwrap().as_list::<i32>();
+            assert_eq!(kept.offsets().to_vec(), expected_offsets);
+            assert!(Arc::ptr_eq(original.values(), kept.values()));
+            let expected = decode(std::slice::from_ref(&input)).unwrap();
+            let actual = decode(std::slice::from_ref(&out)).unwrap();
+            assert_eq!(actual.len(), expected.len());
+            for (a, b) in actual.iter().zip(&expected) {
+                assert!(a.labels().eq(b.labels()));
+                assert_eq!(a.timestamps(), b.timestamps());
+                assert_eq!(
+                    a.values().iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    b.values().iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                );
+            }
+            let expected_rows: Vec<_> = (start..start + len)
+                .filter(|&i| !all[i].timestamps().is_empty())
+                .collect();
+            let ids = out
+                .column_by_name(SERIES_ID)
+                .unwrap()
+                .as_primitive::<datafusion::arrow::datatypes::UInt64Type>();
+            assert_eq!(ids.len(), expected_rows.len());
+            for (row, original_row) in expected_rows.into_iter().enumerate() {
+                assert_eq!(ids.value(row), original_row as u64);
+                assert_eq!(
+                    block_of(&out, row),
+                    Block {
+                        start_ms: original_row as i64 * 10,
+                        end_ms: original_row as i64 * 10 + 10,
+                    },
+                );
+            }
+        }
+        // Sliced nonempty rows and zero-row batches use the clone fast path.
+        for input in [batch.slice(2, 1), batch.slice(7, 0)] {
+            let out = drop_empty(&input);
+            for (original, kept) in input.columns().iter().zip(out.columns()) {
+                assert!(Arc::ptr_eq(original, kept));
+            }
+        }
+        let all_empty = encode(
+            &["pod".to_owned()],
+            &[series(&[("pod", "a")], &[]), series(&[("pod", "b")], &[])],
+            ONE_BLOCK,
+        )
+        .unwrap();
+        let out = drop_empty(&all_empty);
+        assert_eq!(out.num_rows(), 0);
+        assert!(Arc::ptr_eq(
+            all_empty
+                .column_by_name(SAMPLES)
+                .unwrap()
+                .as_list::<i32>()
+                .values(),
+            out.column_by_name(SAMPLES)
+                .unwrap()
+                .as_list::<i32>()
+                .values(),
+        ));
+
+        let bare = encode(&[], &[series(&[], &[])], ONE_BLOCK).unwrap();
+        let out = drop_empty(&bare);
+        assert_eq!(out.num_rows(), 0);
+        validate(&out.schema()).unwrap();
+    }
+
     fn builder_rows(list: &ListArray) -> Vec<Vec<(i64, f64)>> {
         (0..list.len())
             .map(|r| {
@@ -1275,6 +1802,45 @@ mod tests {
                 ts.iter().copied().zip(vs.iter().copied()).collect()
             })
             .collect()
+    }
+
+    #[test]
+    fn append_samples_leaves_row_boundaries_to_the_caller() {
+        let ts = [10, 20, 30, 40];
+        let vs = [
+            -0.0,
+            f64::from_bits(0x7ff0_0000_0000_0002),
+            f64::from_bits(0x7ff8_0000_0000_1234),
+            f64::NEG_INFINITY,
+        ];
+        let mut out = SamplesBuilder::default();
+        out.push(0, f64::INFINITY);
+        out.append_samples(&ts, &vs);
+        assert_eq!(out.ts.len(), 5);
+        assert_eq!(out.rows(), 0, "only the caller finishes rows");
+        out.finish_row();
+        out.append_samples(&[], &[]);
+        out.finish_row();
+        out.append_samples(&[50], &[0.0]); // still-open tail
+        let list = out.take_first(2);
+        assert_eq!(list.value_length(0), 5);
+        assert_eq!(list.value_length(1), 0);
+        let row = list.value(0);
+        let (got_ts, got_vs) = sample_slices(row.as_struct());
+        assert_eq!(got_ts, [0, 10, 20, 30, 40]);
+        assert_eq!(got_vs[0], f64::INFINITY);
+        for (got, want) in got_vs[1..].iter().zip(vs) {
+            assert_eq!(got.to_bits(), want.to_bits());
+        }
+        assert_eq!(ts, [10, 20, 30, 40], "append borrows its source");
+        assert_eq!(vs[0].to_bits(), (-0.0f64).to_bits());
+        assert_eq!(out.rows(), 0);
+        out.finish_row();
+        let tail = out.take_all();
+        let row = tail.value(0);
+        let (got_ts, got_vs) = sample_slices(row.as_struct());
+        assert_eq!(got_ts, [50]);
+        assert_eq!(got_vs[0].to_bits(), 0.0f64.to_bits());
     }
 
     #[test]
@@ -1306,7 +1872,8 @@ mod tests {
     #[test]
     fn take_first_does_not_emit_the_open_series_reservation() {
         let mut b = SamplesBuilder::default();
-        b.reserve(100_000);
+        b.ts.reserve(100_000);
+        b.vs.reserve(100_000);
         b.push(0, 1.0);
         b.finish_row();
         b.push(10, 2.0); // the open row, still being grown

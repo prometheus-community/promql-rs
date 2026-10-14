@@ -455,14 +455,21 @@ mod tests {
             _state: &dyn datafusion::catalog::Session,
             _matchers: &[promql_parser::ast::LabelMatcher],
             _hints: crate::SelectHints,
-        ) -> datafusion::error::Result<std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>>
-        {
+        ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
             let names = crate::series::label_names_of(&self.0);
+            let mut fields = crate::series::schema(&names).fields().to_vec();
+            fields.push(Arc::new(datafusion::arrow::datatypes::Field::new(
+                crate::series::SERIES_ID,
+                DataType::UInt64,
+                false,
+            )));
+            let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(fields));
             let partitions: Vec<Vec<_>> = self
                 .0
                 .iter()
-                .map(|s| {
-                    vec![crate::series::encode(
+                .enumerate()
+                .map(|(id, s)| {
+                    let batch = crate::series::encode(
                         &names,
                         std::slice::from_ref(s),
                         // Whole series: one block answers every step.
@@ -471,10 +478,17 @@ mod tests {
                             end_ms: i64::MAX,
                         },
                     )
-                    .expect("one series is one batch")]
+                    .expect("one series is one batch");
+                    let mut columns = batch.columns().to_vec();
+                    columns.push(Arc::new(datafusion::arrow::array::UInt64Array::from(vec![
+                        id as u64,
+                    ])));
+                    vec![
+                        datafusion::arrow::array::RecordBatch::try_new(schema.clone(), columns)
+                            .unwrap(),
+                    ]
                 })
                 .collect();
-            let schema = crate::series::schema(&names);
             Ok(
                 datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
                     &partitions,
@@ -505,7 +519,12 @@ mod tests {
         use datafusion::physical_plan::{collect, ExecutionPlanProperties};
         use datafusion::prelude::{SessionConfig, SessionContext};
 
-        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(8));
+        let state = datafusion::execution::session_state::SessionStateBuilder::new()
+            .with_config(SessionConfig::new().with_target_partitions(8))
+            .with_default_features()
+            .with_query_planner(Arc::new(crate::series_eval::SeriesEvalQueryPlanner))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
         // `tests/sort.rs`'s `VALUES`, one series per partition and out of
         // value order.
         let source = Split(
@@ -529,8 +548,8 @@ mod tests {
             .unwrap();
 
         // Through `plan::plan` rather than `Engine`, which owns its session
-        // and so cannot be told to use more than one partition. The UDFs
-        // travel inside the expressions, so none need registering.
+        // and so cannot be told to use more than one partition. Register the
+        // same evaluation extension planner while keeping this test's parallelism.
         let (partitions, rendered, values) = rt.block_on(async {
             let plan = crate::plan::plan(&ctx.state(), &source, &expr, &INSTANT)
                 .await

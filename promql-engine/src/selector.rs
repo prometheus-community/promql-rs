@@ -1,51 +1,8 @@
-//! The vector selector as a DataFusion grouped aggregate function.
-//!
-//! `promql_vector_selector(samples, block_start, block_end, start, end,
-//! step, lookback, offset, at, timestamp)` grouped by the block and
-//! `labels` folds one label set's chunks of one block, in arrival order,
-//! into that series' values on the steps the block answers: for every
-//! such step, the most recent sample no older than `lookback`, stamped
-//! with the step's timestamp. With `timestamp` set the sample's own time
-//! is emitted in place of its value, see [`Pick`].
-//!
-//! An aggregate, because a series is one chunk of a label set, not the
-//! whole of it: only an aggregate sees a group's series in sequence and
-//! keeps state between them. The block columns are arguments as well as
-//! group keys because an accumulator never sees its key, and it needs the
-//! block to cut the grid to the steps that block answers. Keeping the
-//! parameters as literal arguments rather than state on the function means
-//! the plan serializes with no custom codec and two selectors with different
-//! parameters are never taken for one.
-//!
-//! The names follow Prometheus's `promql/engine.go`, where a
-//! `VectorSelector` expands the series set and runs `evalSeries` over
-//! `vectorSelectorSingle`: the expansion is [`crate::source::SelectorTable`],
-//! `EvalSeries` is the accumulator both the selector and the range
-//! functions run in, and `advance_selector` is one series' walk across the
-//! grid.
+//! Prometheus's `vectorSelectorSingle` kernel from `promql/engine.go` at
+//! 83962c35. [`crate::series_eval`] is the sole raw-source driver; this module
+//! owns only the per-series numerical walk and its timestamp/staleness rules.
 
-use std::any::Any;
-use std::sync::Arc;
-
-use datafusion::arrow::array::{Array, ArrayRef, AsArray, BooleanArray, ListArray};
-use datafusion::arrow::datatypes::{DataType, Field, FieldRef, TimestampMillisecondType};
-use datafusion::common::{plan_err, ScalarValue};
-use datafusion::error::Result;
-use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
-use datafusion::logical_expr::utils::format_state_name;
-use datafusion::logical_expr::{
-    lit, Accumulator, AggregateUDF, AggregateUDFImpl, EmitTo, Expr, GroupsAccumulator, Signature,
-    Volatility,
-};
-use datafusion::physical_expr::expressions::Literal;
-use datafusion::physical_expr::PhysicalExpr;
-
-use crate::buffer::{BufferedSeriesIterator, Kernel};
-use crate::params::Params;
-use crate::series::{self, Block, SamplesBuilder};
-use crate::source::source_error;
-
-pub const NAME: &str = "promql_vector_selector";
+use crate::buffer::{EvalContext, WindowBuffer, WorkBudget};
 
 /// Prometheus's staleness marker: a NaN with this exact payload. It must
 /// be compared by bits, since every NaN compares unequal to everything.
@@ -62,7 +19,7 @@ pub fn is_stale(v: f64) -> bool {
 /// with the step. Upstream keeps the two apart the same way, with
 /// `rangeEvalTimestampFunctionOverVectorSelector` reading `t` where
 /// `evalVectorSelector` reads `f`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Hash)]
 pub enum Pick {
     Value,
     /// `float64(t) / 1000`: the picked sample's time in seconds.
@@ -70,7 +27,7 @@ pub enum Pick {
 }
 
 impl Pick {
-    fn of(self, t: i64, v: f64) -> f64 {
+    pub(crate) fn of(self, t: i64, v: f64) -> f64 {
         match self {
             Pick::Value => v,
             Pick::Timestamp => t as f64 / 1000.0,
@@ -87,17 +44,19 @@ impl Pick {
 ///
 /// `ts`/`vs` are the series' samples from ordinal `it.base` on.
 pub(crate) fn advance_selector(
-    it: &mut BufferedSeriesIterator,
+    it: &mut WindowBuffer,
+    context: &EvalContext,
     ts: &[i64],
     vs: &[f64],
     pick: Pick,
-    out: &mut SamplesBuilder,
+    budget: &mut WorkBudget,
+    mut emit: impl FnMut(i64, f64),
 ) {
     let Some(last_t) = it.last_t else {
         return;
     };
-    let p = it.params;
-    let steps = it.steps();
+    let p = context.params();
+    let steps = context.steps();
 
     // `@` pins the lookup, so the answer is one value repeated across the
     // grid. The buffer holds only the pinned window's latest sample.
@@ -105,14 +64,20 @@ pub(crate) fn advance_selector(
         if it.next_step >= steps || at - p.offset_ms > last_t {
             return;
         }
-        if let (Some(&t), Some(&v)) = (ts.last(), vs.last()) {
-            if !is_stale(v) {
-                for step in p.steps() {
-                    out.push(step, pick.of(t, v));
-                }
-            }
+        if budget.exhausted() {
+            return;
         }
-        it.next_step = steps;
+        let value = *it.pinned_value.get_or_insert_with(|| {
+            ts.last()
+                .zip(vs.last())
+                .and_then(|(&t, &v)| (!is_stale(v)).then(|| pick.of(t, v)))
+        });
+        while it.next_step < steps && budget.take() {
+            if let Some(v) = value {
+                emit(context.step_at(it.next_step), v);
+            }
+            it.next_step += 1;
+        }
         return;
     }
 
@@ -122,19 +87,25 @@ pub(crate) fn advance_selector(
     // together cost the 30-day selector 7%. The addition past the last step
     // may wrap near `i64::MAX`; that value is never read.
     let (mut next, mut h) = (it.next_step, it.hi - it.base);
-    let mut step = it.step_at(next);
-    while next < steps {
+    let mut step = context.step_at(next);
+    'steps: while next < steps {
         let ref_time = step - p.offset_ms;
         if ref_time > last_t {
             break;
         }
         while h < ts.len() && ts[h] <= ref_time {
+            if !budget.take() {
+                break 'steps;
+            }
             h += 1;
+        }
+        if !budget.take() {
+            break;
         }
         if h > 0 {
             let (t, v) = (ts[h - 1], vs[h - 1]);
             if t > ref_time - p.window_ms && !is_stale(v) {
-                out.push(step, pick.of(t, v));
+                emit(step, pick.of(t, v));
             }
         }
         next += 1;
@@ -146,336 +117,13 @@ pub(crate) fn advance_selector(
     it.lo = it.hi.saturating_sub(1).max(it.base);
 }
 
-/// `evalSeries` as a DataFusion accumulator, one per selector or range
-/// function per partition, grouped by the block and the whole `labels`
-/// struct.
-///
-/// It relies on a label set's chunks arriving consecutively within a
-/// block: that is what lets one [`BufferedSeriesIterator`] serve every
-/// group, and it is what DataFusion's Sorted mode, one open group at a
-/// time, needs to bound memory. A group seen again after a later one
-/// opened is an error, not a second fold, because folding it would answer
-/// from half a series. Each group is folded against the query grid cut to
-/// its block, so a series' steps in another block are never answered
-/// from the reach-back this block repeats.
-pub(crate) struct EvalSeries {
-    series: BufferedSeriesIterator,
-    /// The whole query's grid; the iterator runs on one block's cut of it.
-    grid: Params,
-    out: SamplesBuilder,
-    /// Group index of the open series, always `finished` when set.
-    open: Option<usize>,
-    /// Rows finished in `out`, all before `open`.
-    finished: usize,
-    /// The groups DataFusion has handed out, so an emit can give trailing
-    /// groups that only had null or filtered series their empty row.
-    groups: usize,
-}
-
-impl EvalSeries {
-    pub(crate) fn new(kernel: Kernel, params: Params) -> Self {
-        Self {
-            series: BufferedSeriesIterator::new(kernel, params),
-            grid: params,
-            out: SamplesBuilder::default(),
-            open: None,
-            finished: 0,
-            groups: 0,
-        }
-    }
-
-    /// Finishes every row before group `g`: the open series, then an empty
-    /// row for each group whose series were all null, filtered or empty.
-    fn close_until(&mut self, g: usize) {
-        if self.open.take().is_some() {
-            self.series.close(&mut self.out);
-            self.finished += 1;
-        }
-        while self.finished < g {
-            self.out.finish_row();
-            self.finished += 1;
-        }
-    }
-
-    /// In Sorted mode `First(n)` never reaches the open group. In any other
-    /// mode it may, and the group is closed with what it has; a row for it
-    /// afterwards is a new group DataFusion cannot tell apart.
-    fn emit(&mut self, emit_to: EmitTo) -> ListArray {
-        let n = match emit_to {
-            EmitTo::All => self
-                .groups
-                .max(self.finished + usize::from(self.open.is_some())),
-            EmitTo::First(n) => n,
-        };
-        if self.open.is_none_or(|o| o < n) {
-            self.close_until(n);
-        }
-        let list = self.out.take_first(n);
-        self.finished -= n;
-        self.open = self.open.map(|o| o - n);
-        // The reservation left with the head; in Sorted mode this runs on
-        // every batch, so without it the open series regrows each time.
-        if self.open.is_some() {
-            self.out.reserve(self.series.steps_left());
-        }
-        self.groups = self.groups.saturating_sub(n);
-        list
-    }
-}
-
-impl std::fmt::Debug for EvalSeries {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EvalSeries")
-            .field("open", &self.open)
-            .field("finished", &self.finished)
-            .field("groups", &self.groups)
-            .finish_non_exhaustive()
-    }
-}
-
-/// Series a `FILTER` clause dropped, and rows with no series at all,
-/// contribute nothing to their group.
-fn skipped(list: &ListArray, filter: Option<&BooleanArray>, row: usize) -> bool {
-    list.is_null(row) || filter.is_some_and(|f| f.is_null(row) || !f.value(row))
-}
-
-/// The block of row `row`, off the two block argument columns.
-fn block_at(values: &[ArrayRef], row: usize) -> Block {
-    let at = |i: usize| {
-        values[i]
-            .as_primitive::<TimestampMillisecondType>()
-            .value(row)
-    };
-    Block {
-        start_ms: at(1),
-        end_ms: at(2),
-    }
-}
-
-impl GroupsAccumulator for EvalSeries {
-    fn update_batch(
-        &mut self,
-        values: &[ArrayRef],
-        group_indices: &[usize],
-        opt_filter: Option<&BooleanArray>,
-        total_num_groups: usize,
-    ) -> Result<()> {
-        self.groups = self.groups.max(total_num_groups);
-        let list = values[0].as_list::<i32>();
-        let (ts, vs) = series::sample_slices(list.values().as_struct());
-        let offsets = list.offsets();
-        for (row, &g) in group_indices.iter().enumerate() {
-            let (a, b) = (offsets[row] as usize, offsets[row + 1] as usize);
-            if a == b || skipped(list, opt_filter, row) {
-                continue;
-            }
-            if self.open != Some(g) {
-                // The group key never reaches an accumulator, so unlike
-                // `SeriesSetExec` this cannot name the series. It is the
-                // backstop for a plan that reorders series above that check.
-                if g < self.finished {
-                    return Err(source_error(format!(
-                        "{NAME}: the chunks of a series are not consecutive: group {g} came \
-                         back after group {} opened",
-                        self.finished
-                    )));
-                }
-                self.close_until(g);
-                self.open = Some(g);
-                // The block is a group key, so it is constant over the
-                // group and the grid is cut once, as the group opens.
-                self.series.params = self.grid.for_block(block_at(values, row));
-                // Grown by doubling instead, a 30-day chunk is copied a
-                // dozen times on its way to the size the grid gives up
-                // front.
-                self.out.reserve(self.series.steps_left());
-            }
-            self.series.push(&ts[a..b], &vs[a..b], &mut self.out);
-        }
-        Ok(())
-    }
-
-    fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
-        Ok(Arc::new(self.emit(emit_to)))
-    }
-
-    /// The finished series itself: a partial holding a whole series has
-    /// nothing left to combine, so the final side only has to pass it on.
-    fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
-        Ok(vec![Arc::new(self.emit(emit_to))])
-    }
-
-    /// Group indices are handed out in first-seen order, so a state for a
-    /// group at or before the last one merged is that series' second state,
-    /// from a second partition, and no bitset is needed to see it.
-    fn merge_batch(
-        &mut self,
-        values: &[ArrayRef],
-        group_indices: &[usize],
-        opt_filter: Option<&BooleanArray>,
-        total_num_groups: usize,
-    ) -> Result<()> {
-        self.groups = self.groups.max(total_num_groups);
-        let list = values[0].as_list::<i32>();
-        let (ts, vs) = series::sample_slices(list.values().as_struct());
-        let offsets = list.offsets();
-        for (row, &g) in group_indices.iter().enumerate() {
-            if skipped(list, opt_filter, row) {
-                continue;
-            }
-            if g < self.finished || self.open.is_some() {
-                return Err(source_error(format!(
-                    "{NAME}: a series arrived from more than one partition (group {g})"
-                )));
-            }
-            self.close_until(g);
-            for i in offsets[row] as usize..offsets[row + 1] as usize {
-                self.out.push(ts[i], vs[i]);
-            }
-            self.out.finish_row();
-            self.finished += 1;
-        }
-        Ok(())
-    }
-
-    fn size(&self) -> usize {
-        self.series.size() + self.out.size()
-    }
-}
-
-/// The DataFusion function. Stateless: every parameter is an argument.
-#[derive(Debug, PartialEq, Eq, Hash)]
-pub struct VectorSelector {
-    signature: Signature,
-}
-
-impl Default for VectorSelector {
-    fn default() -> Self {
-        let mut args = vec![
-            series::samples_type(),
-            series::timestamp_type(),
-            series::timestamp_type(),
-        ];
-        args.extend(std::iter::repeat_n(DataType::Int64, 6));
-        args.push(DataType::Boolean);
-        Self {
-            signature: Signature::exact(args, Volatility::Immutable),
-        }
-    }
-}
-
-pub fn udaf() -> AggregateUDF {
-    AggregateUDF::new_from_impl(VectorSelector::default())
-}
-
-/// `promql_vector_selector(samples, block_start, block_end, start, end,
-/// step, lookback, offset, at, timestamp)`.
-pub fn call(samples: Expr, block_start: Expr, block_end: Expr, p: &Params, pick: Pick) -> Expr {
-    udaf().call(vec![
-        samples,
-        block_start,
-        block_end,
-        lit(p.start_ms),
-        lit(p.end_ms),
-        lit(p.step_ms),
-        lit(p.window_ms),
-        lit(p.offset_ms),
-        lit(ScalarValue::Int64(p.at_ms)),
-        lit(pick == Pick::Timestamp),
-    ])
-}
-
-/// The `timestamp` argument, a literal for the reason the parameters
-/// are: an accumulator is built once per plan.
-fn pick_from_literal(exprs: &[Arc<dyn PhysicalExpr>]) -> Result<Pick> {
-    let value = exprs
-        .get(9)
-        .and_then(|e| (e.as_ref() as &dyn Any).downcast_ref::<Literal>())
-        .map(Literal::value);
-    match value {
-        Some(ScalarValue::Boolean(Some(true))) => Ok(Pick::Timestamp),
-        Some(ScalarValue::Boolean(Some(false))) => Ok(Pick::Value),
-        _ => plan_err!("{NAME}: argument 9 (timestamp) must be a Boolean literal"),
-    }
-}
-
-/// What a group with no rows yields: no samples.
-pub(crate) fn empty_samples() -> ScalarValue {
-    let mut b = SamplesBuilder::default();
-    b.finish_row();
-    ScalarValue::List(Arc::new(b.take_all()))
-}
-
-impl AggregateUDFImpl for VectorSelector {
-    fn name(&self) -> &str {
-        NAME
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    /// Same shape out as in. The check here is what makes a mistyped
-    /// samples column a plan error rather than a downcast panic.
-    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        if arg_types.first() != Some(&series::samples_type()) {
-            return plan_err!(
-                "{NAME}: first argument must be {}, got {:?}",
-                series::samples_type(),
-                arg_types.first()
-            );
-        }
-        Ok(series::samples_type())
-    }
-
-    /// Every series yields a list, possibly empty; never NULL, so the
-    /// output is the canonical shape it came in as.
-    fn is_nullable(&self) -> bool {
-        false
-    }
-
-    /// Without a group key there is no series to fold chunks into.
-    fn accumulator(&self, _args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
-        plan_err!("{NAME} must be grouped by the block and labels")
-    }
-
-    fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
-        Ok(vec![Arc::new(Field::new(
-            format_state_name(args.name, "samples"),
-            series::samples_type(),
-            false,
-        ))])
-    }
-
-    fn groups_accumulator_supported(&self, _args: AccumulatorArgs) -> bool {
-        true
-    }
-
-    /// `DISTINCT` would deduplicate chunks, which is the overlap rule's
-    /// job; answering without it would be silently different.
-    fn create_groups_accumulator(
-        &self,
-        args: AccumulatorArgs,
-    ) -> Result<Box<dyn GroupsAccumulator>> {
-        if args.is_distinct {
-            return plan_err!("{NAME}: DISTINCT is not supported");
-        }
-        Ok(Box::new(EvalSeries::new(
-            Kernel::Selector(pick_from_literal(args.exprs)?),
-            Params::from_literals(args.exprs, 3)?,
-        )))
-    }
-
-    fn default_value(&self, _data_type: &DataType) -> Result<ScalarValue> {
-        Ok(empty_samples())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::EngineError;
-    use datafusion::logical_expr::EmitTo;
+    use crate::buffer::{BufferedSeriesIterator, Kernel};
+    use crate::params::Params;
+    use crate::series::{self, Block, SamplesBuilder};
+    use datafusion::arrow::array::{Array, AsArray, ListArray};
 
     const M: i64 = 60_000;
 
@@ -489,12 +137,18 @@ mod tests {
     }
 
     fn select_with(pick: Pick, chunks: &[(&[i64], &[f64])], p: Params) -> Vec<(i64, f64)> {
-        let mut it = BufferedSeriesIterator::new(Kernel::Selector(pick), p);
+        fold(Kernel::Selector(pick), chunks, p)
+    }
+
+    fn fold(kernel: Kernel, chunks: &[(&[i64], &[f64])], p: Params) -> Vec<(i64, f64)> {
+        let context = EvalContext::new(kernel, p);
+        let mut it = BufferedSeriesIterator::new(&context);
         let mut out = SamplesBuilder::default();
         for (ts, vs) in chunks {
-            it.push(ts, vs, &mut out);
+            it.push(&context, ts, vs, |t, v| out.push(t, v));
         }
-        it.close(&mut out);
+        it.close(&context, |t, v| out.push(t, v));
+        out.finish_row();
         let mut rows = rows(&out.take_all());
         assert_eq!(rows.len(), 1);
         rows.pop().unwrap()
@@ -669,6 +323,144 @@ mod tests {
     }
 
     #[test]
+    fn one_step_value_and_timestamp_have_literal_modifier_and_overlap_answers() {
+        let stale = f64::from_bits(STALE_NAN_BITS);
+        let nan = f64::from_bits(0x7ff8_0000_0000_1234);
+        let base = Params {
+            start_ms: 10 * M,
+            end_ms: 10 * M,
+            ..params()
+        };
+        // Each tuple supplies independent Value and Timestamp expectations.
+        let cases = [
+            (base, vec![vec![(5 * M, 8.0)]], None),
+            (base, vec![vec![(10 * M, -0.0)]], Some((-0.0, 600.0))),
+            (base, vec![vec![(9 * M, nan)]], Some((nan, 540.0))),
+            (
+                base,
+                vec![vec![(9 * M, stale)], vec![(9 * M, 7.0), (11 * M, 8.0)]],
+                None,
+            ),
+            (
+                base,
+                vec![
+                    vec![(8 * M, 4.0), (11 * M, stale)],
+                    vec![(9 * M, 9.0), (12 * M, 10.0)],
+                ],
+                Some((4.0, 480.0)),
+            ),
+            (
+                base,
+                vec![vec![(6 * M, 1.0)], vec![(8 * M, -0.0)], vec![(11 * M, 2.0)]],
+                Some((-0.0, 480.0)),
+            ),
+            (
+                Params {
+                    offset_ms: M,
+                    ..base
+                },
+                vec![vec![(8 * M, 3.0), (10 * M, 9.0)]],
+                Some((3.0, 480.0)),
+            ),
+            (
+                Params {
+                    offset_ms: -M,
+                    ..base
+                },
+                vec![vec![(11 * M, nan), (12 * M, 9.0)]],
+                Some((nan, 660.0)),
+            ),
+            (
+                Params {
+                    at_ms: Some(8 * M + 1),
+                    offset_ms: M,
+                    ..base
+                },
+                vec![vec![(7 * M, -0.0), (8 * M, 9.0)]],
+                Some((-0.0, 420.0)),
+            ),
+            (
+                Params {
+                    at_ms: Some(9 * M),
+                    ..base
+                },
+                vec![vec![(9 * M, stale)]],
+                None,
+            ),
+        ];
+        for (p, chunks, expected) in cases {
+            let chunks: Vec<(Vec<i64>, Vec<f64>)> = chunks
+                .into_iter()
+                .map(|chunk| chunk.into_iter().unzip())
+                .collect();
+            let chunks: Vec<(&[i64], &[f64])> = chunks
+                .iter()
+                .map(|(ts, vs)| (ts.as_slice(), vs.as_slice()))
+                .collect();
+            for pick in [Pick::Value, Pick::Timestamp] {
+                let got = select_with(pick, &chunks, p);
+                let want: Vec<(i64, f64)> = expected
+                    .map(|(value, timestamp)| {
+                        (
+                            p.start_ms,
+                            if pick == Pick::Value {
+                                value
+                            } else {
+                                timestamp
+                            },
+                        )
+                    })
+                    .into_iter()
+                    .collect();
+                assert!(
+                    close_enough(&got, &want),
+                    "{pick:?} {p:?}: {got:?} != {want:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_and_multi_step_selectors_preserve_literal_bits_and_staleness() {
+        let nan = f64::from_bits(0x7ff8_0000_0000_1234);
+        let stale = f64::from_bits(STALE_NAN_BITS);
+        let ts = [0, M, 2 * M];
+        let vs = [-0.0, nan, stale];
+        let p = Params {
+            end_ms: 2 * M,
+            ..params()
+        };
+        assert!(close_enough(
+            &select_with(Pick::Value, &[(&ts, &vs)], p),
+            &[(0, -0.0), (M, nan)]
+        ));
+        assert_eq!(
+            select_with(Pick::Timestamp, &[(&ts, &vs)], p),
+            [(0, 0.0), (M, 60.0)]
+        );
+        let pinned = Params {
+            at_ms: Some(M),
+            ..p
+        };
+        assert!(close_enough(
+            &select_with(Pick::Value, &[(&ts, &vs)], pinned),
+            &[(0, nan), (M, nan), (2 * M, nan)]
+        ));
+        assert_eq!(
+            select_with(Pick::Timestamp, &[(&ts, &vs)], pinned),
+            [(0, 60.0), (M, 60.0), (2 * M, 60.0)]
+        );
+        for pick in [Pick::Value, Pick::Timestamp] {
+            let zero = Params {
+                start_ms: 1,
+                end_ms: 0,
+                ..pinned
+            };
+            assert!(select_with(pick, &[(&ts, &vs)], zero).is_empty());
+        }
+    }
+
+    #[test]
     fn at_pins_the_lookup_and_repeats_it_on_every_step() {
         let out = run(
             &[0, M, 2 * M],
@@ -813,194 +605,95 @@ mod tests {
         }
     }
 
-    /// The accumulator's arguments for one series per entry: the samples
-    /// column and the two block columns, every series in `block`.
-    fn column_in(block: Block, rows: &[&[(i64, f64)]]) -> Vec<ArrayRef> {
-        let mut b = SamplesBuilder::default();
-        for row in rows {
-            for &(t, v) in *row {
-                b.push(t, v);
-            }
-            b.finish_row();
-        }
-        let [start, end] = block.columns(rows.len());
-        vec![Arc::new(b.take_all()), start, end]
-    }
-
-    /// [`column_in`] with one block over everything.
-    fn column(rows: &[&[(i64, f64)]]) -> Vec<ArrayRef> {
-        column_in(
-            Block {
-                start_ms: i64::MIN,
-                end_ms: i64::MAX,
-            },
-            rows,
-        )
-    }
-
-    fn accumulator() -> EvalSeries {
-        EvalSeries::new(
-            Kernel::Selector(Pick::Value),
-            Params {
-                end_ms: 2 * M,
-                ..params()
-            },
-        )
-    }
-
-    fn emitted(a: ArrayRef) -> Vec<Vec<(i64, f64)>> {
-        rows(a.as_list::<i32>())
-    }
-
-    /// Each group is folded on the steps its block answers: a label set
-    /// arriving in two blocks is two groups and two output rows, each
-    /// holding only its block's steps, and the second block's reach-back
-    /// repeats the first's samples without answering its steps again.
     #[test]
     fn a_block_answers_only_its_own_steps() {
-        let mut acc = accumulator();
-        let first = column_in(
-            Block {
-                start_ms: 0,
-                end_ms: M,
-            },
-            &[&[(0, 1.0), (30_000, 2.0)]],
-        );
-        let second = column_in(
-            Block {
-                start_ms: M,
-                end_ms: 3 * M,
-            },
-            &[&[(0, 1.0), (30_000, 2.0), (M, 3.0)]],
-        );
-        acc.update_batch(&first, &[0], None, 1).unwrap();
-        acc.update_batch(&second, &[1], None, 2).unwrap();
-        assert_eq!(
-            emitted(acc.evaluate(EmitTo::All).unwrap()),
-            vec![vec![(0, 1.0)], vec![(M, 3.0), (2 * M, 3.0)]]
-        );
-    }
-
-    #[test]
-    fn a_series_whose_chunks_are_not_consecutive_is_an_error() {
-        let mut acc = accumulator();
-        let rows = column(&[&[(0, 1.0)], &[(0, 2.0)], &[(M, 3.0)]]);
-        let err = acc.update_batch(&rows, &[0, 1, 0], None, 2).unwrap_err();
-        assert!(
-            matches!(EngineError::from(err), EngineError::Source(m) if m.contains("not consecutive"))
-        );
-    }
-
-    #[test]
-    fn a_series_carries_across_batches_and_emits_once_closed() {
-        let mut acc = accumulator();
-        acc.update_batch(&column(&[&[(0, 1.0)], &[(0, 5.0)]]), &[0, 1], None, 2)
-            .unwrap();
-        // Group 1 is open; only group 0 is closed.
-        assert_eq!(
-            emitted(acc.evaluate(EmitTo::First(1)).unwrap()),
-            vec![vec![(0, 1.0), (M, 1.0), (2 * M, 1.0)]]
-        );
-        // The open series is now group 0.
-        acc.update_batch(&column(&[&[(M, 6.0)]]), &[0], None, 1)
-            .unwrap();
-        assert_eq!(
-            emitted(acc.evaluate(EmitTo::All).unwrap()),
-            vec![vec![(0, 5.0), (M, 6.0), (2 * M, 6.0)]]
-        );
-    }
-
-    /// A series answers each step at most once, so the grid bounds its row
-    /// before the first sample, and what an emit hands away with the
-    /// finished rows has to be reserved again for the open one.
-    #[test]
-    fn the_open_series_is_reserved_the_steps_it_has_left() {
-        let mut acc = EvalSeries::new(
-            Kernel::Selector(Pick::Value),
-            Params {
-                end_ms: 999 * M,
-                ..params()
-            },
-        );
-        let at = |i: i64| column(&[&[(i * M, i as f64)]]);
-        let reserved = |acc: &EvalSeries| acc.out.size() / 16;
-        acc.update_batch(&at(0), &[0], None, 1).unwrap();
-        assert!(reserved(&acc) >= 1000, "{} reserved", reserved(&acc));
-        for i in 1..500 {
-            acc.update_batch(&at(i), &[0], None, 1).unwrap();
-        }
-        for i in 0..300 {
-            acc.update_batch(&at(i), &[1], None, 2).unwrap();
-        }
-        // Series 0: its 500 samples and four steps of lookback after.
-        assert_eq!(
-            emitted(acc.evaluate(EmitTo::First(1)).unwrap())[0].len(),
-            504
-        );
-        // Series 1 holds 299 answered steps and has 701 to go.
-        assert!(reserved(&acc) >= 1000, "{} reserved", reserved(&acc));
-    }
-
-    /// Sorted mode emits a batch's closed groups as soon as the next one
-    /// opens. With a grid near `MAX_STEPS` and sparse series, a flushed row
-    /// must report only its own samples, not the reservation the freshly
-    /// opened series behind it still needs.
-    #[test]
-    fn per_batch_emit_does_not_carry_the_next_series_reservation() {
         let grid = Params {
-            end_ms: (crate::aggregate::MAX_STEPS as i64 - 1) * M,
+            end_ms: 2 * M,
             ..params()
         };
-        let mut acc = EvalSeries::new(Kernel::Selector(Pick::Value), grid);
-        let at = |i: i64| column(&[&[(i * M, i as f64)]]);
-        for i in 0..20i64 {
-            acc.update_batch(&at(i), &[i as usize], None, i as usize + 1)
-                .unwrap();
-            if i > 0 {
-                let list = acc.evaluate(EmitTo::First(1)).unwrap();
-                let list = list.as_list::<i32>();
-                assert_eq!(list.len(), 1);
-                assert!(
-                    list.get_array_memory_size() < 4096,
-                    "batch {i}: {} bytes for one sparse row, still counting the next \
-                     series' MAX_STEPS-sized reservation",
-                    list.get_array_memory_size()
-                );
-            }
+        let first = run(
+            &[0, 30_000],
+            &[1.0, 2.0],
+            grid.for_block(Block {
+                start_ms: 0,
+                end_ms: M,
+            }),
+        );
+        let second = run(
+            &[0, 30_000, M],
+            &[1.0, 2.0, 3.0],
+            grid.for_block(Block {
+                start_ms: M,
+                end_ms: 3 * M,
+            }),
+        );
+        assert_eq!(first, [(0, 1.0)]);
+        assert_eq!(second, [(M, 3.0), (2 * M, 3.0)]);
+    }
+
+    #[test]
+    fn block_local_zero_one_many_grids_preserve_literal_answers() {
+        for kernel in [
+            Kernel::Selector(Pick::Value),
+            Kernel::Selector(Pick::Timestamp),
+            Kernel::Range(crate::range::Func::CountOverTime),
+        ] {
+            let grid = Params {
+                end_ms: 4 * M,
+                ..params()
+            };
+            let block = |start_ms, end_ms| Block { start_ms, end_ms };
+            let blocks = [
+                (block(-M, 0), vec![(-30_000, 5.0)]),
+                (block(0, M), vec![(-30_000, 11.0)]),
+                (block(M, 3 * M), vec![(30_000, 22.0), (90_000, 23.0)]),
+                (block(3 * M, 4 * M), vec![(150_000, 33.0)]),
+                (block(4 * M, 5 * M), vec![(210_000, 44.0)]),
+            ];
+            let got = blocks
+                .into_iter()
+                .map(|(block, samples)| {
+                    let (ts, vs): (Vec<_>, Vec<_>) = samples.into_iter().unzip();
+                    fold(kernel, &[(&ts, &vs)], grid.for_block(block))
+                })
+                .collect::<Vec<_>>();
+            let want = match kernel {
+                Kernel::Selector(Pick::Value) => vec![
+                    vec![],
+                    vec![(0, 11.0)],
+                    vec![(M, 22.0), (2 * M, 23.0)],
+                    vec![(3 * M, 33.0)],
+                    vec![(4 * M, 44.0)],
+                ],
+                Kernel::Selector(Pick::Timestamp) => vec![
+                    vec![],
+                    vec![(0, -30.0)],
+                    vec![(M, 30.0), (2 * M, 90.0)],
+                    vec![(3 * M, 150.0)],
+                    vec![(4 * M, 210.0)],
+                ],
+                Kernel::Range(_) => vec![
+                    vec![],
+                    vec![(0, 1.0)],
+                    vec![(M, 1.0), (2 * M, 2.0)],
+                    vec![(3 * M, 1.0)],
+                    vec![(4 * M, 1.0)],
+                ],
+            };
+            assert_eq!(got, want, "{kernel:?}");
         }
     }
 
     #[test]
-    fn a_group_with_nothing_to_select_is_an_empty_row() {
-        let mut acc = accumulator();
-        let rows = column(&[&[(0, 1.0)], &[(0, 2.0)], &[], &[(0, 4.0)]]);
-        let skip = BooleanArray::from(vec![true, false, true, true]);
-        acc.update_batch(&rows, &[0, 1, 2, 3], Some(&skip), 5)
-            .unwrap();
-        let out = emitted(acc.evaluate(EmitTo::All).unwrap());
-        assert_eq!(out.len(), 5);
-        assert!(out[1].is_empty() && out[2].is_empty() && out[4].is_empty());
-        assert_eq!(out[3].len(), 3);
-    }
-
-    #[test]
-    fn the_state_is_the_finished_series() {
-        let mut acc = accumulator();
-        acc.update_batch(&column(&[&[(0, 1.0)], &[(0, 2.0)]]), &[0, 1], None, 2)
-            .unwrap();
-        let state = acc.state(EmitTo::All).unwrap();
-        assert_eq!(state.len(), 1);
-
-        let mut last = accumulator();
-        last.merge_batch(&state, &[0, 1], None, 2).unwrap();
-        assert_eq!(emitted(last.evaluate(EmitTo::All).unwrap()).len(), 2);
-
-        // A second state for one series means it crossed partitions.
-        let mut last = accumulator();
-        last.merge_batch(&state, &[0, 1], None, 2).unwrap();
-        let err = last.merge_batch(&state, &[1, 2], None, 3).unwrap_err();
-        assert!(
-            matches!(EngineError::from(err), EngineError::Source(m) if m.contains("partition"))
+    fn a_series_continues_from_one_chunk_to_the_next() {
+        let grid = Params {
+            end_ms: 2 * M,
+            ..params()
+        };
+        assert_eq!(run(&[0], &[1.0], grid), [(0, 1.0), (M, 1.0), (2 * M, 1.0)]);
+        assert_eq!(
+            select(&[(&[0], &[5.0]), (&[M], &[6.0])], grid),
+            [(0, 5.0), (M, 6.0), (2 * M, 6.0)]
         );
     }
 }

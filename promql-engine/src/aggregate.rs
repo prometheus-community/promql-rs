@@ -1,12 +1,14 @@
 //! PromQL aggregation as a DataFusion aggregate function:
 //! `promql_aggregate(samples, 'sum') … GROUP BY <label columns>`.
 //!
-//! Every input series is already on the query's step grid — it came
-//! through `promql_vector_selector` or a range function, both of which
-//! emit at `start + i * step` — so a timestamp *is* an array index, and
-//! the running state can be flat lanes over `group * steps + step`
-//! rather than a state object per group. That shape is what lets a whole
-//! series be folded in as slice work, with an independent accumulator
+//! Every input series is already on the query's step grid — evaluation
+//! emits at `start + i * step` — so a timestamp *is* an array index, and
+//! the running state can be dense lanes over each group's evaluated span,
+//! not the entire query grid. Only output timestamps define those spans:
+//! offsets shift them and a pinned `@` can cover the full grid. A one-step
+//! query instead shares flat lanes across group indices, avoiding per-group
+//! buffers. This ports Prometheus's `groupedAggregation` at 83962c35 using
+//! the same numerical kernels, with an independent accumulator
 //! per step and no loop-carried dependency; the kernels and their
 //! bit-fidelity obligations are in [`crate::math`].
 //!
@@ -14,9 +16,17 @@
 //! value, because a step no series reached is absent from the output, as
 //! in Prometheus, and that is not the same as a step that summed to zero.
 //!
+//! Geometric left headroom keeps descending span growth amortized linear,
+//! without refolding or sorting contributions. Native block-prefix emission
+//! frees completed spans; one-step prefix drains retain flat float capacity
+//! and continue charging it. DataFusion determines how many groups are live:
+//! its stream mode, input batch size and spill path
+//! can change that lifetime, so span-local allocation alone is not an RSS bound.
+//! Timestamp-bearing partial states and list offsets stay unchanged.
+//!
 //! The operator is a literal argument rather than eight registered
-//! functions: one name to register, one plan to serialize, and the
-//! same reasoning as the parameters of `promql_vector_selector`.
+//! functions: one name to register and one plan to serialize, without
+//! distinct function identities for the same lane machinery.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -29,6 +39,8 @@ use datafusion::arrow::buffer::{BooleanBuffer, OffsetBuffer, ScalarBuffer};
 use datafusion::arrow::datatypes::{
     DataType, Field, FieldRef, Fields, Float64Type, TimestampMillisecondType,
 };
+use datafusion::arrow::util::bit_chunk_iterator::BitChunks;
+use datafusion::arrow::util::bit_iterator::BitIndexIterator;
 use datafusion::common::{plan_err, ScalarValue};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
@@ -207,6 +219,20 @@ impl Grid {
         timestamps: &[i64],
         mut run: impl FnMut(usize, usize, usize),
     ) -> Result<()> {
+        self.try_runs(timestamps, |index, from, len| {
+            run(index, from, len);
+            Ok(())
+        })
+    }
+
+    /// Span-local writes can fail even when the global grid position is valid:
+    /// a malformed SQL list may leave its endpoint-derived span before the
+    /// timestamp walk encounters a later descending timestamp.
+    fn try_runs(
+        &self,
+        timestamps: &[i64],
+        mut run: impl FnMut(usize, usize, usize) -> Result<()>,
+    ) -> Result<()> {
         if timestamps.is_empty() {
             return Ok(());
         }
@@ -225,23 +251,19 @@ impl Grid {
                 )));
             }
             self.index(timestamps[k - 1])?;
-            run(index, start, k - start);
+            run(index, start, k - start)?;
             start = k;
             index = self.index(timestamps[k])?;
         }
         self.index(timestamps[timestamps.len() - 1])?;
-        run(index, start, timestamps.len() - start);
-        Ok(())
+        run(index, start, timestamps.len() - start)
     }
 }
 
-/// Every group's running state, as flat `f64` lanes indexed by
-/// `group * grid.len + step`.
+/// Flat `f64` lanes over one evaluated span, or over all one-step groups.
 ///
-/// Only the lanes the operator uses are allocated. Which lanes those are
-/// is the operator's business alone: growing them, dropping an emitted
-/// prefix and measuring them are the same work whatever their number, so
-/// those three read `floats` without matching on the operator.
+/// Only the lanes the operator uses are allocated. Growing, widening and
+/// measuring them read `floats` without matching on the operator.
 #[derive(Debug)]
 struct Lanes {
     op: Op,
@@ -304,8 +326,20 @@ impl Lanes {
         }
     }
 
-    /// Drop the first `cut` positions and shift the rest down to meet the
-    /// group indices DataFusion will send after an [`EmitTo::First`].
+    /// Widen towards earlier steps without refolding any state. Compensation,
+    /// NaN payloads, signed zeros and incremental flags must survive verbatim.
+    fn prepend(&mut self, count: usize, len: usize) {
+        for lane in &mut self.floats {
+            let old_len = lane.len();
+            lane.resize(len, self.fill);
+            lane.copy_within(..old_len, count);
+            lane[..count].fill(self.fill);
+        }
+        if let Some(incremental) = &mut self.incremental {
+            prepend_bits(incremental, count, len);
+        }
+    }
+
     fn drop_front(&mut self, cut: usize) {
         for lane in &mut self.floats {
             lane.drain(..cut);
@@ -456,10 +490,12 @@ impl Lanes {
 
     /// Bytes of lane storage, for DataFusion's memory accounting.
     fn size(&self) -> usize {
-        self.floats
-            .iter()
-            .map(|v| v.capacity() * std::mem::size_of::<f64>())
-            .sum::<usize>()
+        self.floats.capacity() * std::mem::size_of::<Vec<f64>>()
+            + self
+                .floats
+                .iter()
+                .map(|v| v.capacity() * std::mem::size_of::<f64>())
+                .sum::<usize>()
             + self
                 .incremental
                 .as_ref()
@@ -515,69 +551,75 @@ fn drop_bits_front(bits: &mut BooleanBufferBuilder, cut: usize) {
     bits.append_buffer(&all.slice(cut, all.len() - cut));
 }
 
-/// The accumulator for every group of one aggregation.
-///
-/// DataFusion assigns each group a contiguous index and hands it back
-/// with every row, which is what lets one set of lanes and one bitmap
-/// carry every group with nothing boxed per group.
+/// Rebase a bitmap onto a widened span, preserving its old bits.
+fn prepend_bits(bits: &mut BooleanBufferBuilder, count: usize, len: usize) {
+    let old = bits.finish();
+    bits.append_n(count, false);
+    bits.append_buffer(&old);
+    bits.resize(len);
+}
+
+/// Separate spans never bridge unrelated blocks sharing an input batch.
+/// Internal gaps remain dense, with a bitmap distinguishing absence from zero.
 #[derive(Debug)]
-pub struct Grouped {
-    op: Op,
-    grid: Grid,
-    /// What DataFusion last said `total_num_groups` was, and so the
-    /// number of grids the lanes and the bitmap span.
-    groups: usize,
-    /// Whether any series contributed at each position. A step nobody
-    /// reached is absent from the result, which is not the same as a
-    /// step that summed to zero, and it is also the mask the emit
-    /// gathers through.
+struct Span {
+    /// Grid index at `start`, not at the headroom's origin.
+    first: usize,
+    /// Active positions are `start..seen.len()`; the unused prefix buys
+    /// amortized left growth without changing timestamp or accumulation order.
+    start: usize,
     seen: BooleanBufferBuilder,
     lanes: Lanes,
 }
 
-impl Grouped {
-    pub fn new(op: Op, start_ms: i64, end_ms: i64, step_ms: i64) -> Result<Self> {
-        Ok(Self {
-            op,
-            grid: Grid::new(NAME, start_ms, end_ms, step_ms)?,
-            groups: 0,
+impl Span {
+    fn new(op: Op) -> Self {
+        Self {
+            first: 0,
+            start: 0,
             seen: BooleanBufferBuilder::new(0),
             lanes: Lanes::new(op),
-        })
-    }
-
-    /// Room for `groups` grids. DataFusion only ever grows this number,
-    /// as it meets new group keys, so the lanes are extended batch by
-    /// batch rather than sized up front.
-    fn grow(&mut self, groups: usize) -> Result<()> {
-        if groups <= self.groups {
-            return Ok(());
         }
-        let len = groups.checked_mul(self.grid.len).ok_or_else(|| {
-            DataFusionError::Execution(format!(
-                "{NAME}: {groups} groups of {} steps is more state than can be addressed",
-                self.grid.len
-            ))
-        })?;
-        self.lanes.resize(len);
-        self.seen.resize(len);
-        self.groups = groups;
-        Ok(())
     }
 
-    fn base(&self, group: usize) -> usize {
-        group * self.grid.len
+    fn len(&self) -> usize {
+        self.seen.len() - self.start
     }
 
-    /// Fold one whole series into one group, one slice operation per
-    /// maximal run of consecutive grid positions.
-    fn add_series(&mut self, group: usize, timestamps: &[i64], values: &[f64]) -> Result<()> {
-        debug_assert_eq!(timestamps.len(), values.len());
-        let base = self.base(group);
-        let grid = self.grid;
-        grid.runs(timestamps, |index, from, len| {
-            self.add_run(base + index, &values[from..from + len]);
-        })
+    fn include(&mut self, first: usize, last: usize) {
+        if self.len() == 0 {
+            self.first = first;
+        }
+        let end = (last + 1).max(self.first + self.len());
+        let begin = first.min(self.first);
+        let left = self.first - begin;
+        if left > self.start {
+            // Doubling the physical span bounds total movement by O(span),
+            // even for descending singleton inputs. Stop at grid zero: there
+            // can be no further left growth after that final, capped rebase.
+            let origin = self.first - self.start;
+            let prepend = (left - self.start).max(self.seen.len()).min(origin);
+            let len = self.seen.len() + prepend;
+            self.lanes.prepend(prepend, len);
+            prepend_bits(&mut self.seen, prepend, len);
+            self.start += prepend;
+        }
+        self.start -= left;
+        self.first = begin;
+        let needed = self.start + end - begin;
+        if needed > self.seen.len() {
+            self.lanes.resize(needed);
+            self.seen.resize(needed);
+        }
+    }
+
+    fn local_index(&self, index: usize, len: usize) -> Result<usize> {
+        match index.checked_sub(self.first) {
+            Some(at) if at + len <= self.len() => Ok(self.start + at),
+            _ => Err(DataFusionError::Execution(format!(
+                "{NAME}: samples must be in ascending timestamp order"
+            ))),
+        }
     }
 
     fn add_run(&mut self, at: usize, values: &[f64]) {
@@ -585,11 +627,8 @@ impl Grouped {
         self.lanes.add_run(at, values);
     }
 
-    /// Fold `len` incoming partial states into the positions at `at`.
-    ///
-    /// A run generally spans both positions this accumulator has reached
-    /// and positions it has not; merging and copying are different
-    /// arithmetic, so each stretch of one kind is its own lane call.
+    /// Fresh positions copy partial states; reached positions merge them.
+    /// A merge into a fresh Kahan or Welford state is not bit-identical to a copy.
     fn merge_run(&mut self, at: usize, rows: &StateRows, from: usize, len: usize) {
         let mut k = 0;
         while k < len {
@@ -605,42 +644,218 @@ impl Grouped {
         }
     }
 
-    fn emitted(&self, emit_to: EmitTo) -> usize {
-        match emit_to {
-            EmitTo::All => self.groups,
-            EmitTo::First(n) => n.min(self.groups),
+    fn size(&self) -> usize {
+        self.seen.capacity() / 8 + self.lanes.size()
+    }
+}
+
+/// Chosen from the global grid, never from a group's current span.
+#[derive(Debug)]
+enum Storage {
+    SingleStep(Span),
+    Spans { spans: Vec<Span>, heap_size: usize },
+}
+
+struct GroupView<'a> {
+    lanes: &'a Lanes,
+    seen: &'a BooleanBufferBuilder,
+    start: usize,
+    len: usize,
+    first: usize,
+}
+
+impl GroupView<'_> {
+    fn count(&self) -> usize {
+        if self.len == 1 {
+            return usize::from(self.seen.get_bit(self.start));
         }
+        BitChunks::new(self.seen.as_slice(), self.start, self.len)
+            .iter_padded()
+            .map(|word| word.count_ones() as usize)
+            .sum()
+    }
+}
+
+/// Validate Arrow List totals before allocating the emitted sample buffers.
+fn checked_offset(rows: i32, count: usize) -> Result<i32> {
+    i32::try_from(count)
+        .ok()
+        .and_then(|count| rows.checked_add(count))
+        .ok_or_else(|| {
+            DataFusionError::Execution(format!("{NAME}: output exceeds i32 list offsets"))
+        })
+}
+
+/// Prometheus's `groupedAggregation` at 83962c35, driven by native group indices.
+///
+/// Each multi-step group owns its timestamp-derived dense span plus amortized
+/// left headroom, at most another span's width. Single-step queries share flat lanes. Timestamp-bearing partial/spilled states reconstruct
+/// the same spans without planner-specific offset or `@` handling. Nested heap
+/// capacities are cached so DataFusion's frequent size checks stay O(1).
+#[derive(Debug)]
+pub struct Grouped {
+    op: Op,
+    grid: Grid,
+    storage: Storage,
+}
+
+impl Grouped {
+    pub fn new(op: Op, start_ms: i64, end_ms: i64, step_ms: i64) -> Result<Self> {
+        let grid = Grid::new(NAME, start_ms, end_ms, step_ms)?;
+        let storage = if grid.len == 1 {
+            Storage::SingleStep(Span::new(op))
+        } else {
+            Storage::Spans {
+                spans: Vec::new(),
+                heap_size: 0,
+            }
+        };
+        Ok(Self { op, grid, storage })
+    }
+
+    /// Filtered, null and empty rows can discover keys without allocating lanes.
+    fn grow(&mut self, groups: usize) -> Result<()> {
+        if groups > isize::MAX as usize / std::mem::size_of::<Span>() {
+            return Err(DataFusionError::Execution(format!(
+                "{NAME}: {groups} groups is more state than can be addressed"
+            )));
+        }
+        match &mut self.storage {
+            Storage::SingleStep(flat) => {
+                if groups > flat.seen.len() {
+                    flat.lanes.resize(groups);
+                    flat.seen.resize(groups);
+                }
+            }
+            Storage::Spans { spans, heap_size } => {
+                spans.reserve(groups.saturating_sub(spans.len()));
+                while spans.len() < groups {
+                    let span = Span::new(self.op);
+                    *heap_size += span.size();
+                    spans.push(span);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Widen once per series, not per gapped run. Invalid endpoint bounds must
+    /// be rejected before they can allocate a span; runs validates its interior.
+    fn prepare(&mut self, group: usize, timestamps: &[i64]) -> Result<()> {
+        let Storage::Spans { spans, heap_size } = &mut self.storage else {
+            return Ok(());
+        };
+        let Some(&first_ts) = timestamps.first() else {
+            return Ok(());
+        };
+        let last_ts = timestamps[timestamps.len() - 1];
+        let first = self.grid.index(first_ts)?;
+        let last = self.grid.index(last_ts)?;
+        if last < first {
+            return Err(DataFusionError::Execution(format!(
+                "{NAME}: samples must be in ascending timestamp order, got {last_ts}ms after {first_ts}ms"
+            )));
+        }
+        let span = &mut spans[group];
+        let before = span.size();
+        span.include(first, last);
+        *heap_size = *heap_size - before + span.size();
+        Ok(())
+    }
+
+    fn add_series(&mut self, group: usize, timestamps: &[i64], values: &[f64]) -> Result<()> {
+        debug_assert_eq!(timestamps.len(), values.len());
+        self.prepare(group, timestamps)?;
+        match &mut self.storage {
+            Storage::SingleStep(flat) => self.grid.try_runs(timestamps, |_, from, len| {
+                debug_assert_eq!(len, 1);
+                flat.add_run(group, &values[from..from + len]);
+                Ok(())
+            }),
+            Storage::Spans { spans, .. } => {
+                let span = &mut spans[group];
+                self.grid.try_runs(timestamps, |index, from, len| {
+                    let at = span.local_index(index, len)?;
+                    span.add_run(at, &values[from..from + len]);
+                    Ok(())
+                })
+            }
+        }
+    }
+
+    fn emitted(&self, emit_to: EmitTo) -> usize {
+        let groups = match &self.storage {
+            Storage::SingleStep(flat) => flat.seen.len(),
+            Storage::Spans { spans, .. } => spans.len(),
+        };
+        match emit_to {
+            EmitTo::All => groups,
+            EmitTo::First(n) => n.min(groups),
+        }
+    }
+
+    fn view(&self, group: usize) -> GroupView<'_> {
+        match &self.storage {
+            Storage::SingleStep(flat) => GroupView {
+                lanes: &flat.lanes,
+                seen: &flat.seen,
+                start: group,
+                len: 1,
+                first: 0,
+            },
+            Storage::Spans { spans, .. } => {
+                let span = &spans[group];
+                GroupView {
+                    lanes: &span.lanes,
+                    seen: &span.seen,
+                    start: span.start,
+                    len: span.len(),
+                    first: span.first,
+                }
+            }
+        }
+    }
+
+    fn kept(&self, groups: usize) -> Result<usize> {
+        let rows = match &self.storage {
+            Storage::SingleStep(flat) => {
+                let count = BitChunks::new(flat.seen.as_slice(), 0, groups)
+                    .iter_padded()
+                    .map(|word| word.count_ones() as usize)
+                    .sum();
+                checked_offset(0, count)?
+            }
+            Storage::Spans { .. } => (0..groups).try_fold(0, |rows, group| {
+                checked_offset(rows, self.view(group).count())
+            })?,
+        };
+        Ok(rows as usize)
     }
 
     /// The first `groups` groups' series: one list row each, holding only
     /// the steps something reached.
     ///
-    /// Takes `seen` rather than reading `self.seen`, so an emit shares one
-    /// materialization of the bitmap with [`Grouped::release`] instead of
-    /// paying for a second. Each lane is gathered inside the walk rather
-    /// than through a collected index list, which would be a second pass
-    /// over something as long as the output.
-    fn finish(&self, seen: &BooleanBuffer, groups: usize) -> ListArray {
-        // An emit of everything keeps exactly the set bits; an emit of a
-        // prefix keeps fewer, so this is an upper bound either way.
-        let kept = seen.count_set_bits();
+    /// Gather directly through borrowed per-group bitmaps, without group Arrow
+    /// arrays or sample-index vectors. Only the emitted prefix sizes the output.
+    fn finish(&self, groups: usize) -> Result<ListArray> {
+        let kept = self.kept(groups)?;
         let (mut ts, mut vs) = (Vec::with_capacity(kept), Vec::with_capacity(kept));
-        let offsets = match self.op {
+        let offsets = self.walk(groups, |span| match self.op {
             Op::Sum => {
-                let [sum, c] = self.lanes.read();
-                self.walk(seen, groups, |i, t| {
+                let [sum, c] = span.lanes.read();
+                self.walk_span(span, |i, t| {
                     ts.push(t);
                     vs.push(sum[i] + c[i]);
-                })
+                });
             }
             Op::Avg => {
-                let [value, c, count] = self.lanes.read();
-                let incremental = self
+                let [value, c, count] = span.lanes.read();
+                let incremental = span
                     .lanes
                     .incremental
                     .as_ref()
                     .expect("avg has the bit lane");
-                self.walk(seen, groups, |i, t| {
+                self.walk_span(span, |i, t| {
                     ts.push(t);
                     vs.push(
                         Mean {
@@ -651,34 +866,34 @@ impl Grouped {
                         }
                         .result(),
                     );
-                })
+                });
             }
             Op::Count | Op::Min | Op::Max => {
-                let [lane] = self.lanes.read();
-                self.walk(seen, groups, |i, t| {
+                let [lane] = span.lanes.read();
+                self.walk_span(span, |i, t| {
                     ts.push(t);
                     vs.push(lane[i]);
-                })
+                });
             }
-            Op::Group => self.walk(seen, groups, |_, t| {
+            Op::Group => self.walk_span(span, |_, t| {
                 ts.push(t);
                 vs.push(1.0);
             }),
             Op::Stddev => {
-                let [_, m2, count] = self.lanes.read();
-                self.walk(seen, groups, |i, t| {
+                let [_, m2, count] = span.lanes.read();
+                self.walk_span(span, |i, t| {
                     ts.push(t);
                     vs.push((m2[i] / count[i]).sqrt());
-                })
+                });
             }
             Op::Stdvar => {
-                let [_, m2, count] = self.lanes.read();
-                self.walk(seen, groups, |i, t| {
+                let [_, m2, count] = span.lanes.read();
+                self.walk_span(span, |i, t| {
                     ts.push(t);
                     vs.push(m2[i] / count[i]);
-                })
+                });
             }
-        };
+        });
         let entries = StructArray::new(
             series::sample_fields(),
             vec![
@@ -687,77 +902,84 @@ impl Grouped {
             ],
             None,
         );
-        list_per_group(series::sample_item(), offsets, entries)
+        Ok(list_per_group(series::sample_item(), offsets, entries))
     }
 
     /// The same rows as [`Grouped::finish`], but each step's running
     /// state rather than its result: what another partition's accumulator
     /// merges in, the lane-wise restatement of the test oracle's `State::to_row`.
     ///
-    /// The operator is matched twice because the second match cannot run
-    /// before the first: how long a zero lane has to be is only known
-    /// once the walk has counted the rows.
-    fn partial(&self, seen: &BooleanBuffer, groups: usize) -> ListArray {
-        let kept = seen.count_set_bits();
+    /// Unused state columns get non-null zeros after the emitted sample count
+    /// is known; their serialization format is unchanged by span storage.
+    fn partial(&self, groups: usize) -> Result<ListArray> {
+        let kept = self.kept(groups)?;
         let mut ts = Vec::with_capacity(kept);
-        let (mut a, mut b, mut n) = (Vec::new(), Vec::new(), Vec::new());
-        let mut m = BooleanBufferBuilder::new(0);
-        let lane = || Vec::with_capacity(kept);
-        let offsets = match self.op {
+        let lane = |used: bool| {
+            if used {
+                Vec::with_capacity(kept)
+            } else {
+                Vec::new()
+            }
+        };
+        let mut a = lane(!matches!(self.op, Op::Count | Op::Group));
+        let mut b = lane(matches!(
+            self.op,
+            Op::Sum | Op::Avg | Op::Stddev | Op::Stdvar
+        ));
+        let mut n = lane(matches!(
+            self.op,
+            Op::Avg | Op::Count | Op::Stddev | Op::Stdvar
+        ));
+        let mut m = BooleanBufferBuilder::new(if self.op == Op::Avg { kept } else { 0 });
+        let offsets = self.walk(groups, |span| match self.op {
             Op::Sum => {
-                let [sum, c] = self.lanes.read();
-                (a, b) = (lane(), lane());
-                self.walk(seen, groups, |i, t| {
+                let [sum, c] = span.lanes.read();
+                self.walk_span(span, |i, t| {
                     ts.push(t);
                     a.push(sum[i]);
                     b.push(c[i]);
-                })
+                });
             }
             Op::Avg => {
-                let [value, c, count] = self.lanes.read();
-                let incremental = self
+                let [value, c, count] = span.lanes.read();
+                let incremental = span
                     .lanes
                     .incremental
                     .as_ref()
                     .expect("avg has the bit lane");
-                (a, b, n) = (lane(), lane(), lane());
-                m = BooleanBufferBuilder::new(kept);
-                self.walk(seen, groups, |i, t| {
+                self.walk_span(span, |i, t| {
                     ts.push(t);
                     a.push(value[i]);
                     b.push(c[i]);
                     n.push(count[i]);
                     m.append(incremental.get_bit(i));
-                })
+                });
             }
             Op::Count => {
-                let [counts] = self.lanes.read();
-                n = lane();
-                self.walk(seen, groups, |i, t| {
+                let [counts] = span.lanes.read();
+                self.walk_span(span, |i, t| {
                     ts.push(t);
                     n.push(counts[i]);
-                })
+                });
             }
             Op::Min | Op::Max => {
-                let [cur] = self.lanes.read();
-                a = lane();
-                self.walk(seen, groups, |i, t| {
+                let [cur] = span.lanes.read();
+                self.walk_span(span, |i, t| {
                     ts.push(t);
                     a.push(cur[i]);
-                })
+                });
             }
-            Op::Group => self.walk(seen, groups, |_, t| ts.push(t)),
+            Op::Group => self.walk_span(span, |_, t| ts.push(t)),
             Op::Stddev | Op::Stdvar => {
-                let [mean, m2, count] = self.lanes.read();
-                (a, b, n) = (lane(), lane(), lane());
-                self.walk(seen, groups, |i, t| {
+                let [mean, m2, count] = span.lanes.read();
+                self.walk_span(span, |i, t| {
                     ts.push(t);
                     a.push(mean[i]);
                     b.push(m2[i]);
                     n.push(count[i]);
-                })
+                });
             }
-        };
+        });
         let rows = ts.len();
         // The state schema declares all five children non-nullable, so a
         // lane the operator does not use is a buffer of zeros of the full
@@ -798,50 +1020,56 @@ impl Grouped {
             ],
             None,
         );
-        list_per_group(state_item(), offsets, entries)
+        Ok(list_per_group(state_item(), offsets, entries))
     }
 
-    /// Visit every position the emitted groups reached, in output order,
-    /// with its index into the lanes and its timestamp, and return where
-    /// each group's run of rows ends.
-    fn walk(
-        &self,
-        seen: &BooleanBuffer,
-        groups: usize,
-        mut visit: impl FnMut(usize, i64),
-    ) -> Vec<i32> {
+    /// `kept` validated all offsets before output allocation. Borrowed views
+    /// keep both storage paths on one emission path without group arrays.
+    fn walk(&self, groups: usize, mut visit: impl FnMut(&GroupView<'_>)) -> Vec<i32> {
         let mut offsets = Vec::with_capacity(groups + 1);
         offsets.push(0i32);
         let mut rows = 0i32;
         for group in 0..groups {
-            let base = self.base(group);
-            for step in seen.slice(base, self.grid.len).set_indices() {
-                visit(base + step, self.grid.timestamp(step));
-                rows += 1;
-            }
+            let view = self.view(group);
+            visit(&view);
+            rows = checked_offset(rows, view.count()).expect("kept validated all offsets");
             offsets.push(rows);
         }
         offsets
     }
 
-    /// Forget the groups an emission covered, as the trait requires. An
-    /// [`EmitTo::First`] shifts what is left down to meet the group
-    /// indices of the next batch. Takes back the same `seen` buffer
-    /// [`Grouped::finish`]/[`Grouped::partial`] already read, so the
-    /// bitmap is materialized once per emit rather than twice.
-    fn release(&mut self, emit_to: EmitTo, seen: BooleanBuffer) {
-        match emit_to {
-            EmitTo::All => {
-                self.lanes = Lanes::new(self.op);
-                self.seen = BooleanBufferBuilder::new(0);
-                self.groups = 0;
+    fn walk_span(&self, span: &GroupView<'_>, mut visit: impl FnMut(usize, i64)) {
+        if span.len == 1 {
+            if span.seen.get_bit(span.start) {
+                visit(span.start, self.grid.timestamp(span.first));
             }
-            EmitTo::First(n) => {
-                let n = n.min(self.groups);
-                let cut = self.base(n);
-                self.lanes.drop_front(cut);
-                self.seen.append_buffer(&seen.slice(cut, seen.len() - cut));
-                self.groups -= n;
+        } else {
+            for step in BitIndexIterator::new(span.seen.as_slice(), span.start, span.len) {
+                visit(span.start + step, self.grid.timestamp(span.first + step));
+            }
+        }
+    }
+
+    /// Rebase native group indices and retire emitted spans. Flat float lanes
+    /// retain capacity after prefix drains, which remains charged by size().
+    fn release(&mut self, emit_to: EmitTo) {
+        let groups = self.emitted(emit_to);
+        match &mut self.storage {
+            Storage::SingleStep(flat) => {
+                if matches!(emit_to, EmitTo::All) {
+                    *flat = Span::new(self.op);
+                } else if groups > 0 {
+                    flat.lanes.drop_front(groups);
+                    drop_bits_front(&mut flat.seen, groups);
+                }
+            }
+            Storage::Spans { spans, heap_size } => {
+                for span in spans.drain(..groups) {
+                    *heap_size -= span.size();
+                }
+                if matches!(emit_to, EmitTo::All) {
+                    *spans = Vec::new();
+                }
             }
         }
     }
@@ -863,9 +1091,30 @@ impl Grouped {
         Ok((ts, vs))
     }
 
+    #[cfg(test)]
+    fn spans(&self) -> &[Span] {
+        match &self.storage {
+            Storage::Spans { spans, .. } => spans,
+            Storage::SingleStep(_) => panic!("expected multi-step storage"),
+        }
+    }
+
+    #[cfg(test)]
+    fn heap_size(&self) -> usize {
+        match &self.storage {
+            Storage::Spans { heap_size, .. } => *heap_size,
+            Storage::SingleStep(flat) => flat.size(),
+        }
+    }
+
     fn size(&self) -> usize {
-        // `capacity()` is bits, per the builder's own doc example.
-        std::mem::size_of::<Self>() + self.seen.capacity() / 8 + self.lanes.size()
+        std::mem::size_of::<Self>()
+            + match &self.storage {
+                Storage::SingleStep(flat) => flat.size(),
+                Storage::Spans { spans, heap_size } => {
+                    spans.capacity() * std::mem::size_of::<Span>() + heap_size
+                }
+            }
     }
 }
 
@@ -893,19 +1142,15 @@ impl GroupsAccumulator for Grouped {
 
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
         let groups = self.emitted(emit_to);
-        // `finish()` moves the bitmap out rather than copying it, and
-        // `release` rebuilds `self.seen` from what comes back.
-        let seen = self.seen.finish();
-        let out = self.finish(&seen, groups);
-        self.release(emit_to, seen);
+        let out = self.finish(groups)?;
+        self.release(emit_to);
         Ok(Arc::new(out))
     }
 
     fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
         let groups = self.emitted(emit_to);
-        let seen = self.seen.finish();
-        let out = self.partial(&seen, groups);
-        self.release(emit_to, seen);
+        let out = self.partial(groups)?;
+        self.release(emit_to);
         Ok(vec![Arc::new(out)])
     }
 
@@ -913,7 +1158,6 @@ impl GroupsAccumulator for Grouped {
         &mut self,
         values: &[ArrayRef],
         group_indices: &[usize],
-        opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
         self.grow(total_num_groups)?;
@@ -951,20 +1195,101 @@ impl GroupsAccumulator for Grouped {
         };
         let offsets = list.offsets();
         for (row, &group) in group_indices.iter().enumerate() {
-            if skipped(list, opt_filter, row) {
+            if list.is_null(row) {
                 continue;
             }
             let (lo, hi) = (offsets[row] as usize, offsets[row + 1] as usize);
             if lo == hi {
                 continue;
             }
-            let base = self.base(group);
-            let grid = self.grid;
-            grid.runs(&ts[lo..hi], |index, from, len| {
-                self.merge_run(base + index, &rows, lo + from, len);
-            })?;
+            self.prepare(group, &ts[lo..hi])?;
+            match &mut self.storage {
+                Storage::SingleStep(flat) => self.grid.try_runs(&ts[lo..hi], |_, from, len| {
+                    debug_assert_eq!(len, 1);
+                    flat.merge_run(group, &rows, lo + from, len);
+                    Ok(())
+                })?,
+                Storage::Spans { spans, .. } => {
+                    let span = &mut spans[group];
+                    self.grid.try_runs(&ts[lo..hi], |index, from, len| {
+                        let at = span.local_index(index, len)?;
+                        span.merge_run(at, &rows, lo + from, len);
+                        Ok(())
+                    })?;
+                }
+            }
         }
         Ok(())
+    }
+
+    /// DataFusion 55 can bypass unordered, high-cardinality Partial aggregation.
+    /// Each input row must still serialize `aggregation`/`groupedAggregation`'s
+    /// per-step state (Prometheus 83962c35), not its result or the raw value.
+    /// In particular, a singleton Welford state containing infinity has a NaN m2, and
+    /// adding -0 to a fresh Kahan lane need not preserve the input's zero sign.
+    /// Reuse the update kernels rather than hand-seeding those corner cases.
+    fn convert_to_state(
+        &self,
+        values: &[ArrayRef],
+        filter: Option<&BooleanArray>,
+    ) -> Result<Vec<ArrayRef>> {
+        let list = values[0].as_list::<i32>();
+        let (ts, vs) = Self::samples(list)?;
+        let offsets = list.offsets();
+        let mut out_offsets = Vec::with_capacity(list.len() + 1);
+        out_offsets.push(0);
+        let mut kept = 0;
+        for row in 0..list.len() {
+            if !skipped(list, filter, row) {
+                kept = checked_offset(kept, (offsets[row + 1] - offsets[row]) as usize)?;
+            }
+            out_offsets.push(kept);
+        }
+        // Flat positions here are samples, not grid positions: a sparse row
+        // must not allocate its entire timestamp span just to pass it through.
+        let mut timestamps = Vec::with_capacity(kept as usize);
+        let mut lanes = Lanes::new(self.op);
+        lanes.resize(kept as usize);
+        for row in 0..list.len() {
+            if skipped(list, filter, row) {
+                continue;
+            }
+            let (lo, hi) = (offsets[row] as usize, offsets[row + 1] as usize);
+            self.grid.runs(&ts[lo..hi], |_, _, _| {})?;
+            timestamps.extend_from_slice(&ts[lo..hi]);
+            lanes.add_run(out_offsets[row] as usize, &vs[lo..hi]);
+        }
+        let rows = timestamps.len();
+        let mut floats = lanes.floats.into_iter();
+        let mut take =
+            || -> ArrayRef { Arc::new(Float64Array::from(floats.next().expect("operator lane"))) };
+        let zeros = || -> ArrayRef { Arc::new(Float64Array::from(vec![0.0; rows])) };
+        let (a, b, n) = match self.op {
+            Op::Sum => (take(), take(), zeros()),
+            Op::Avg | Op::Stddev | Op::Stdvar => (take(), take(), take()),
+            Op::Count => (zeros(), zeros(), take()),
+            Op::Min | Op::Max => (take(), zeros(), zeros()),
+            Op::Group => (zeros(), zeros(), zeros()),
+        };
+        let flags = lanes
+            .incremental
+            .map_or_else(|| BooleanBuffer::new_unset(rows), |mut bits| bits.finish());
+        let entries = StructArray::new(
+            state_fields(),
+            vec![
+                Arc::new(TimestampMillisecondArray::from(timestamps)),
+                a,
+                b,
+                n,
+                Arc::new(BooleanArray::new(flags, None)),
+            ],
+            None,
+        );
+        Ok(vec![Arc::new(list_per_group(
+            state_item(),
+            out_offsets,
+            entries,
+        ))])
     }
 
     fn size(&self) -> usize {
@@ -980,10 +1305,9 @@ fn skipped(list: &ListArray, filter: Option<&BooleanArray>, row: usize) -> bool 
 
 /// The same lanes driven as a single group.
 ///
-/// A PromQL aggregation without `by` or `without` plans to no grouping
-/// columns at all, which DataFusion runs through [`Accumulator`] rather
-/// than the grouped path. Delegating keeps the two paths from drifting
-/// into two arithmetics.
+/// A SQL call without grouping columns runs through [`Accumulator`] rather
+/// than the grouped path (PromQL plans still group on blocks). Delegating
+/// keeps the two paths from drifting into two arithmetics.
 #[derive(Debug)]
 pub struct OneGroup {
     groups: Grouped,
@@ -1007,12 +1331,9 @@ impl Accumulator for OneGroup {
         self.groups.update_batch(values, &self.zeros, None, 1)
     }
 
-    /// Clones the bitmap instead of moving it out the way [`Grouped`]'s
-    /// own `evaluate`/`state` do: the trait allows a window frame to
-    /// evaluate the same accumulator again.
+    /// Borrowed reads retain state: a window frame may evaluate it again.
     fn evaluate(&mut self) -> Result<ScalarValue> {
-        let seen = self.groups.seen.finish_cloned();
-        Ok(ScalarValue::List(Arc::new(self.groups.finish(&seen, 1))))
+        Ok(ScalarValue::List(Arc::new(self.groups.finish(1)?)))
     }
 
     fn size(&self) -> usize {
@@ -1022,15 +1343,12 @@ impl Accumulator for OneGroup {
     }
 
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
-        let seen = self.groups.seen.finish_cloned();
-        Ok(vec![ScalarValue::List(Arc::new(
-            self.groups.partial(&seen, 1),
-        ))])
+        Ok(vec![ScalarValue::List(Arc::new(self.groups.partial(1)?))])
     }
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
         self.zeros.resize(states[0].len(), 0);
-        self.groups.merge_batch(states, &self.zeros, None, 1)
+        self.groups.merge_batch(states, &self.zeros, 1)
     }
 }
 
@@ -1256,6 +1574,12 @@ mod tests {
     use datafusion::physical_plan::displayable;
     use datafusion::prelude::{SessionConfig, SessionContext};
 
+    mod bypass;
+    mod left_growth;
+    mod preservation;
+    mod selector_prefix;
+    mod stream_lifetime;
+
     // The one-sample-at-a-time reference the lane kernels are pinned
     // against: a slow restatement of each operator, in the value types
     // upstream's per-group `groupedAggregation` (`engine.go`) uses, kept
@@ -1427,8 +1751,15 @@ mod tests {
 
     /// One group's series, as pairs.
     fn samples(acc: &Grouped, group: usize) -> Vec<(i64, f64)> {
-        let seen = acc.seen.finish_cloned();
-        rows(&acc.finish(&seen, acc.groups), group)
+        rows(&acc.finish(acc.emitted(EmitTo::All)).unwrap(), group)
+    }
+
+    /// Read global grid positions without assuming a span starts at zero.
+    fn at(acc: &Grouped, group: usize, index: usize) -> Option<State> {
+        let view = acc.view(group);
+        let index = index.checked_sub(view.first)?;
+        let at = view.start + index;
+        (index < view.len && view.seen.get_bit(at)).then(|| get(view.lanes, at))
     }
 
     /// One list row of an emitted `samples` array.
@@ -1445,7 +1776,7 @@ mod tests {
     /// Fold a partial state into every row's group zero.
     fn merge(acc: &mut Grouped, state: &ArrayRef) -> Result<()> {
         let groups = vec![0usize; state.len()];
-        acc.merge_batch(std::slice::from_ref(state), &groups, None, 1)
+        acc.merge_batch(std::slice::from_ref(state), &groups, 1)
     }
 
     fn run(op: Op, series: &[&[(i64, f64)]]) -> Vec<(i64, f64)> {
@@ -1537,7 +1868,7 @@ mod tests {
                 }
             }
             for (i, want) in scalar.iter().enumerate() {
-                assert_same(op, get(&lanes.lanes, i), *want, i);
+                assert_same(op, at(&lanes, 0, i).unwrap(), *want, i);
             }
         }
     }
@@ -1624,12 +1955,8 @@ mod tests {
             let mut src = accumulate(op, &as_refs(&source), 0, 3, 1);
             let mut dest = accumulate(op, &as_refs(&target), 0, 3, 1);
 
-            let before: Vec<Option<State>> = (0..4)
-                .map(|i| dest.seen.get_bit(i).then(|| get(&dest.lanes, i)))
-                .collect();
-            let sent: Vec<Option<State>> = (0..4)
-                .map(|i| src.seen.get_bit(i).then(|| get(&src.lanes, i)))
-                .collect();
+            let before: Vec<Option<State>> = (0..4).map(|i| at(&dest, 0, i)).collect();
+            let sent: Vec<Option<State>> = (0..4).map(|i| at(&src, 0, i)).collect();
 
             let state = src.state(EmitTo::All).unwrap().remove(0);
             let rows = state_rows(&state);
@@ -1673,9 +2000,13 @@ mod tests {
 
             merge(&mut dest, &state).unwrap();
             for (i, want) in expect.iter().enumerate() {
-                assert_eq!(dest.seen.get_bit(i), want.is_some(), "{op:?} seen at {i}");
+                assert_eq!(
+                    at(&dest, 0, i).is_some(),
+                    want.is_some(),
+                    "{op:?} seen at {i}"
+                );
                 if let Some(want) = want {
-                    assert_same(op, get(&dest.lanes, i), *want, i);
+                    assert_same(op, at(&dest, 0, i).unwrap(), *want, i);
                 }
             }
         }
@@ -1697,9 +2028,8 @@ mod tests {
         );
     }
 
-    /// Group indices are the only thing separating one group's steps
-    /// from another's in the flat lanes, so a run that reaches the last
-    /// step of one grid must not touch the first step of the next.
+    /// A span reaching the query's last step must not touch another group,
+    /// including an empty group with no numerical lanes allocated.
     #[test]
     fn groups_do_not_bleed_into_each_other() {
         let mut acc = Grouped::new(Op::Sum, 0, 2, 1).unwrap();
@@ -1732,7 +2062,7 @@ mod tests {
         assert_eq!(rows(out, 0), vec![(0, 1.0)]);
 
         // What was group 1 is now group 0, and still accumulating.
-        assert_eq!(acc.groups, 2);
+        assert_eq!(acc.emitted(EmitTo::All), 2);
         acc.add_series(0, &[1], &[10.0]).unwrap();
         assert_eq!(samples(&acc, 0), vec![(1, 12.0)]);
         assert_eq!(samples(&acc, 1), vec![(2, 3.0)]);
@@ -1777,12 +2107,12 @@ mod tests {
         }
     }
 
-    /// `avg`'s overflow switch is bit-packed alongside the seen grid,
-    /// so an emission has to shift it down with the float lanes.
+    /// `avg`'s overflow switch must follow its group when indices rebase.
     #[test]
     fn emitting_the_first_groups_shifts_the_packed_flag_too() {
-        let flag = |acc: &Grouped, at: usize| match get(&acc.lanes, at) {
-            State::Avg(m) => m.incremental,
+        let flag = |acc: &Grouped, group: usize, index: usize| match at(acc, group, index) {
+            Some(State::Avg(m)) => m.incremental,
+            None => false,
             _ => unreachable!("one accumulator, one operator"),
         };
         let mut acc = Grouped::new(Op::Avg, 0, 2, 1).unwrap();
@@ -1793,12 +2123,12 @@ mod tests {
         // `avg` to an incremental mean.
         acc.add_series(1, &[2], &[f64::MAX]).unwrap();
         acc.add_series(1, &[2], &[f64::MAX]).unwrap();
-        assert!(flag(&acc, 5));
+        assert!(flag(&acc, 1, 2));
 
         acc.evaluate(EmitTo::First(1)).unwrap();
-        assert_eq!(acc.groups, 1);
-        assert!(flag(&acc, 2), "the flag moved down with its group");
-        assert!(!flag(&acc, 0));
+        assert_eq!(acc.emitted(EmitTo::All), 1);
+        assert!(flag(&acc, 0, 2), "the flag moved down with its group");
+        assert!(!flag(&acc, 0, 0));
     }
 
     /// A run wide enough to cover whole bytes of the seen grid, which is
@@ -1812,7 +2142,7 @@ mod tests {
         acc.add_series(1, &timestamps, &values).unwrap();
         for bit in 0..400 {
             assert_eq!(
-                acc.seen.get_bit(bit),
+                at(&acc, bit / 200, bit % 200).is_some(),
                 (203..397).contains(&bit),
                 "bit {bit}"
             );
@@ -1833,7 +2163,11 @@ mod tests {
         assert_eq!(list.len(), 2, "one row per group, empty or not");
         assert_eq!(list.value(0).len(), 2);
         assert_eq!(list.value(1).len(), 0);
-        assert_eq!(acc.groups, 0, "emitting everything resets the state");
+        assert_eq!(
+            acc.emitted(EmitTo::All),
+            0,
+            "emitting everything resets the state"
+        );
         assert_eq!(
             empty_samples().to_array().unwrap().data_type(),
             &series::samples_type()
@@ -2184,10 +2518,9 @@ mod tests {
         }
     }
 
-    /// No `by` or `without` plans to no grouping columns, which
-    /// DataFusion drives through `Accumulator` rather than the grouped
-    /// path, so the two must agree. One partition per batch, so that the
-    /// path runs partial and merges rather than aggregating in one go.
+    /// SQL without grouping columns drives `Accumulator` rather than the
+    /// grouped path, so the two must agree. One partition per batch exercises
+    /// partial states and merging rather than aggregating in one go.
     #[tokio::test]
     async fn an_aggregation_without_grouping_columns_agrees_with_the_grouped_path() {
         let (schema, batches) = batches();

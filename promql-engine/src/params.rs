@@ -6,18 +6,10 @@
 //! so that a change to the grid arithmetic cannot land in one kernel and
 //! miss the other.
 
-use std::any::Any;
-use std::sync::Arc;
-
-use datafusion::common::{plan_err, ScalarValue};
-use datafusion::error::Result;
-use datafusion::physical_expr::expressions::Literal;
-use datafusion::physical_expr::PhysicalExpr;
-
 use crate::series::Block;
 
 /// Everything a per-series kernel needs besides the samples.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Hash)]
 pub struct Params {
     pub start_ms: i64,
     pub end_ms: i64,
@@ -32,38 +24,6 @@ pub struct Params {
 }
 
 impl Params {
-    /// Read back off a planned call's arguments `first..first + 6`: start,
-    /// end, step, window, offset, `@`. Literals, because an accumulator is
-    /// built once per plan while a column would vary per row; only `@` may
-    /// be NULL.
-    pub(crate) fn from_literals(exprs: &[Arc<dyn PhysicalExpr>], first: usize) -> Result<Params> {
-        let literal = |i: usize| -> Result<Option<i64>> {
-            let value = exprs
-                .get(first + i)
-                .and_then(|e| (e.as_ref() as &dyn Any).downcast_ref::<Literal>())
-                .map(Literal::value);
-            match value {
-                Some(ScalarValue::Int64(v)) => Ok(*v),
-                Some(ScalarValue::Null) => Ok(None),
-                _ => plan_err!("argument {} must be an Int64 literal", first + i),
-            }
-        };
-        let required = |i: usize, what: &str| -> Result<i64> {
-            match literal(i)? {
-                Some(v) => Ok(v),
-                None => plan_err!("argument {} ({what}) must not be NULL", first + i),
-            }
-        };
-        Ok(Params {
-            start_ms: required(0, "start")?,
-            end_ms: required(1, "end")?,
-            step_ms: required(2, "step")?,
-            window_ms: required(3, "window")?,
-            offset_ms: required(4, "offset")?,
-            at_ms: literal(5)?,
-        })
-    }
-
     /// The scan range a store has to be asked for so that every step can
     /// be answered: `getTimeRangesForSelector` in upstream, the first
     /// window end widened back by the whole window. The window is open at

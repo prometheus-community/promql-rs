@@ -197,9 +197,8 @@ fn binary_op_across_blocks_with_different_edges() {
     }
 }
 
-/// Four partitions run the selector as one SinglePartitioned aggregate per
-/// partition and leave the plan in four partitions, a shape one partition
-/// never plans.
+/// Four partitions run the native selector fold independently and leave
+/// evaluation in four partitions, a shape one partition never plans.
 #[test]
 fn chunks_over_four_partitions() {
     let source = MemorySeriesSource::from_descriptions(&descriptions(), 30.0)
@@ -348,8 +347,10 @@ fn pods_per_partition(source: &MemorySeriesSource) -> Vec<BTreeSet<String>> {
         .unwrap();
     let engine = Engine::new();
     let plan = rt
-        .block_on(engine.physical_plan_async(source, "x", &multi_step()))
-        .unwrap();
+        .block_on(engine.prepare_async(source, "x", &multi_step()))
+        .unwrap()
+        .physical_plan()
+        .clone();
     let mut node = &plan;
     while !node.is::<SeriesSetExec>() {
         node = node.children()[0];
@@ -374,11 +375,9 @@ fn pods_per_partition(source: &MemorySeriesSource) -> Vec<BTreeSet<String>> {
         .collect()
 }
 
-/// The rate aggregate runs SinglePartitioned per store partition; a sum by
-/// a label that every partition holds must then meet its partial sums
-/// across partitions, which only the shuffle above the lower aggregate
-/// does. Were Hash(labels) to leak through the label projection, the
-/// upper aggregate would skip it and answer each group once per partition.
+/// The rate fold stays local to each store partition; a sum by a label
+/// that every partition holds must then meet its partial sums through the
+/// shuffle above evaluation. Source co-location is not a DataFusion hash.
 #[test]
 fn a_group_spanning_every_partition_matches_unpartitioned() {
     let lines: Vec<String> = ["a", "b", "c"]

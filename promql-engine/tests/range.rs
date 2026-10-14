@@ -167,7 +167,7 @@ fn what_is_still_unsupported_is_named() {
 }
 
 #[tokio::test]
-async fn the_plan_is_an_aggregate_with_the_function_as_a_literal() {
+async fn the_plan_keeps_the_range_kernel_and_modifiers_in_typed_evaluation() {
     let engine = Engine::new();
     let source = source();
     let plan = engine
@@ -178,14 +178,33 @@ async fn the_plan_is_an_aggregate_with_the_function_as_a_literal() {
         )
         .await
         .unwrap();
-    let rendered = plan.display_indent().to_string();
+    let rendered = promql_engine::explain_plan(&plan);
     assert!(
-        rendered.starts_with(
-            "Projection: promql_labels(Utf8(\"pod\"), get_field(selector_0.labels, Utf8(\"pod\"))) AS labels, samples, selector_0.block_start, selector_0.block_end\n  Aggregate: groupBy=[[selector_0.block_start, selector_0.block_end, selector_0.labels]], aggr=[[promql_range_function(selector_0.samples, selector_0.block_start, selector_0.block_end, Utf8(\"rate\"), Int64(0), Int64(600000), Int64(30000), Int64(300000), Int64(60000), Int64(NULL)) AS samples]]"
+        rendered.contains(
+            "SeriesEval: rate(samples[5m] offset 1m, 0..600000 step 30s) per series per block"
         ),
         "{rendered}"
     );
-    assert!(rendered.contains("TableScan: selector_0"), "{rendered}");
+    assert!(!rendered.contains("promql_range_function"), "{rendered}");
+    // Metric-name removal remains above full-identity evaluation.
+    assert_eq!(
+        promql_engine::series::label_names(plan.schema().as_arrow()),
+        ["pod"]
+    );
+    let mut stack = vec![&plan];
+    let mut evaluations = 0;
+    while let Some(node) = stack.pop() {
+        if let datafusion::logical_expr::LogicalPlan::Extension(extension) = node {
+            assert_eq!(extension.node.name(), "SeriesEval");
+            evaluations += 1;
+            assert_eq!(
+                promql_engine::series::label_names(extension.node.inputs()[0].schema().as_arrow()),
+                ["__name__", "pod"]
+            );
+        }
+        stack.extend(node.inputs());
+    }
+    assert_eq!(evaluations, 1);
 }
 
 /// Two metrics with one label set but the name, plus a third pod so the

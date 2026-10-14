@@ -18,5 +18,5 @@ tests:
       rate(http_requests_total[5m] @ 900)
     plan: |
       Projection: labels{job, pod}
-        Aggregate: rate(samples[5m] @ 900000, 600000..1200000 step 30s) per series per block
+        SeriesEval: rate(samples[5m] @ 900000, 600000..1200000 step 30s) per series per block
           TableScan: http_requests_total

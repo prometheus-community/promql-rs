@@ -247,7 +247,9 @@ impl Welford {
         self.m2 += delta * (f - self.mean);
     }
 
-    /// Chan et al.'s parallel combination.
+    /// Chan et al.'s parallel combination, with valid incoming singletons
+    /// replayed as Prometheus 83962c35's `aggregation` update and overflowed
+    /// delta squares weighted before the second multiplication when shrinking.
     #[inline]
     pub fn merge(&mut self, other: &Welford) {
         if other.count == 0.0 {
@@ -257,10 +259,31 @@ impl Welford {
             *self = *other;
             return;
         }
+        if other.count == 1.0 && other.m2 == 0.0 && other.mean.is_finite() {
+            // `aggregation` multiplies delta by the residual after updating the
+            // mean, not by delta before weighting: [0, 1.5e154] has finite m2
+            // even though delta squared overflows. Replay only a valid singleton
+            // so an incoming NaN/Inf or nonzero m2 is never discarded. A genuine
+            // multi-sample partial cannot replay its constituent values.
+            self.add(other.mean);
+            return;
+        }
         let total = self.count + other.count;
         let delta = other.mean - self.mean;
         self.mean += delta * (other.count / total);
-        self.m2 += other.m2 + delta * delta * (self.count * other.count / total);
+        let weight = self.count * other.count / total;
+        let delta_squared = delta * delta;
+        let correction =
+            if delta.is_finite() && delta_squared.is_infinite() && weight > 0.0 && weight < 1.0 {
+                // Prometheus 83962c35's `aggregation` forms delta * residual, so
+                // [0, 1.5e154, 1.5e154] has finite m2. Reassociate only an overflowed
+                // square with a shrinking weight: ordinary Chan rounding stays put,
+                // and NaN/Inf partial m2 still poisons the addition below.
+                delta * (delta * weight)
+            } else {
+                delta_squared * weight
+            };
+        self.m2 += other.m2 + correction;
         self.count = total;
     }
 
@@ -707,6 +730,206 @@ mod tests {
         assert_eq!(max_nan_loses(f64::NAN, 3.0), 3.0);
         assert_eq!(max_nan_loses(3.0, f64::NAN), 3.0);
         assert_eq!(max_nan_loses(3.0, 5.0), 5.0);
+    }
+
+    #[test]
+    fn welford_singleton_merge_matches_aggregation_without_intermediate_overflow() {
+        let cases: &[(&[f64], f64)] = &[
+            (&[0.0, 1.5e154], 5.625e307),
+            (&[1.5e154, 0.0], 5.625e307),
+            (&[0.0, -1.5e154], 5.625e307),
+            (&[-1.5e154, 0.0], 5.625e307),
+            (&[0.0, 0.0, 1.5e154], 5e307),
+        ];
+        for &(values, oracle) in cases {
+            let (last, prefix) = values.split_last().unwrap();
+            let mut prefix_state = Welford::default();
+            for &value in prefix {
+                prefix_state.add(value);
+            }
+            let mut singleton = Welford::default();
+            singleton.add(*last);
+            let mut sequential = prefix_state;
+            sequential.add(*last);
+            let mut merged = prefix_state;
+            merged.merge(&singleton);
+            assert_eq!(merged, sequential, "{values:?}");
+            assert!(merged.variance().is_finite(), "{values:?}");
+            assert!((merged.variance() - oracle).abs() <= oracle * 1e-14);
+            assert!(merged.variance().sqrt().is_finite());
+            if values.len() == 2 {
+                assert!((merged.variance().sqrt() - 7.5e153).abs() <= 7.5e153 * 1e-14);
+            }
+
+            let mut means = [prefix_state.mean];
+            let mut m2s = [prefix_state.m2];
+            let mut counts = [prefix_state.count];
+            welford_merge_each(
+                &mut means,
+                &mut m2s,
+                &mut counts,
+                &[singleton.mean],
+                &[singleton.m2],
+                &[singleton.count],
+            );
+            assert_eq!(means[0].to_bits(), sequential.mean.to_bits());
+            assert_eq!(m2s[0].to_bits(), sequential.m2.to_bits());
+            assert_eq!(counts[0].to_bits(), sequential.count.to_bits());
+        }
+    }
+
+    #[test]
+    fn welford_merge_shrinks_an_overflowed_delta_square_in_both_orders() {
+        for (single, repeated) in [
+            (0.0, 1.5e154),
+            (0.0, -1.5e154),
+            (1.5e154, 0.0),
+            (-1.5e154, 0.0),
+        ] {
+            let mut singleton = Welford::default();
+            singleton.add(single);
+            let mut partial = Welford::default();
+            partial.add(repeated);
+            partial.add(repeated);
+            assert_eq!(singleton.m2, 0.0);
+            assert_eq!(partial.m2, 0.0);
+            for (resident, incoming, values) in [
+                (singleton, partial, [single, repeated, repeated]),
+                (partial, singleton, [repeated, repeated, single]),
+            ] {
+                let mut sequential = Welford::default();
+                for value in values {
+                    sequential.add(value);
+                }
+                let mut merged = resident;
+                merged.merge(&incoming);
+                assert_eq!(merged.count, 3.0);
+                for value in [merged.m2, sequential.m2] {
+                    assert!(value.is_finite());
+                    assert!((value - 1.5e308).abs() <= 1.5e308 * 1e-14);
+                }
+                for variance in [merged.variance(), sequential.variance()] {
+                    assert!(variance.is_finite());
+                    assert!((variance - 5e307).abs() <= 5e307 * 1e-14);
+                    let stddev = variance.sqrt();
+                    assert!(stddev.is_finite());
+                    assert!(
+                        (stddev - 7.071067811865475e153).abs() <= 7.071067811865475e153 * 1e-14
+                    );
+                }
+
+                let mut means = [resident.mean];
+                let mut m2s = [resident.m2];
+                let mut counts = [resident.count];
+                welford_merge_each(
+                    &mut means,
+                    &mut m2s,
+                    &mut counts,
+                    &[incoming.mean],
+                    &[incoming.m2],
+                    &[incoming.count],
+                );
+                assert_eq!(means[0].to_bits(), merged.mean.to_bits());
+                assert_eq!(m2s[0].to_bits(), merged.m2.to_bits());
+                assert_eq!(counts[0].to_bits(), merged.count.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn welford_merge_keeps_ordinary_chan_rounding() {
+        let mut resident = Welford::default();
+        resident.add(0.0);
+        let mut incoming = Welford::default();
+        incoming.add(0.1);
+        incoming.add(0.1);
+        let delta = incoming.mean - resident.mean;
+        let total = resident.count + incoming.count;
+        let weight = resident.count * incoming.count / total;
+        let expected = resident.m2 + (incoming.m2 + delta * delta * weight);
+        // This finite square distinguishes the old order from a global rewrite.
+        assert_ne!(expected.to_bits(), (delta * (delta * weight)).to_bits());
+        resident.merge(&incoming);
+        assert_eq!(resident.m2.to_bits(), expected.to_bits());
+    }
+
+    #[test]
+    fn welford_merge_weighting_preserves_genuine_nonfinite_results() {
+        for values in [
+            [f64::NAN, 1.5e154],
+            [f64::INFINITY, 1.5e154],
+            [f64::NEG_INFINITY, 1.5e154],
+            [1.5e154, f64::NAN],
+            [1.5e154, f64::INFINITY],
+            [1.5e154, f64::NEG_INFINITY],
+            [0.0, 3e154],   // Finite mean, genuinely overflowed partial m2.
+            [2e154, 2e154], // Even the weighted correction really overflows.
+        ] {
+            let mut singleton = Welford::default();
+            singleton.add(0.0);
+            let mut partial = Welford::default();
+            for value in values {
+                partial.add(value);
+            }
+            for (mut resident, incoming) in [(singleton, partial), (partial, singleton)] {
+                resident.merge(&incoming);
+                for result in [resident.variance(), resident.variance().sqrt()] {
+                    if values.iter().all(|v| v.is_finite()) {
+                        assert_eq!(result, f64::INFINITY, "{values:?}");
+                    } else {
+                        assert!(result.is_nan(), "{values:?}");
+                    }
+                }
+            }
+        }
+        // With a weight of one or greater, squaring delta is a real overflow.
+        for count in [2, 3] {
+            let mut low = Welford::default();
+            let mut high = Welford::default();
+            for _ in 0..count {
+                low.add(0.0);
+                high.add(1.5e154);
+            }
+            for (mut resident, incoming) in [(low, high), (high, low)] {
+                resident.merge(&incoming);
+                assert_eq!(resident.variance(), f64::INFINITY);
+                assert_eq!(resident.variance().sqrt(), f64::INFINITY);
+            }
+        }
+    }
+
+    #[test]
+    fn welford_singleton_merge_preserves_nonzero_and_nonfinite_state() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut singleton = Welford::default();
+            singleton.add(value);
+            let mut merged = Welford::default();
+            merged.add(0.0);
+            merged.merge(&singleton);
+            assert!(merged.variance().is_nan(), "{value}");
+
+            let mut empty = Welford::default();
+            empty.merge(&singleton);
+            assert_eq!(empty.mean.to_bits(), singleton.mean.to_bits());
+            assert_eq!(empty.m2.to_bits(), singleton.m2.to_bits());
+            assert_eq!(empty.count, singleton.count);
+        }
+        // A count of one alone does not authorize discarding serialized m2.
+        for m2 in [1.0, -1.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let mut merged = Welford::default();
+            merged.add(0.0);
+            merged.merge(&Welford {
+                mean: 0.0,
+                m2,
+                count: 1.0,
+            });
+            if m2.is_nan() {
+                assert!(merged.m2.is_nan());
+            } else {
+                assert_eq!(merged.m2, m2);
+            }
+            assert_eq!(merged.count, 2.0);
+        }
     }
 
     #[test]

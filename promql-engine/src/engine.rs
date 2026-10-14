@@ -12,32 +12,18 @@
 //! DataFusion engine, and Arrow in, Arrow out lets a caller stay on
 //! `RecordBatch` end to end instead of paying to materialize Rust values
 //! it may only re-encode. Applied before the batches come back are
-//! [`series::drop_empty`] — see its doc for why that can't live in the
-//! plan — and `labelset::reject_same_labelset` and
-//! `labelset::sort_by_labelset`, Prometheus's own post-evaluation passes.
-//!
-//! Between planning and execution the physical plan goes through
-//! [`check_selector_plans`]. The selector and range aggregates bound memory
-//! only in DataFusion's Sorted mode, and DataFusion drops to Linear mode
-//! without an error; the check turns that into a refused query.
+//! `labelset::finalize`: empty rows are dropped, duplicate labels checked
+//! through borrowed samples and ordinary results organized by label set.
+//! Explicit root instant sorts retain their result order.
 
 use std::sync::Arc;
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::error::DataFusionError;
+use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::LogicalPlan;
-use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
-use datafusion::physical_plan::coop::CooperativeExec;
-use datafusion::physical_plan::joins::{
-    HashJoinExec, PartitionMode, SortMergeJoinExec, StreamJoinPartitionMode, SymmetricHashJoinExec,
-};
-use datafusion::physical_plan::projection::ProjectionExec;
-use datafusion::physical_plan::repartition::RepartitionExec;
-use datafusion::physical_plan::sorts::sort::SortExec;
-use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
-use datafusion::physical_plan::union::InterleaveExec;
-use datafusion::physical_plan::{self, ExecutionPlan, InputOrderMode, Partitioning};
+use datafusion::physical_plan::execution_plan::reset_plan_states;
+use datafusion::physical_plan::{self, ExecutionPlan};
 use datafusion::prelude::{SessionConfig, SessionContext};
 
 use promql_parser::{Parser, ParserOptions};
@@ -45,12 +31,10 @@ use promql_parser::{Parser, ParserOptions};
 use crate::error::EngineError;
 use crate::labelset;
 pub use crate::plan::RangeQuery;
-use crate::series::{self, LABELS};
-use crate::source::{SeriesSetExec, SeriesSource};
+use crate::series;
+use crate::source::SeriesSource;
 use crate::value_type::{value_type, ValueType};
-use crate::{
-    absent, aggregate, binary, elementwise, labels, matrix, range, selector, sort, to_scalar,
-};
+use crate::{absent, aggregate, binary, elementwise, labels, matrix, sort, to_scalar};
 
 /// The knobs of Prometheus's `promql.EngineOpts` that this engine honours,
 /// one field each, under a name that follows upstream's.
@@ -90,6 +74,37 @@ pub struct Engine {
     options: EngineOptions,
 }
 
+/// A planned PromQL query, including the semantics needed to finalize its result.
+///
+/// Preparation selects from the source once per selector. Each
+/// [`Engine::execute_async`] resets a separate execution tree, including protected
+/// source-owned plans, so this value can be executed repeatedly or concurrently.
+/// Source operators must implement DataFusion's execution-state reset contract.
+#[derive(Debug)]
+pub struct PreparedQuery {
+    physical_plan: Arc<dyn ExecutionPlan>,
+    result_order: ResultOrder,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResultOrder {
+    LabelSet,
+    Preserve,
+}
+
+impl PreparedQuery {
+    /// The optimized physical template, for diagnostics or raw streaming.
+    ///
+    /// Raw execution bypasses PromQL result finalization. Callers using DataFusion
+    /// directly must reset execution state with `reset_plan_states` before each
+    /// execution, including the first; cloning the Arc does not reset exchanges.
+    /// [`Engine::execute_async`] does this automatically. Its execution metrics
+    /// belong to the reset tree, not to this template.
+    pub fn physical_plan(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.physical_plan
+    }
+}
+
 /// A failure out of DataFusion as the caller should read it.
 ///
 /// A UDAF has no way to fail but a `DataFusionError`, so the matching
@@ -97,9 +112,7 @@ pub struct Engine {
 /// this crate. They are neither: Prometheus refuses the same query with
 /// the same words, so they are an answer. Named one by one rather than
 /// lifting every execution error, which would turn the next real bug
-/// into a query result. The `instant-label-functions` branch hangs its
-/// own same-labelset error on this hook, so the merge adds a text
-/// rather than a mechanism.
+/// into a query result.
 fn lift(error: DataFusionError) -> EngineError {
     match error.find_root() {
         DataFusionError::Execution(message) if binary::is_matching_error(message) => {
@@ -118,26 +131,24 @@ impl Engine {
 
     /// [`Self::new`] under `options`.
     pub fn with_options(options: EngineOptions) -> Self {
-        // A scan split by byte range cuts through a series. Round-robin is
-        // off out of caution: with the selector SinglePartitioned over
-        // Hash(labels) DataFusion only places it above the selector, over
-        // finished series, but nothing but that requirement keeps it there.
-        // Hash repartitioning for aggregations is what lets the selector run
-        // SinglePartitioned per store partition. The plan then ends in
-        // several partitions, and `range_query_async` restores the order.
+        // Raw chunks stay in the store's partitions; evaluation requests no
+        // shuffle. Upper aggregations may hash their completed series rows.
+        // Byte-range scan splitting could cut through a source identity.
         let mut config = SessionConfig::new()
             .with_round_robin_repartition(false)
             .with_repartition_file_scans(false)
             .with_repartition_aggregations(true);
-        // Below this many input partitions EnforceDistribution re-hashes a
-        // satisfied Hash(labels) input anyway, to reach target_partitions,
-        // which splits the selector into Partial and FinalPartitioned.
+        // Do not rehash an already satisfied upper-aggregation distribution
+        // merely to reach the session's target partition count.
         config.options_mut().optimizer.subset_repartition_threshold = 1;
-        let ctx = SessionContext::new_with_config(config);
-        ctx.register_udaf(selector::udaf());
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(config)
+            .with_query_planner(Arc::new(crate::series_eval::SeriesEvalQueryPlanner))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
         ctx.register_udf(labels::udf());
         ctx.register_udaf(aggregate::udaf());
-        ctx.register_udaf(range::udaf());
         ctx.register_udaf(absent::udaf());
         ctx.register_udaf(to_scalar::udaf());
         ctx.register_udf(elementwise::udf());
@@ -182,8 +193,6 @@ impl Engine {
         query: &str,
         range: &RangeQuery,
     ) -> Result<LogicalPlan, EngineError> {
-        // The one place a query string is parsed: `range_query`,
-        // `range_query_async` and `physical_plan_async` all plan through here.
         let expr = self.parse(query)?;
         crate::plan::plan(&self.ctx.state(), source, &expr, range).await
     }
@@ -206,20 +215,38 @@ impl Engine {
             .map_err(EngineError::Parse)
     }
 
-    /// The optimized `ExecutionPlan` a range query runs, for inspection or
-    /// for a caller that streams it instead of paying for
-    /// [`Self::range_query_async`]'s buffering, as the memory bench does.
+    /// Prepare a range query without executing it or losing its result-order policy.
+    ///
+    /// Selects once per selector; executing the prepared query does not select or
+    /// plan again. Matrix label ordering follows Prometheus's `Engine.execEvalStmt`
+    /// (83962c35); a one-step grid retains the direct logical-root sort policy.
     /// Must run on a Tokio runtime, see [`Self::plan_async`].
-    /// It has passed [`check_selector_plans`], so it is exactly what
-    /// [`Self::range_query_async`] executes.
-    pub async fn physical_plan_async(
+    pub async fn prepare_async(
         &self,
         source: &dyn SeriesSource,
         query: &str,
         range: &RangeQuery,
-    ) -> Result<Arc<dyn ExecutionPlan>, EngineError> {
+    ) -> Result<PreparedQuery, EngineError> {
         let plan = self.plan_async(source, query, range).await?;
-        self.lower(plan).await
+        self.prepare_plan(plan).await
+    }
+
+    // Both public query paths capture ordering before optimization and execute
+    // through the same reset/finalization boundary, including raw instant matrices.
+    async fn prepare_plan(&self, plan: LogicalPlan) -> Result<PreparedQuery, EngineError> {
+        // Prometheus Engine.execEvalStmt (83962c35) label-orders matrices,
+        // while explicit instant sorts can order vectors. Preserve the existing
+        // direct logical-root policy before optimization: a sort below a
+        // projection or aggregate is internal work, not a result-order promise.
+        let result_order = if matches!(&plan, LogicalPlan::Sort(_)) {
+            ResultOrder::Preserve
+        } else {
+            ResultOrder::LabelSet
+        };
+        Ok(PreparedQuery {
+            physical_plan: self.lower(plan).await?,
+            result_order,
+        })
     }
 
     async fn lower(&self, plan: LogicalPlan) -> Result<Arc<dyn ExecutionPlan>, EngineError> {
@@ -229,14 +256,13 @@ impl Engine {
             .await?
             .create_physical_plan()
             .await?;
-        check_selector_plans(&exec)?;
         Ok(exec)
     }
 
     /// Evaluate a range query. Batches are in the canonical schema
     /// ([`crate::series`]) with empty series already dropped, series in
-    /// Prometheus's label-set order unless an ordering function set it; call
-    /// [`series::decode`] to get [`Series`](crate::Series) instead.
+    /// Prometheus's label-set order unless a root instant ordering function set it; call
+    /// [`crate::series::decode`] to get [`Series`](crate::Series) instead.
     ///
     /// Must run on a Tokio runtime, see [`Self::plan_async`]. A single-partition
     /// store hides the requirement; a multi-partition one panics without it.
@@ -246,8 +272,8 @@ impl Engine {
         query: &str,
         range: &RangeQuery,
     ) -> Result<Vec<RecordBatch>, EngineError> {
-        let plan = self.plan_async(source, query, range).await?;
-        self.run(plan).await
+        let prepared = self.prepare_async(source, query, range).await?;
+        self.execute_async(&prepared).await
     }
 
     /// Evaluate a query at one instant and answer with the type the
@@ -272,7 +298,8 @@ impl Engine {
             return Ok(InstantResult::String(s.to_owned()));
         }
         let plan = crate::plan::plan_instant(&self.ctx.state(), source, &expr, at_ms).await?;
-        let batches = self.run(plan).await?;
+        let prepared = self.prepare_plan(plan).await?;
+        let batches = self.execute_async(&prepared).await?;
         match value_type(&expr) {
             ValueType::Vector => Ok(InstantResult::Vector(batches)),
             ValueType::Matrix => Ok(InstantResult::Matrix(batches)),
@@ -310,37 +337,27 @@ impl Engine {
             .block_on(self.instant_query_async(source, query, at_ms))
     }
 
-    /// Execute a planned query and apply the passes Prometheus runs on
-    /// every result.
-    async fn run(&self, plan: LogicalPlan) -> Result<Vec<RecordBatch>, EngineError> {
-        // Only sort, sort_desc and sort_by_label plan a Sort, and only at
-        // the root of an instant query: their order is the result, and
-        // Prometheus orders by label set only a matrix.
-        let ordered = matches!(plan, LogicalPlan::Sort(_));
-        let exec = self.lower(plan).await?;
+    /// Execute a prepared query with [`Self::range_query_async`]'s finalization.
+    ///
+    /// Each call resets a separate execution tree before collecting, even on the
+    /// first execution. Repeated or concurrent calls and a call after cancellation
+    /// do not reuse consumed exchange channels, including source-owned exchanges.
+    /// Source operators must honor DataFusion's `reset_state` contract.
+    ///
+    /// Explicit instant-query root sorts retain their order; other results are
+    /// sorted by Prometheus label-set order. Must run on a Tokio runtime.
+    pub async fn execute_async(
+        &self,
+        prepared: &PreparedQuery,
+    ) -> Result<Vec<RecordBatch>, EngineError> {
+        // Never execute the template: resetting only after collection would
+        // miss cancellation and let concurrent executions share exchange state.
+        // SeriesSetExec::reset_state also resets its protected source subtree.
+        let exec = reset_plan_states(Arc::clone(prepared.physical_plan())).map_err(lift)?;
         let batches = physical_plan::collect(exec, self.ctx.task_ctx())
             .await
             .map_err(lift)?;
-        // One `collect()` shares a single output schema across all its
-        // batches, so validating it once and comparing later batches by
-        // pointer skips the redundant re-walk of the label fields.
-        let mut validated = None;
-        let batches: Vec<RecordBatch> = batches
-            .iter()
-            .map(|b| {
-                let schema = b.schema();
-                if !validated.as_ref().is_some_and(|s| Arc::ptr_eq(s, &schema)) {
-                    series::validate(&schema)?;
-                }
-                validated = Some(schema);
-                Ok(series::drop_empty(b))
-            })
-            .collect::<Result<_, EngineError>>()?;
-        labelset::reject_same_labelset(&batches)?;
-        if ordered {
-            return Ok(batches);
-        }
-        labelset::sort_by_labelset(&batches)
+        labelset::finalize(&batches, prepared.result_order == ResultOrder::Preserve)
     }
 
     /// [`Self::range_query_async`], blocking on the engine's own runtime.
@@ -382,175 +399,6 @@ impl Engine {
     }
 }
 
-/// Refuse a plan in which a selector or range-function aggregate would not
-/// hold exactly one open series per partition.
-///
-/// The session flags in [`Engine::new`] produce such plans today, but
-/// nothing makes DataFusion keep doing so: an upgrade or a new optimizer
-/// rule that loses `InputOrderMode::Sorted` does not fail, it buffers every
-/// series of the scan and answers out of order. `EvalSeries`' contiguity
-/// checks catch the rows that then arrive interleaved, but only for data
-/// that happens to interleave, so the shape is checked here on every plan.
-///
-/// Accepted: a Partial, Single or SinglePartitioned aggregate, Sorted,
-/// whose input reaches [`SeriesSetExec`] through nothing but projections
-/// and cooperative yields; and a Final aggregate, Sorted, over such a Partial through an
-/// order-preserving merge or hash repartition. Anything that deals rows
-/// out anew below the Partial — round-robin, a hash split of chunks —
-/// can put one series in two partitions, each of which folds half of it.
-///
-/// A sort on a `labels` column is refused wherever it sits: Arrow cannot
-/// sort a struct, so the plan would otherwise fail inside the sort.
-///
-/// So is a partitioned join, or an `InterleaveExec`, with an input whose
-/// partitioning is still the one [`SeriesSetExec`] declares. That
-/// declaration names the right key but not DataFusion's hash, so partition
-/// i of the store is not partition i of anything DataFusion hashed, nor of
-/// another store's. Aggregates only need a key in one partition and are
-/// fine; a join matches partitions by index and would silently miss series,
-/// and DataFusion turns a `UnionExec` into an `InterleaveExec` whenever
-/// every child declares the same partitioning
-/// (`enforce_distribution.rs:1458-1485`, `union.rs:664-676`), which is true
-/// of two selectors over the same store: it would then zip partition i of
-/// one scan with partition i of the other and hand a downstream Sorted
-/// consumer the same label set twice.
-pub fn check_selector_plans(plan: &Arc<dyn ExecutionPlan>) -> Result<(), EngineError> {
-    let refuse = |why: &str| {
-        EngineError::Query(format!(
-            "refusing a plan in which {why}:\n{}",
-            crate::explain::render_physical(plan.as_ref())
-        ))
-    };
-    let mut stack = vec![plan];
-    while let Some(node) = stack.pop() {
-        stack.extend(node.children());
-        if joins_by_partition(node) && node.children().into_iter().any(trusts_store_partitioning) {
-            return Err(refuse(
-                "a partitioned join relies on the store's partitioning",
-            ));
-        }
-        if node.is::<InterleaveExec>() && node.children().into_iter().any(trusts_store_partitioning)
-        {
-            return Err(refuse("an interleave relies on the store's partitioning"));
-        }
-        if let Some(sort) = node.downcast_ref::<SortExec>() {
-            if sort.expr().iter().any(|e| is_labels(e.expr.as_ref())) {
-                return Err(refuse("a sort orders by labels"));
-            }
-            continue;
-        }
-        let Some(agg) = selector_aggregate(node) else {
-            continue;
-        };
-        if agg.input_order_mode() != &InputOrderMode::Sorted {
-            return Err(refuse("a selector aggregate does not run Sorted"));
-        }
-        let fed = match agg.mode() {
-            AggregateMode::Partial | AggregateMode::Single | AggregateMode::SinglePartitioned => {
-                reaches(agg.input(), &|n| n.is::<SeriesSetExec>(), &|n| {
-                    n.is::<ProjectionExec>() || n.is::<CooperativeExec>()
-                })
-            }
-            AggregateMode::Final | AggregateMode::FinalPartitioned => reaches(
-                agg.input(),
-                &|n| selector_aggregate(n).is_some_and(|a| *a.mode() == AggregateMode::Partial),
-                &|n| {
-                    n.is::<ProjectionExec>()
-                        || n.is::<CooperativeExec>()
-                        || n.is::<SortPreservingMergeExec>()
-                        || n.downcast_ref::<RepartitionExec>().is_some_and(|r| {
-                            r.preserve_order() && matches!(r.partitioning(), Partitioning::Hash(..))
-                        })
-                },
-            ),
-            AggregateMode::PartialReduce => false,
-        };
-        if !fed {
-            return Err(refuse(
-                "a selector aggregate's input does not come straight from the store",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn selector_aggregate(node: &Arc<dyn ExecutionPlan>) -> Option<&AggregateExec> {
-    node.downcast_ref::<AggregateExec>().filter(|agg| {
-        agg.aggr_expr()
-            .iter()
-            .any(|e| [selector::NAME, range::NAME].contains(&e.fun().name()))
-    })
-}
-
-fn joins_by_partition(node: &Arc<dyn ExecutionPlan>) -> bool {
-    node.downcast_ref::<HashJoinExec>()
-        .is_some_and(|j| *j.partition_mode() == PartitionMode::Partitioned)
-        || node
-            .downcast_ref::<SymmetricHashJoinExec>()
-            .is_some_and(|j| j.partition_mode() == StreamJoinPartitionMode::Partitioned)
-        || node.is::<SortMergeJoinExec>()
-}
-
-fn is_labels(expr: &dyn datafusion::physical_expr::PhysicalExpr) -> bool {
-    expr.downcast_ref::<Column>()
-        .is_some_and(|c| c.name() == LABELS)
-}
-
-/// Whether `node` still carries [`SeriesSetExec`]'s declared partitioning
-/// through nothing but projections, cooperative yields, a selector
-/// aggregate, or a single-child node DataFusion reports as leaving its
-/// child's `output_partitioning()` unchanged — `FilterExec`,
-/// `GlobalLimitExec`, `LocalLimitExec` and `CoalesceBatchesExec` among
-/// them. Shared by the join guard and the interleave guard: one trusting
-/// side is enough to refuse either, because DataFusion would hash only the
-/// other side to match it.
-fn trusts_store_partitioning(node: &Arc<dyn ExecutionPlan>) -> bool {
-    reaches(node, &|n| n.is::<SeriesSetExec>(), &|n| {
-        n.is::<ProjectionExec>()
-            || n.is::<CooperativeExec>()
-            || selector_aggregate(n).is_some()
-            || passes_partitioning_through(n)
-    })
-}
-
-/// Whether `node` has exactly one child and reports the same
-/// `output_partitioning()` as that child, so a Hash(labels, n) declared
-/// below it reaches above it unchanged. A positive rule on
-/// `output_partitioning()` instead of naming node types: DataFusion
-/// guarantees the property, not the list, and an allowlist only grows as
-/// more pass-through operators turn up. Excludes `RepartitionExec`: its
-/// whole purpose is to declare new partitioning, and `Partitioning::Hash`
-/// equality does not distinguish a genuine re-hash of the same width from
-/// a passthrough of the declaration this guard exists to catch.
-fn passes_partitioning_through(node: &Arc<dyn ExecutionPlan>) -> bool {
-    if node.is::<RepartitionExec>() {
-        return false;
-    }
-    match node.children().as_slice() {
-        [child] => node.properties().partitioning == child.properties().partitioning,
-        _ => false,
-    }
-}
-
-/// Whether `node`, or the single-child chain below it through `through`,
-/// ends in a node that is `target`.
-fn reaches(
-    node: &Arc<dyn ExecutionPlan>,
-    target: &dyn Fn(&Arc<dyn ExecutionPlan>) -> bool,
-    through: &dyn Fn(&Arc<dyn ExecutionPlan>) -> bool,
-) -> bool {
-    let mut node = node;
-    loop {
-        if target(node) {
-            return true;
-        }
-        match node.children().as_slice() {
-            [child] if through(node) => node = child,
-            _ => return false,
-        }
-    }
-}
-
 impl Drop for Engine {
     fn drop(&mut self) {
         // A plain drop of a `Runtime` waits for its blocking workers, which
@@ -571,5 +419,177 @@ impl Drop for Engine {
 impl Default for Engine {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod lifecycle;
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use datafusion::catalog::Session;
+    use promql_parser::ast::LabelMatcher;
+
+    use super::*;
+    use crate::{series, MemorySeriesSource, SelectHints, Series};
+
+    #[derive(Debug)]
+    struct CountedSource {
+        inner: MemorySeriesSource,
+        selections: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl SeriesSource for CountedSource {
+        async fn select(
+            &self,
+            state: &dyn Session,
+            matchers: &[LabelMatcher],
+            hints: SelectHints,
+        ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+            self.selections.fetch_add(1, Ordering::Relaxed);
+            self.inner.select(state, matchers, hints).await
+        }
+    }
+
+    #[tokio::test]
+    async fn collector_preserves_explicit_instant_order_but_label_orders_matrices() {
+        let source = MemorySeriesSource::try_new(
+            [("cpu20", 1.0), ("cpu3", 2.0), ("cpu100", 3.0)]
+                .into_iter()
+                .map(|(pod, value)| {
+                    Series::new(&[("__name__", "x"), ("pod", pod)], vec![0], vec![value]).unwrap()
+                })
+                .collect(),
+        )
+        .unwrap()
+        .partitions(NonZeroUsize::new(3).unwrap())
+        .rows_per_batch(NonZeroUsize::new(1).unwrap());
+        let engine = Engine::with_options(EngineOptions {
+            parser: ParserOptions::all(),
+        });
+        for (query, instant_pods, root_sort) in [
+            ("x", ["cpu100", "cpu20", "cpu3"], false),
+            ("sum by (pod) (x)", ["cpu100", "cpu20", "cpu3"], false),
+            ("sort(x)", ["cpu20", "cpu3", "cpu100"], true),
+            ("(sort(x))", ["cpu20", "cpu3", "cpu100"], true),
+            ("sort_desc(x)", ["cpu100", "cpu3", "cpu20"], true),
+            (
+                "sort_by_label(x, \"pod\")",
+                ["cpu3", "cpu20", "cpu100"],
+                true,
+            ),
+            (
+                "sort_by_label_desc(x, \"pod\")",
+                ["cpu100", "cpu20", "cpu3"],
+                true,
+            ),
+            ("abs(sort(x))", ["cpu100", "cpu20", "cpu3"], false),
+            ("abs((sort_desc(x)))", ["cpu100", "cpu20", "cpu3"], false),
+            ("sum by (pod) (sort(x))", ["cpu100", "cpu20", "cpu3"], false),
+            (
+                "sum by (pod) (abs(sort_desc(x)))",
+                ["cpu100", "cpu20", "cpu3"],
+                false,
+            ),
+        ] {
+            let InstantResult::Vector(batches) =
+                engine.instant_query_async(&source, query, 0).await.unwrap()
+            else {
+                panic!("{query} must answer with an instant vector");
+            };
+            let rows = series::decode(&batches).unwrap();
+            let pods: Vec<_> = rows.iter().map(|row| row.label("pod")).collect();
+            assert_eq!(pods, instant_pods, "typed instant: {query}");
+
+            for range in [RangeQuery::new(0, 0, 1), RangeQuery::new(0, 2, 1)] {
+                let prepared = engine.prepare_async(&source, query, &range).await.unwrap();
+                assert_eq!(
+                    prepared.result_order,
+                    if root_sort && range.start_ms == range.end_ms {
+                        ResultOrder::Preserve
+                    } else {
+                        ResultOrder::LabelSet
+                    },
+                    "{query}, {range:?}"
+                );
+                let planned = engine.execute_async(&prepared).await.unwrap();
+                let direct = engine
+                    .range_query_async(&source, query, &range)
+                    .await
+                    .unwrap();
+                for result in [planned, direct] {
+                    let rows = series::decode(&result).unwrap();
+                    let pods: Vec<_> = rows.iter().map(|row| row.label("pod")).collect();
+                    let expected = if range.start_ms == range.end_ms {
+                        instant_pods
+                    } else {
+                        ["cpu100", "cpu20", "cpu3"]
+                    };
+                    assert_eq!(pods, expected, "{query}, {range:?}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn inspected_plan_execution_finalizes_results_without_selecting_again() {
+        let source = CountedSource {
+            inner: MemorySeriesSource::try_new(
+                [("cpu20", 1.0), ("cpu3", 2.0), ("cpu100", 3.0)]
+                    .into_iter()
+                    .map(|(pod, value)| {
+                        Series::new(&[("__name__", "x"), ("pod", pod)], vec![0], vec![value])
+                            .unwrap()
+                    })
+                    .collect(),
+            )
+            .unwrap()
+            .partitions(NonZeroUsize::new(3).unwrap())
+            .rows_per_batch(NonZeroUsize::new(1).unwrap()),
+            selections: AtomicUsize::new(0),
+        };
+        let engine = Engine::with_options(EngineOptions {
+            parser: ParserOptions::all(),
+        });
+        for range in [RangeQuery::new(0, 0, 1), RangeQuery::new(0, 2, 1)] {
+            for query in [
+                "x",
+                "sum by (pod) (x)",
+                "sort(x)",
+                "sort_desc(x)",
+                "sort_by_label(x, \"pod\")",
+                "sort_by_label_desc(x, \"pod\")",
+            ] {
+                let expected = engine
+                    .range_query_async(&source, query, &range)
+                    .await
+                    .unwrap();
+                let prepared = engine.prepare_async(&source, query, &range).await.unwrap();
+                let before = source.selections.load(Ordering::Relaxed);
+                let actual = engine.execute_async(&prepared).await.unwrap();
+                assert_eq!(source.selections.load(Ordering::Relaxed), before, "{query}");
+                let rows = |batches: &[RecordBatch]| {
+                    series::decode(batches)
+                        .unwrap()
+                        .into_iter()
+                        .map(|row| {
+                            (
+                                row.labels()
+                                    .map(|(n, v)| (n.to_string(), v.to_string()))
+                                    .collect::<Vec<_>>(),
+                                row.timestamps().to_vec(),
+                                row.values().iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(rows(&actual), rows(&expected), "{query}, {range:?}");
+            }
+        }
     }
 }

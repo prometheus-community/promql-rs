@@ -25,9 +25,8 @@ fn source() -> MemorySeriesSource {
 
 /// A store that declares one block over the whole query range whatever
 /// the lookback, as a store with a fixed block grid would. The default
-/// source starts its block at `start + window`, which for a huge window
-/// fails the ordering check before the kernels run and so hides the
-/// overflow.
+/// source starts its block at `start + window`; using a fixed block here
+/// keeps these regressions about query arithmetic, not source layout.
 #[derive(Debug)]
 struct WholeRange(MemorySeriesSource);
 

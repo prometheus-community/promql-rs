@@ -365,12 +365,11 @@ table.lanes td.out{color:var(--ok); font-weight:600;}
 <h1>How <code>rate</code> walks a block and crosses its edge</h1>
 <p class="byline">promql-engine internals &middot; companion to <a class="fl" href="engine.md">docs/engine.md</a> and <a class="fl" href="series-source.md">docs/series-source.md</a> &middot; illustrates <a class="fl" href="engine-blocks.md">docs/engine-blocks.md</a></p>
 
-<!-- The overview is the whole approach in one picture: time cut into blocks by the store,
-     one series folded at a time inside a block, steps leaving at the block's edge.
-     Times are the step-through's fixture, so the picture and the step-through agree. -->
+<!-- Logical prefix progression, not native buffering or emission timing.
+     Times are the step-through's fixture, so the diagrams agree. -->
 <section class="overview" id="overview" aria-label="Overview">
   <div class="ov-scroll">
-  <svg id="ov-svg" viewBox="0 0 920 258" role="img" aria-label="A query range cut by the store into two blocks, each shading its reach-back before block_start; inside block 1 two series in label order are folded one at a time into one partial per step, and the partials leave at the block's edge">
+  <svg id="ov-svg" viewBox="0 0 920 258" role="img" aria-label="Schematic of two blocks with reach-back; inside block 1 two contiguous identities fold into per-step partials eligible to emit after the block prefix closes, without showing native buffering">
     <defs>
       <pattern id="ov-hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
         <rect class="hatch-bg" width="6" height="6"/>
@@ -446,13 +445,13 @@ table.lanes td.out{color:var(--ok); font-weight:600;}
       <circle class="dot-b" cx="519" cy="180.5" r="2"/>
       <text x="532" y="161.5">1st  x{pod="a"}</text>
       <text x="532" y="183.5">2nd  x{pod="b"}</text>
-      <text x="70" y="162">series, one chunk each, in label order</text>
+      <text x="70" y="162">series, one chunk each, with opaque IDs</text>
     </a>
 
     <a href="#block-edge">
       <path class="flow" d="M480 190V210" marker-end="url(#ov-arr)"/>
       <path class="flow" d="M519 190V210" marker-end="url(#ov-arr)"/>
-      <text x="454" y="203" text-anchor="end">rate folds one series at a time and forgets it at the next label set</text>
+      <text x="454" y="203" text-anchor="end">rate folds one ID at a time and forgets it at the next ID</text>
     </a>
 
     <a href="#block-edge">
@@ -462,16 +461,16 @@ table.lanes td.out{color:var(--ok); font-weight:600;}
       <text class="acc" x="519" y="224.5" text-anchor="middle" style="font-size:7.5px">.0517</text>
       <text x="454" y="225" text-anchor="end">sum: one partial per step of the block</text>
       <path class="flow" d="M540 221.5H600" marker-end="url(#ov-arr)"/>
-      <text class="acc" x="606" y="213">emitted at the block's edge,</text>
-      <text class="acc" x="606" y="224.5">when block 2's first series arrives;</text>
-      <text class="acc" x="606" y="236">nothing per series crosses it</text>
+      <text class="acc" x="606" y="213">eligible after the prefix closes;</text>
+      <text class="acc" x="606" y="224.5">native buffering is not shown;</text>
+      <text class="acc" x="606" y="236">no raw-series fold crosses the edge</text>
     </a>
   </svg>
   </div>
   <ul class="ov-caps">
     <li><b>The store cuts time.</b> Every series names its block, and each block reaches back by the window, so it answers its own steps alone.</li>
-    <li><b>A block is folded one series at a time.</b> Series come in label order. <code>rate</code> holds one label set's window buffer and drops it at the next label set.</li>
-    <li><b>The edge is when steps leave.</b> <code>sum</code> holds one partial per step of the open block and emits them once the block's last series has passed.</li>
+    <li><b>A block is folded one ID at a time.</b> Each ID's chunks are contiguous. <code>rate</code> holds one series' window buffer and drops it at the next ID; ordering between IDs is unspecified.</li>
+    <li><b>The edge permits prefix emission.</b> These partials illustrate the arithmetic. Native batches, output queues and spill may retain groups from several blocks; this is not a one-block memory bound.</li>
   </ul>
 </section>
 
@@ -479,18 +478,18 @@ table.lanes td.out{color:var(--ok); font-weight:600;}
 <h2>Before you read</h2>
 <dl class="glossary">
   <dt>Block</dt>
-  <dd>The store's unit of time, such as a TSDB block, named on every series by <code>block_start</code> and <code>block_end</code>. It holds every sample that the windows of its steps reach, so the engine keeps nothing per series once the block ends. It is the unit of the engine's memory.</dd>
+  <dd>The store's unit of time, such as a TSDB block, named on every row by <code>block_start</code> and <code>block_end</code>. Its samples include the reach-back needed to answer its steps independently. No raw-series fold crosses the edge; completed output and native aggregate state may outlive it.</dd>
   <dt>Batch (<code>RecordBatch</code>)</dt>
   <dd>The series the store sends together. The store may cut a block into batches anywhere, even between two chunks of one series. It is the unit of transport.</dd>
   <dt>Series</dt>
-  <dd>One series' labels and one chunk of its samples, with the two block columns, stored as one Arrow row. A series with several chunks arrives once per chunk, consecutive in sorted mode and tagged with a <code>series_id</code> in keyed mode. How many chunks a label set becomes in a block is the store's call: a TSDB-backed store sends one per chunk it keeps, a remote store may merge what it receives into one. It is the unit the engine folds.</dd>
+  <dd>One series' full raw labels, mandatory opaque <code>series_id</code>, and one chunk of its samples, with the two block columns, stored as one Arrow row. A series with several chunks arrives once per chunk, consecutive by ID and chronological within each block and partition. How many chunks a label set becomes in a block is the store's call: a TSDB-backed store sends one per chunk it keeps, a remote store may merge what it receives into one. It is the unit the engine folds.</dd>
   <dt>Chunk</dt>
-  <dd>A run of one series' samples as the store keeps it, such as a compressed TSDB chunk. The store never decodes a chunk to trim it, so a series may reach past a block edge or overlap the next chunk of the same label set. It is the store's unit of storage.</dd>
+  <dd>A run of one series' samples as the store keeps it, such as a compressed TSDB chunk. The store need not decode a chunk to trim it, so samples may reach past a block edge or overlap the next chunk of the same label set. It is the store's unit of storage.</dd>
 </dl>
 <p>One <code>select</code> yields blocks, a block arrives as batches, a batch holds series, and a series holds one chunk's samples.</p>
 </section>
 
-<p class="lede">How does <code>rate</code> reach across two chunks of one series that it never aligns? It copies what a later window reaches into one window buffer per open series, and a grouped aggregate folds a block, not a label set.</p>
+<p class="lede">How does <code>rate</code> reach across two chunks of one series that it never aligns? It copies what a later window reaches into the one current ID's window buffer. <code>SeriesEvalExec</code> emits a row when that ID closes, and an aggregate above sees only evaluated rows.</p>
 
 <div class="query-banner">
   <code>sum(rate(x[5m]))</code> &nbsp;&middot;&nbsp; <code>x{pod="a"}</code>, <code>x{pod="b"}</code> &nbsp;&middot;&nbsp; step 30&thinsp;s, 420&thinsp;s &rarr; 600&thinsp;s &nbsp;&middot;&nbsp; blocks 1 and 2 &nbsp;&middot;&nbsp; batches C and D
@@ -499,7 +498,7 @@ table.lanes td.out{color:var(--ok); font-weight:600;}
 <nav class="toc">
   <a href="#glossary">Before you read</a>
   <a href="#shape">The shape</a>
-  <a href="#checks">What the engine checks</a>
+  <a href="#checks">What the source promises</a>
   <a href="#block-edge">A block edge, step by step</a>
   <a href="#finalising">Finalising</a>
   <a href="#edge-cases">Edge cases</a>
@@ -511,27 +510,30 @@ table.lanes td.out{color:var(--ok); font-weight:600;}
 <pre class="codeblock"><code>labels       Struct&lt;__name__: Utf8View, ...&gt;
 samples      List&lt;Struct&lt;timestamp: Timestamp(Millisecond), value: Float64&gt;&gt;
 block_start  Timestamp(Millisecond)
-block_end    Timestamp(Millisecond)</code></pre>
+block_end    Timestamp(Millisecond)
+series_id    UInt64 | FixedSizeBinary(n&gt;0)   mandatory at the source</code></pre>
 
-<p>One series is one Arrow row: labels, one chunk's samples, and the block it belongs to.</p>
+<p>One series is one Arrow row: full raw labels, an opaque ID, one chunk's samples, and the block it belongs to. The illustration assigns ID 41 to <code>a</code> and ID 7 to <code>b</code>; their order is not numeric ID order. Evaluation removes <code>series_id</code> from the canonical four-column output.</p>
 
-<h2 id="checks">What the engine checks on every series</h2>
+<h2 id="checks">What the source promises</h2>
 
-<p>A violation is a query error, not a wrong result.</p>
+<p>The source is trusted. These obligations are not per-row engine audits; a broken source can produce wrong results. No seen-ID map or provenance validator is kept.</p>
 
 <div class="tablewrap">
 <table class="checks">
-<thead><tr><th>check</th><th>what it catches</th></tr></thead>
+<thead><tr><th>source obligation</th><th>why it matters</th></tr></thead>
 <tbody>
-<tr><td>One label comparison, against the previous series in sorted mode or the id's stored labels in keyed mode</td><td>a label set out of order, or split by another label set, and a <code>series_id</code> that names other labels</td></tr>
-<tr><td>The first sample timestamp does not decrease across a label set's chunks</td><td>chunks of one label set sent out of time order</td></tr>
-<tr><td><code>block_start</code> and <code>block_end</code> stay constant within a block</td><td>a series that disagrees with its block about where the block ends</td></tr>
-<tr><td>Blocks ascend and do not overlap</td><td>a series that goes back to an earlier block, or a block that starts before the last one ended</td></tr>
+<tr><td>Each <code>series_id</code> maps one-to-one to full raw labels, stable across chunks, blocks and selections</td><td>ID equality identifies the current fold without comparing labels</td></tr>
+<tr><td>Chunks of one ID are contiguous and chronological within each block, all in one partition</td><td>a different ID closes the current series permanently for this block</td></tr>
+<tr><td><code>block_start</code> and <code>block_end</code> stay constant within a block, with the same edges in every partition</td><td>the first row establishes every step the block answers</td></tr>
+<tr><td>Blocks ascend and do not overlap</td><td>no fold needs to survive a block edge; the same ID may recur in a later block</td></tr>
 </tbody>
 </table>
 </div>
 
-<p>A batch boundary is not among the events, because the store may cut a block anywhere, even between two chunks of one label set. In sorted mode the engine carries one open series per partition across a batch boundary, and in keyed mode every series of the block.</p>
+<p>A batch boundary is not among the events, because the store may cut a block anywhere, even between two chunks of one ID. The evaluator carries one current ID and fold per partition, plus budgeted completed output and a pending input cursor. Output budgets allow one indivisible oversized row. The fold closes on an ID change, block change or end of stream. Only block ordering and unknown partitioning are advertised to DataFusion, never labels or IDs ascending.</p>
+
+<p>History follows the window's sample high water plus a bounded ingestion allowance. At most 256 samples enter before readiness and retirement are checked; unused future tails are not copied. Front trimming does not release vector capacity. The diagrams show sample reachability, not retained capacity or cooperative work budgets (<a href="engine.md#memory-and-output-ownership">docs/engine.md</a>).</p>
 
 <h2 id="block-edge">Watch one query cross a block edge</h2>
 
@@ -553,19 +555,19 @@ block_end    Timestamp(Millisecond)</code></pre>
     <span class="anim-now" id="fold-now"></span>
   </div>
   <div class="anim-scroll">
-    <svg id="fold-svg" viewBox="0 0 900 352" role="img" aria-label="Two series, each with one chunk in each of two blocks, arriving in two RecordBatches, folded one series at a time into seven step windows; sum emits a block's steps when the block's last series has passed"></svg>
+    <svg id="fold-svg" viewBox="0 0 900 352" role="img" aria-label="Logical progression of two series across two blocks and two RecordBatches, folded one identity at a time into seven step windows; schematic sum emission omits native buffering"></svg>
   </div>
   <p class="anim-cap" id="fold-cap"></p>
 
   <h3 class="insp-h" id="inspector">The same step, as Arrow holds it</h3>
-  <p class="insp-lede">The top half draws the two input <code>RecordBatch</code>es, each with label and block columns and a <code>samples</code> list of offsets over two flat child buffers. The batch edge falls inside block 2 on purpose. The bottom half draws what outlives a chunk, the open series' window buffer and <code>sum</code>'s partials, then what <code>sum</code> has emitted.</p>
+  <p class="insp-lede">The top half draws the two input <code>RecordBatch</code>es, each with label, ID and block columns and a <code>samples</code> list of offsets over two flat child buffers. The batch edge falls inside block 2 on purpose. The bottom half draws copied history and logical <code>sum</code> partials and output. It omits executor output batching, retained capacities and native aggregate buffering.</p>
   <div class="anim-scroll">
-    <svg id="arrow-svg" viewBox="0 0 900 328" role="img" aria-label="Two Arrow RecordBatches, each an offsets buffer over its own child buffers, above the open series' window buffer, sum's partials for the open block, and sum's output"></svg>
+    <svg id="arrow-svg" viewBox="0 0 900 328" role="img" aria-label="Two Arrow RecordBatches above copied history, schematic per-block sum partials and output; grey history cells are no longer reachable, not necessarily deallocated"></svg>
   </div>
   <p class="anim-cap" id="arrow-cap"></p>
 
   <h3 class="insp-h">Partials per step</h3>
-  <p class="insp-lede">A partial exists only while its block is open. Every value comes from the page's own fold and its port of <code>extrapolatedRate</code>.</p>
+  <p class="insp-lede">Every value comes from the page's own fold and its port of <code>extrapolatedRate</code>. This schematic updates partials as steps become numerically final and emits at each logical block edge. The real executor first closes the ID and delivers its completed row in an output batch; native aggregation can retain groups from multiple blocks. The schematic shows arithmetic and prefix progression, not exact emission timing or a memory bound.</p>
   <div class="anim-scroll">
     <div class="tablewrap" style="margin-top:0">
       <table class="lanes" id="sum-tbl">
@@ -580,7 +582,7 @@ block_end    Timestamp(Millisecond)</code></pre>
 
 <p><code>sum</code> never sees samples, only the step values <code>rate</code> emits, each keyed by its step, so a batch cannot arrive early or late.</p>
 
-<p>With several partitions, each keeps its own partials, and the block's final <code>sum</code> adds them once every partition has passed the block, because its group key leads with <code>block_start</code> and the repartition beneath the Final preserves block order (<a href="engine.md#ordering-integrity">docs/engine.md</a>).</p>
+<p>With several partitions, Partial aggregates feed a Final aggregate through an order-preserving repartition, with <code>block_start</code> leading the group key. Completed prefixes can emit once every partition has passed them (<a href="engine.md#physical-properties-and-session-flags">docs/engine.md</a>). This does not require the native aggregate to release one block before consuming any rows of the next.</p>
 
 <h2 id="finalising">Finalising</h2>
 
@@ -614,9 +616,9 @@ rate               = 12.2222222 / 300                           = 0.0407407407</
 
 <h2 id="edge-cases">Edge cases</h2>
 
-<p><b>Overlapping chunks.</b> Adjacent chunks of a label set may overlap in time, so the engine skips every sample at or before the last timestamp it copied and the first chunk wins. A stale marker claims its timestamp too (<a href="engine-blocks.md#6-overlapping-chunks">docs/engine-blocks.md</a>).</p>
+<p><b>Overlapping chunks.</b> Adjacent chunks of a label set may overlap in time, so the engine skips every sample at or before the last timestamp it saw for the current identity and the first chunk wins. A stale marker claims its timestamp too (<a href="engine-blocks.md#6-overlapping-chunks">docs/engine-blocks.md</a>).</p>
 
-<p><b>Functions that need every sample.</b> <code>quantile_over_time</code> and functions like it keep no running state. They refold the lane's slice of the same buffer at each step (<a href="engine-blocks.md#7-functions-that-need-every-sample-in-the-window">docs/engine-blocks.md</a>).</p>
+<p><b>Functions that need every sample.</b> <code>quantile_over_time</code> and functions like it refold the lane's chronological slice of the same history at each step, with function-specific scratch as needed. The slice follows the window; retained buffer capacity can also depend on chunk size (<a href="engine-blocks.md#7-functions-that-need-every-sample-in-the-window">docs/engine-blocks.md</a>).</p>
 
 <div class="footnote" id="notes">
 <p><b>Notes on the numbers.</b> The fold and <code>extrapolatedRate</code> run in this page, term for term after Prometheus's <code>promql/functions.go</code>. The engine checks itself against the same rates in <code>the_engine_blocks_fixture</code> in <code>buffer.rs</code>.</p>
@@ -650,8 +652,8 @@ rate               = 12.2222222 / 300                           = 0.0407407407</
      milliseconds, and nothing on this page turns on the difference. Two
      blocks the store declares and two series, each with one chunk per block.
      The chunks come in two RecordBatches cut inside block 2 on purpose: the block edge (before
-     2·a) and the batch edge (before 2·b) fall in different places, and only
-     the first is an event for sum. ---- */
+     2·a) and the batch edge (before 2·b) fall in different places. Emission
+     follows logical prefixes here; native buffering is not simulated. ---- */
   var RANGE = 300, STEP = 30;
   var STEPS = [420, 450, 480, 510, 540, 570, 600];
   var BLOCKS = [
@@ -673,7 +675,7 @@ rate               = 12.2222222 / 300                           = 0.0407407407</
       out.push([t, series === "a" ? A_VALUES[(t - 300) / STEP] : 10 + (t - 150) / STEP]);
     return out;
   }
-  var SER = {a:{label:'x{pod="a"}', key:"ca"}, b:{label:'x{pod="b"}', key:"cb"}};
+  var SER = {a:{label:'x{pod="a"}', id:41, key:"ca"}, b:{label:'x{pod="b"}', id:7, key:"cb"}};
   var BATCHES = [
     {name:"C", rows:[
       {name:"1·a", series:"a", block:0, s:samples("a", 300, 450)},
@@ -736,7 +738,7 @@ rate               = 12.2222222 / 300                           = 0.0407407407</
   /* ---- frames ----
      The engine pushes a whole chunk at once. The page slows each push to one
      frame per step it makes final, so the partials can be watched filling.
-     Between series: "close" when the label set changes inside a block, "edge"
+     Between series: "close" when the ID changes inside a block, "edge"
      when a series of the next block arrives, "end" when the stream does. */
   var EV = [{k:"src", row:0}];
   ROWS.forEach(function(r, ri){
@@ -899,7 +901,7 @@ rate               = 12.2222222 / 300                           = 0.0407407407</
   // style because the stylesheet's text fill outranks a fill attribute
   var gRel = mk("g", {"class":"g gone"});
   mk("text", {x:X(460), y:BATCH_Y[0][0] + 11, "font-size":8, style:"fill:var(--accent)"}, gRel,
-     "batch C released: labels, blocks, offsets, child buffers");
+     "batch C released: labels, IDs, blocks, offsets, child buffers");
 
   var gDrop = mk("g", {"class":"g"});
   var dropLine = mk("path", {"class":"drop", d:""}, gDrop);
@@ -920,7 +922,7 @@ rate               = 12.2222222 / 300                           = 0.0407407407</
                              style:"fill:var(--accent)"}, g, ""));
   });
 
-  // the open series' cursor: its last copied timestamp, what the overlap skip compares against
+  // The overlap cursor follows the last seen timestamp, including stale markers.
   var gCur = mk("g", {"class":"g gone"});
   var curLine = mk("path", {"class":"cursor", d:""}, gCur);
   var curTxt = mk("text", {x:0, y:AXIS_Y - 7, "font-size":7.5, "text-anchor":"end",
@@ -930,16 +932,17 @@ rate               = 12.2222222 / 300                           = 0.0407407407</
 
   /* =====================  Arrow buffer inspector  =====================
      Driven by the same frame index. Top: the two input RecordBatches, each its
-     label and block columns plus the samples list as offsets over two flat
+     label, ID and block columns plus the samples list as offsets over two flat
      child buffers of its own. Bottom: what outlives a chunk, the open series'
      window buffer, copied out of its batch, and sum's partials for the open
      block. Only the bottom half outlives a batch, and only sum's partials
      outlive a series. */
   var ICW = 22;                                   // child buffer cell width
-  var BX = 236;                                   // child buffer origin
+  var BX = 268;                                   // child buffer origin
   var PANEL_Y = [0, 96];
   var CCOLS = [
     {name:"labels.pod", w:40, get:function(r){ return '"' + r.series + '"'; }},
+    {name:"series_id", w:28, get:function(r){ return String(SER[r.series].id); }},
     {name:"block_start", w:50, get:function(r){ return String(BLOCKS[r.block].start); }},
     {name:"block_end", w:50, get:function(r){ return String(BLOCKS[r.block].end); }}
   ];
@@ -1031,7 +1034,7 @@ rate               = 12.2222222 / 300                           = 0.0407407407</
   mk("text", {"class":"hdr", x:BUF_X + 46, y:BUF_Y + 64, "font-size":6.5}, asvg,
      "what the overlap skip compares against; dropped with the series");
 
-  // bottom right: sum's partials, one slot per step of the open block
+  // Schematic partial slots omit native buffering across blocks.
   var PX0 = 520, PCW = 72, MAXSLOTS = 5;
   var partTitle = mk("text", {x:PX0, y:BUF_Y - 8, "font-size":9, fill:"var(--text)"}, asvg, "");
   var partSlot = [];
@@ -1048,7 +1051,7 @@ rate               = 12.2222222 / 300                           = 0.0407407407</
     partSlot.push({gh:gh, th:th, gv:gv, tv:tv});
   }
   mk("text", {"class":"hdr", x:PX0, y:BUF_Y + 46, "font-size":6.5}, asvg,
-     "one partial per step of the open block, dropped when it is emitted");
+     "schematic partials; native batching and spill state omitted");
 
   // bottom: sum's output, filled at each block edge
   var OUT_Y = 306, OX = BUF_X;
@@ -1113,8 +1116,8 @@ rate               = 12.2222222 / 300                           = 0.0407407407</
     if (e.k === "src"){
       return "<b>Batch C arrives</b>, and its first series, 1&middot;a, names block 1, " + c("block_start") +
         " 240&thinsp;s and " + c("block_end") + " 480&thinsp;s. Before any sample is read, the engine knows " +
-        "the block answers only 420&thinsp;s and 450&thinsp;s, and " + c("sum") + " opens one partial for each. " +
-        "The engine pushes a chunk whole, and the frames below slow each push to one step at a time.";
+        "the block answers only 420&thinsp;s and 450&thinsp;s. The schematic opens " + c("sum") + " partials for those steps. " +
+        "The engine pushes a chunk whole; these frames slow it to one step at a time and omit native buffering.";
     }
     if (e.k === "push"){
       r = ROWS[e.row];
@@ -1137,8 +1140,8 @@ rate               = 12.2222222 / 300                           = 0.0407407407</
       if (reach === Infinity)
         s += "Block " + bl.name + " answers no later step, so no window reaches the buffer any more.";
       else if (gone.length)
-        s += "The window at " + sec_(reach + RANGE) + " starts at " + sec_(reach) + ", so the buffer drops " +
-             stepList(gone) + " from the front.";
+        s += "The window at " + sec_(reach + RANGE) + " starts at " + sec_(reach) + ", so it no longer reaches " +
+             stepList(gone) + ". Grey cells show unreachable samples, not released capacity.";
       else
         s += "The window at " + sec_(reach + RANGE) + " still reaches every sample, so the buffer drops nothing.";
       return s;
@@ -1148,33 +1151,33 @@ rate               = 12.2222222 / 300                           = 0.0407407407</
       var prev = ROWS[e.row - 1];
       s = e.arrives
         ? "<b>Batch D arrives, and " + r.name + " closes " + c(SER[prev.series].label) + ".</b> What closes " + c(prev.series) +
-          " is " + r.name + "'s label set, not the batch boundary, and it would close " + c(prev.series) + " the same way inside batch C. " +
+          " is " + r.name + "'s different ID, not the batch boundary, and it would close " + c(prev.series) + " the same way inside batch C. " +
           c(prev.series) + "'s window buffer is dropped with the series, and batch C is released."
-        : "<b>" + r.name + " closes " + c(SER[prev.series].label) + ".</b> Its label set sorts after " + c(prev.series) +
-          "'s, so " + c(prev.series) + " is done in this block, and its window buffer is dropped with it before any of " +
+        : "<b>" + r.name + " closes " + c(SER[prev.series].label) + ".</b> Its ID " + SER[r.series].id + " differs from " + SER[prev.series].id +
+          ", so " + c(prev.series) + " is done in this block, and its window buffer is dropped with it before any of " +
           c(r.series) + "'s samples is read. Only " + c("sum") + "'s partials hold anything of " + c(prev.series) + ", one number per step.";
       return s;
     }
     if (e.k === "edge"){
-      return "<b>Block edge.</b> 2&middot;a carries " + c("block_start") + " 480&thinsp;s, so block 1's last series has passed and " +
-        c('x{pod="b"}') + " closes with its window buffer. " + c("sum") + " emits " + stepList(h.emitted) +
-        ", drops their partials, and opens five for block 2, where every series starts from an empty buffer.";
+      return "<b>Block edge.</b> 2&middot;a carries " + c("block_start") + " 480&thinsp;s, closing block 1's last raw-series fold. " +
+        "The schematic emits " + stepList(h.emitted) + " and opens five partials for block 2. In execution, completed rows must first " +
+        "reach the aggregate and close its block prefix; native buffering can delay emission. Every raw-series fold starts afresh in block 2.";
     }
-    return "<b>End of stream.</b> " + c('x{pod="b"}') + " closes with its window buffer, block 2's last series has passed, and " +
-      c("sum") + " emits " + stepList(h.emitted) + ". " + c("sum") + " never held partials for more than one block's steps, five here, and " +
-      c("rate") + " never more than one series' buffer.";
+    return "<b>End of stream.</b> " + c('x{pod="b"}') + " closes with its history, and the schematic emits " +
+      stepList(h.emitted) + ". Its one-block partials are not a native-state bound: batching, output queues and spill can retain several blocks. " +
+      c("rate") + " holds one identity's history per source partition, bounded by its window's sample high water plus the ingestion allowance.";
   }
   function asay(e, h){
     if (e.k === "push"){
       var r = ROWS[e.row], b = BATCHES[r.batch], lo = r.base + e.from, hi = r.base + e.to;
       return "Reading cells <b>" + lo + "</b> to <b>" + (hi - 1) + "</b> of batch " + b.name + "'s child buffers, inside the slice " +
         c("[" + r.base + ", " + (r.base + r.s.length) + ")") + " its offsets delimit. They are copied into the window buffer below, " +
-        "not held as a slice, so the batch can go once its series are folded. Greyed buffer cells are reached by no later window of the block.";
+        "not held as a slice, so the batch can go once its series are folded. Greyed cells are reached by no later window; trimming need not release their capacity.";
     }
     if (e.k === "src")
       return "Batch C holds three Arrow rows over two blocks, with offsets " + c("[" + BATCHES[0].offs.join(", ") + "]") +
         ". " + c("block_start") + " and " + c("block_end") + " are plain columns, constant within a block; the engine reads them off the " +
-        "first series and checks the rest against them.";
+        "first series and trusts the source to keep them constant. IDs 41 and 7 identify the full raw series.";
     if (e.k === "close" && e.arrives)
       return "Batch D brings its own columns and its own offsets " + c("[" + BATCHES[1].offs.join(", ") + "]") +
         ", indexed from 0 again. Nothing in it points back at batch C, and nothing needs to: " + c("sum") +
@@ -1183,9 +1186,9 @@ rate               = 12.2222222 / 300                           = 0.0407407407</
       return "The window buffer is empty again: " + c("b") + " starts from nothing, and " + c("a") + "'s copied samples and " +
         c("last_ts") + " are gone. " + c("sum") + "'s two partials are the only state left from " + c("a") + ".";
     if (e.k === "edge")
-      return "Block 1's partials move into " + c("sum") + "'s output and leave the slots, which block 2's steps take over. " +
-        "What " + c("sum") + " holds is bounded by one block's steps, not by the range.";
-    return "All seven steps are in " + c("sum") + "'s output, block by block, and nothing is held: no buffer, no partial.";
+      return "The schematic moves block 1's partials into output and reuses the slots for block 2. Native aggregation may retain " +
+        "groups from several blocks; these slots do not represent all retained state.";
+    return "All seven steps are in the schematic output, with no open fold or partial. Actual output collection retains the complete answer.";
   }
 
   function render(){
@@ -1317,7 +1320,7 @@ rate               = 12.2222222 / 300                           = 0.0407407407</
     cls(curCell, "hot", e.k === "push");
 
     var bl = BLOCKS[h.block];
-    partTitle.textContent = "sum  partials of block " + bl.name;
+    partTitle.textContent = "schematic sum  block " + bl.name;
     partSlot.forEach(function(sl, i){
       var ts = bl.steps[i], used = ts !== undefined;
       cls(sl.gh, "gone", !used); cls(sl.gv, "gone", !used);

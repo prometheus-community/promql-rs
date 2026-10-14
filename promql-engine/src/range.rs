@@ -1,44 +1,15 @@
-//! Range-vector functions as one DataFusion grouped aggregate function:
-//! `promql_range_function(samples, block_start, block_end, 'rate', start,
-//! end, step, range, offset, at)` grouped by the block and `labels`.
-//!
-//! A range function is the vector selector's shape with a window instead
-//! of a lookback, so it runs in the selector's accumulator, `EvalSeries`,
-//! with `advance_range` as the walk: one label set's chunks of one block
-//! in, that series' values on the steps the block answers out. The
-//! function name is a literal
-//! argument, like every parameter, so one registration serves all of them
-//! and the plan says which it is.
-//!
-//! Semantics are `matrixIterSlice`, `extrapolatedRate`, `instantValue`
-//! and the `*_over_time` functions in Prometheus's `promql/functions.go`
-//! and `engine.go`. Floats only; native histograms are a later slice.
+//! Range-vector numerical kernels after `matrixIterSlice`, `extrapolatedRate`,
+//! `instantValue` and the `*_over_time` functions in Prometheus's
+//! `promql/functions.go` and `engine.go` at 83962c35. [`crate::series_eval`]
+//! drives one ID's chunks; `advance_range` answers its block-local steps.
+//! Floats only; native histograms are a later slice.
 
-use std::any::Any;
 use std::collections::VecDeque;
-use std::sync::Arc;
 
-use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
-use datafusion::common::{plan_err, ScalarValue};
-use datafusion::error::Result;
-use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
-use datafusion::logical_expr::utils::format_state_name;
-use datafusion::logical_expr::{
-    lit, Accumulator, AggregateUDF, AggregateUDFImpl, Expr, GroupsAccumulator, Signature,
-    Volatility,
-};
-use datafusion::physical_expr::expressions::Literal;
-use datafusion::physical_expr::PhysicalExpr;
-
-use crate::buffer::{BufferedSeriesIterator, Kernel};
+use crate::buffer::{EvalContext, WindowBuffer, WorkBudget};
 use crate::math;
-use crate::params::{step_count, Params};
-use crate::selector::{empty_samples, EvalSeries};
-use crate::series;
 
-pub const NAME: &str = "promql_range_function";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Hash)]
 pub enum Func {
     Rate,
     Increase,
@@ -93,6 +64,22 @@ impl Func {
             Func::PresentOverTime => "present_over_time",
             Func::Changes => "changes",
             Func::Resets => "resets",
+        }
+    }
+
+    /// Work in an indivisible value fold; O(1) kernels are already charged
+    /// by the step. This is sample work, not a timing estimate or preemption.
+    fn value_work(self, samples: usize) -> usize {
+        match self {
+            Self::Rate
+            | Self::Increase
+            | Self::SumOverTime
+            | Self::AvgOverTime
+            | Self::MinOverTime
+            | Self::MaxOverTime
+            | Self::Changes
+            | Self::Resets => samples,
+            _ => 0,
         }
     }
 
@@ -269,6 +256,15 @@ pub(crate) enum Sweep {
 }
 
 impl Sweep {
+    /// Owned queue allocations; the enum itself is inline in its iterator.
+    pub(crate) fn heap_size(&self) -> usize {
+        let capacity = match self {
+            Sweep::Counter { resets, .. } => resets.capacity(),
+            Sweep::Extremum { candidates, .. } => candidates.capacity(),
+        };
+        capacity * std::mem::size_of::<usize>()
+    }
+
     /// Between series, so that one `Sweep` can be hoisted above a row
     /// loop and keep the `VecDeque`s' capacity.
     pub(crate) fn reset(&mut self) {
@@ -300,17 +296,27 @@ impl Sweep {
     /// arrives with `i` only once its left half is inside. `vs` holds
     /// ordinals from `base` on: the tracked indices stay absolute so that
     /// trimming the buffer's front never has to rewrite them.
-    fn enter(&mut self, i: usize, lo: usize, base: usize, vs: &[f64]) {
+    fn enter(
+        &mut self,
+        i: usize,
+        lo: usize,
+        base: usize,
+        vs: &[f64],
+        budget: &mut WorkBudget,
+    ) -> bool {
         let at = |j: usize| vs[j - base];
         match self {
             Sweep::Counter { resets, .. } => {
+                if !budget.take() {
+                    return false;
+                }
                 if i > lo && at(i) < at(i - 1) {
                     resets.push_back(i - 1);
                 }
             }
             Sweep::Extremum { candidates, max } => {
                 if at(i).is_nan() {
-                    return;
+                    return budget.take();
                 }
                 // A strict comparison keeps the earliest of equal
                 // values, which is the one `min_of`'s fold settles on
@@ -324,11 +330,20 @@ impl Sweep {
                     if !beaten {
                         break;
                     }
+                    if !budget.take() {
+                        // This sample has not entered yet. Resuming at i is
+                        // safe: already removed candidates stay beaten.
+                        return false;
+                    }
                     candidates.pop_back();
+                }
+                if !budget.take() {
+                    return false;
                 }
                 candidates.push_back(i);
             }
         }
+        true
     }
 
     fn leave(&mut self, i: usize) {
@@ -343,6 +358,13 @@ impl Sweep {
                     candidates.pop_front();
                 }
             }
+        }
+    }
+
+    fn value_work(&self) -> usize {
+        match self {
+            Sweep::Counter { resets, .. } => resets.len(),
+            Sweep::Extremum { .. } => 0,
         }
     }
 
@@ -372,10 +394,12 @@ impl Sweep {
 
 /// Evaluate the steps of `it`'s open series that are ready.
 ///
-/// Without `done`, a step is ready once its window's end is at or before
-/// `last_t`: the samples still to come are all later, so they cannot
-/// land in it. With `done` there are no samples to come, and every step
-/// left is ready. Evaluating as the chunks arrive, rather than at close,
+/// A step is ready once its window's end is at or before `last_t`: the
+/// samples still to come cannot land in it. Close sets `last_t` to MAX.
+/// Edge and step cursors survive budget exhaustion. Computing one value
+/// (`evaluate` or `Sweep::value`) remains indivisible, including its ordered
+/// float fold; this is not wall-clock preemption.
+/// Evaluating as the chunks arrive, rather than at close,
 /// is what lets the buffer drop everything below `lo` between chunks.
 ///
 /// `ts`/`vs` are the series' samples from ordinal `it.base` on and must
@@ -383,33 +407,33 @@ impl Sweep {
 /// seen only this series. `emit` receives `(step_timestamp, value)` in
 /// step order, each step at most once.
 pub(crate) fn advance_range(
-    it: &mut BufferedSeriesIterator,
+    it: &mut WindowBuffer,
+    context: &EvalContext,
     ts: &[i64],
     vs: &[f64],
     func: Func,
-    done: bool,
+    budget: &mut WorkBudget,
     mut emit: impl FnMut(i64, f64),
 ) {
-    let BufferedSeriesIterator {
+    let WindowBuffer {
         sweep,
-        params: p,
         base,
         lo,
         hi,
         next_step,
         last_t,
+        pinned_value,
         ..
     } = it;
     debug_assert_eq!(ts.len(), vs.len());
-    let steps = step_count(p.start_ms, p.end_ms, p.step_ms);
+    let p = context.params();
+    let steps = context.steps();
     if p.window_ms <= 0 || *next_step >= steps {
         return;
     }
     // A window ending after this may still gain a sample.
-    let ready = match (done, *last_t) {
-        (true, _) => i64::MAX,
-        (false, Some(t)) => t,
-        (false, None) => return,
+    let Some(ready) = *last_t else {
+        return;
     };
     let base = *base;
     // Indices relative to the slices.
@@ -428,14 +452,22 @@ pub(crate) fn advance_range(
         if range_end > ready {
             return;
         }
-        let l = ts.partition_point(|t| *t <= range_end - p.window_ms);
-        let h = ts.partition_point(|t| *t <= range_end);
-        if let Some(v) = evaluate(func, &window(l, h, range_end)) {
-            for step in p.steps() {
-                emit(step, v);
-            }
+        if budget.exhausted() {
+            return;
         }
-        *next_step = steps;
+        let value = *pinned_value.get_or_insert_with(|| {
+            let l = ts.partition_point(|t| *t <= range_end - p.window_ms);
+            let h = ts.partition_point(|t| *t <= range_end);
+            let value = evaluate(func, &window(l, h, range_end));
+            budget.account_kernel(func.value_work(h - l));
+            value
+        });
+        while *next_step < steps && budget.take() {
+            if let Some(v) = value {
+                emit(context.step_at(*next_step), v);
+            }
+            *next_step += 1;
+        }
         return;
     }
 
@@ -450,34 +482,47 @@ pub(crate) fn advance_range(
     let mut step = (i128::from(p.start_ms) + next * i128::from(p.step_ms)) as i64;
     match sweep {
         None => {
-            while next < steps {
+            'steps: while next < steps {
                 let range_end = step - p.offset_ms;
                 if range_end > ready {
                     break;
                 }
                 let range_start = range_end - p.window_ms;
                 while l < ts.len() && ts[l] <= range_start {
+                    if !budget.take() {
+                        break 'steps;
+                    }
                     l += 1;
                 }
                 h = h.max(l);
                 while h < ts.len() && ts[h] <= range_end {
+                    if !budget.take() {
+                        break 'steps;
+                    }
                     h += 1;
+                }
+                if !budget.take() {
+                    break;
                 }
                 if let Some(v) = evaluate(func, &window(l, h, range_end)) {
                     emit(step, v);
                 }
+                budget.account_kernel(func.value_work(h - l));
                 next += 1;
                 step = step.wrapping_add(p.step_ms);
             }
         }
         Some(sweep) => {
-            while next < steps {
+            'steps: while next < steps {
                 let range_end = step - p.offset_ms;
                 if range_end > ready {
                     break;
                 }
                 let range_start = range_end - p.window_ms;
                 while l < ts.len() && ts[l] <= range_start {
+                    if !budget.take() {
+                        break 'steps;
+                    }
                     if l < h {
                         sweep.leave(base + l);
                     }
@@ -487,153 +532,35 @@ pub(crate) fn advance_range(
                 // samples it skips never entered, and the state is empty.
                 h = h.max(l);
                 while h < ts.len() && ts[h] <= range_end {
-                    sweep.enter(base + h, base + l, base, vs);
+                    if !sweep.enter(base + h, base + l, base, vs, budget) {
+                        break 'steps;
+                    }
                     h += 1;
+                }
+                if !budget.take() {
+                    break;
                 }
                 if let Some(v) = sweep.value(&window(l, h, range_end), base + l) {
                     emit(step, v);
                 }
+                budget.account_kernel(sweep.value_work());
                 next += 1;
                 step = step.wrapping_add(p.step_ms);
             }
         }
     }
-    (*lo, *hi, *next_step) = (base + l, base + h, next);
-}
-
-/// The DataFusion function. Stateless: every parameter is an argument.
-#[derive(Debug, PartialEq, Eq, Hash)]
-pub struct RangeFunction {
-    signature: Signature,
-}
-
-impl Default for RangeFunction {
-    fn default() -> Self {
-        let mut args = vec![
-            series::samples_type(),
-            series::timestamp_type(),
-            series::timestamp_type(),
-            DataType::Utf8,
-        ];
-        args.extend(std::iter::repeat_n(DataType::Int64, 6));
-        Self {
-            signature: Signature::exact(args, Volatility::Immutable),
-        }
-    }
-}
-
-pub fn udaf() -> AggregateUDF {
-    AggregateUDF::new_from_impl(RangeFunction::default())
-}
-
-/// `promql_range_function(samples, block_start, block_end, '<func>',
-/// start, end, step, range, offset, at)`. The block columns are arguments
-/// as well as group keys for the reason `selector.rs` gives.
-pub fn call(samples: Expr, block_start: Expr, block_end: Expr, func: Func, p: &Params) -> Expr {
-    udaf().call(vec![
-        samples,
-        block_start,
-        block_end,
-        lit(func.as_str()),
-        lit(p.start_ms),
-        lit(p.end_ms),
-        lit(p.step_ms),
-        lit(p.window_ms),
-        lit(p.offset_ms),
-        lit(ScalarValue::Int64(p.at_ms)),
-    ])
-}
-
-/// The function name and the grid, read off a planned call's literals.
-/// Every error names this function: the grid literals are read by a
-/// helper shared with the selector, whose own message cannot say which
-/// of the two it was reading for.
-fn read_args(exprs: &[Arc<dyn PhysicalExpr>]) -> Result<(Func, Params)> {
-    let name = exprs
-        .get(3)
-        .and_then(|e| (e.as_ref() as &dyn Any).downcast_ref::<Literal>())
-        .map(Literal::value);
-    let func = match name {
-        Some(ScalarValue::Utf8(Some(name))) => match Func::parse(name) {
-            Some(func) => func,
-            None => return plan_err!("{NAME}: unknown function {name}"),
-        },
-        other => {
-            return plan_err!("{NAME}: the function name must be a Utf8 literal, got {other:?}")
-        }
-    };
-    let params = Params::from_literals(exprs, 4).map_err(|e| e.context(NAME))?;
-    Ok((func, params))
-}
-
-impl AggregateUDFImpl for RangeFunction {
-    fn name(&self) -> &str {
-        NAME
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    /// Same shape out as in. The check here is what makes a mistyped
-    /// samples column a plan error rather than a downcast panic.
-    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        if arg_types.first() != Some(&series::samples_type()) {
-            return plan_err!(
-                "{NAME}: first argument must be {}, got {:?}",
-                series::samples_type(),
-                arg_types.first()
-            );
-        }
-        Ok(series::samples_type())
-    }
-
-    /// Every series yields a list, possibly empty; never NULL, so the
-    /// output is the canonical shape it came in as.
-    fn is_nullable(&self) -> bool {
-        false
-    }
-
-    /// Without a group key there is no series to fold chunks into.
-    fn accumulator(&self, _args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
-        plan_err!("{NAME} must be grouped by the block and labels")
-    }
-
-    fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
-        Ok(vec![Arc::new(Field::new(
-            format_state_name(args.name, "samples"),
-            series::samples_type(),
-            false,
-        ))])
-    }
-
-    fn groups_accumulator_supported(&self, _args: AccumulatorArgs) -> bool {
-        true
-    }
-
-    /// `DISTINCT` would deduplicate chunks, which is the overlap rule's
-    /// job; answering without it would be silently different.
-    fn create_groups_accumulator(
-        &self,
-        args: AccumulatorArgs,
-    ) -> Result<Box<dyn GroupsAccumulator>> {
-        if args.is_distinct {
-            return plan_err!("{NAME}: DISTINCT is not supported");
-        }
-        let (func, params) = read_args(args.exprs)?;
-        Ok(Box::new(EvalSeries::new(Kernel::Range(func), params)))
-    }
-
-    fn default_value(&self, _data_type: &DataType) -> Result<ScalarValue> {
-        Ok(empty_samples())
-    }
+    // A suspended left-edge walk can pass the previous right edge before
+    // reaching h.max(l) above. No skipped sample entered the sweep.
+    (*lo, *hi, *next_step) = (base + l, base + h.max(l), next);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::{BufferedSeriesIterator, Kernel};
+    use crate::params::Params;
     use crate::selector::{is_stale, STALE_NAN_BITS};
-    use crate::series::SamplesBuilder;
+    use crate::series::{self, SamplesBuilder};
     use datafusion::arrow::array::AsArray;
 
     const S: i64 = 1000;
@@ -641,10 +568,12 @@ mod tests {
 
     /// One series in one chunk, pushed and closed.
     fn run(func: Func, ts: &[i64], vs: &[f64], p: Params) -> Vec<(i64, f64)> {
-        let mut it = BufferedSeriesIterator::new(Kernel::Range(func), p);
+        let context = EvalContext::new(Kernel::Range(func), p);
+        let mut it = BufferedSeriesIterator::new(&context);
         let mut out = SamplesBuilder::default();
-        it.push(ts, vs, &mut out);
-        it.close(&mut out);
+        it.push(&context, ts, vs, |t, v| out.push(t, v));
+        it.close(&context, |t, v| out.push(t, v));
+        out.finish_row();
         let row = out.take_all().value(0);
         let (ts, vs) = series::sample_slices(row.as_struct());
         ts.iter().copied().zip(vs.iter().copied()).collect()
@@ -1012,7 +941,8 @@ mod tests {
         base: usize,
         k: usize,
     ) -> Vec<(i64, f64)> {
-        let mut it = BufferedSeriesIterator::new(Kernel::Range(func), p);
+        let context = EvalContext::new(Kernel::Range(func), p);
+        let mut it = WindowBuffer::new(&context);
         (it.base, it.lo, it.hi) = (base, base, base);
         let mut out = Vec::new();
         for (cts, cvs) in ts.chunks(k).zip(vs.chunks(k)) {
@@ -1024,14 +954,31 @@ mod tests {
             }
             it.last_t = cts.last().copied();
             let (bts, bvs) = (it.ts.clone(), it.vs.clone());
-            advance_range(&mut it, &bts, &bvs, func, false, |t, v| out.push((t, v)));
+            advance_range(
+                &mut it,
+                &context,
+                &bts,
+                &bvs,
+                func,
+                &mut WorkBudget::new(usize::MAX),
+                |t, v| out.push((t, v)),
+            );
             let dead = it.lo - it.base;
             it.ts.drain(..dead);
             it.vs.drain(..dead);
             it.base += dead;
         }
         let (bts, bvs) = (it.ts.clone(), it.vs.clone());
-        advance_range(&mut it, &bts, &bvs, func, true, |t, v| out.push((t, v)));
+        it.last_t = Some(i64::MAX);
+        advance_range(
+            &mut it,
+            &context,
+            &bts,
+            &bvs,
+            func,
+            &mut WorkBudget::new(usize::MAX),
+            |t, v| out.push((t, v)),
+        );
         out
     }
 
@@ -1088,34 +1035,5 @@ mod tests {
                 }
             }
         }
-    }
-
-    /// The grid literals are read by a helper shared with the vector
-    /// selector, so the name has to be added on the way out.
-    #[test]
-    fn an_argument_error_names_the_range_function() {
-        let lit = |v: ScalarValue| Arc::new(Literal::new(v)) as Arc<dyn PhysicalExpr>;
-        let exprs = vec![
-            lit(ScalarValue::Null),
-            lit(ScalarValue::Null),
-            lit(ScalarValue::Null),
-            lit(ScalarValue::Utf8(Some("rate".into()))),
-            // `start`, which is not an Int64 literal.
-            lit(ScalarValue::Utf8(Some("noon".into()))),
-            lit(ScalarValue::Int64(Some(0))),
-            lit(ScalarValue::Int64(Some(30 * S))),
-            lit(ScalarValue::Int64(Some(5 * M))),
-            lit(ScalarValue::Int64(Some(0))),
-            lit(ScalarValue::Int64(None)),
-        ];
-        let err = read_args(&exprs).unwrap_err().to_string();
-        assert!(err.contains(NAME), "{err}");
-        assert!(!err.contains(crate::selector::NAME), "{err}");
-
-        let mut unknown = exprs;
-        unknown[3] = lit(ScalarValue::Utf8(Some("rote".into())));
-        unknown[4] = lit(ScalarValue::Int64(Some(0)));
-        let err = read_args(&unknown).unwrap_err().to_string();
-        assert!(err.contains(NAME) && err.contains("rote"), "{err}");
     }
 }

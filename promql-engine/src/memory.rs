@@ -6,8 +6,8 @@
 //! store has to do: apply the matchers with [`crate::matcher`]'s
 //! semantics, keep only samples inside the range, cut the range into
 //! blocks and stamp every series with its block, hand over each series'
-//! chunks consecutively, blocks ascending, series in struct order within
-//! a block and samples in timestamp order, in the canonical schema. A
+//! chunks consecutively by opaque ID within each block, blocks ascending
+//! and samples in timestamp order. IDs identify the full raw label set; a
 //! store implementer who wants to know "what exactly am I promising" can
 //! read `select` below.
 //!
@@ -31,15 +31,20 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{Array, AsArray, ListArray, RecordBatch, UInt32Array};
+use datafusion::arrow::array::{
+    Array, ArrayRef, AsArray, FixedSizeBinaryArray, ListArray, RecordBatch, UInt32Array,
+    UInt64Array,
+};
 use datafusion::arrow::buffer::OffsetBuffer;
 use datafusion::arrow::compute::{concat_batches, filter_record_batch, take, take_record_batch};
-use datafusion::arrow::datatypes::TimestampMillisecondType;
+use datafusion::arrow::datatypes::{DataType, Field, Schema, TimestampMillisecondType};
 use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::row::{RowConverter, SortField};
 use datafusion::catalog::Session;
@@ -54,14 +59,14 @@ use crate::matcher::{mask_all, CompiledMatcher};
 use crate::series::decode;
 use crate::series::{
     clip, drop_empty, drop_unused_labels, encode, label_names_of, sample_item, with_block, Block,
-    Series, BLOCK_END, BLOCK_START, LABELS, SAMPLES, TIMESTAMP,
+    Series, LABELS, SAMPLES, SERIES_ID, TIMESTAMP,
 };
 use crate::source::{SelectHints, SeriesSource};
 
 #[derive(Debug)]
 pub struct MemorySeriesSource {
-    /// Sorted by labels in struct order, the order `SeriesSetExec`
-    /// declares, so a selection is sorted by construction.
+    /// A deterministic stored order for assigning reference IDs. The source
+    /// contract promises adjacency, not label or ID sorting.
     batch: RecordBatch,
     /// Test mode: see [`Self::chunked`].
     chunk_ms: Option<i64>,
@@ -71,6 +76,16 @@ pub struct MemorySeriesSource {
     partitions: usize,
     /// See [`Self::rows_per_batch`].
     rows_per_batch: usize,
+    /// Reference ID encoding; identity is mandatory for every selection.
+    ids: SeriesIdEncoding,
+}
+
+/// Reference-source ID encodings. Binary IDs are sixteen bytes; neither
+/// encoding is a dense index that the evaluator can use as an array offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeriesIdEncoding {
+    UInt64,
+    FixedSizeBinary,
 }
 
 /// DataFusion's default `execution.batch_size`, the size a store scanning
@@ -104,13 +119,20 @@ impl MemorySeriesSource {
             block_ms: None,
             partitions: 1,
             rows_per_batch: ROWS_PER_BATCH,
+            ids: SeriesIdEncoding::UInt64,
         })
     }
 
-    /// Test mode: hand every selected label set over as consecutive
-    /// chunks of at most `chunk_ms` span, the way a chunked store does.
-    /// Series order and time order are kept. `0` gives one sample per
-    /// chunk.
+    /// Select the encoding of stable opaque IDs, without changing identity,
+    /// chunk adjacency, full labels or partition assignment.
+    pub fn with_ids(mut self, id: SeriesIdEncoding) -> Self {
+        self.ids = id;
+        self
+    }
+
+    /// Test mode: hand every selected label set over as consecutive chunks
+    /// of at most `chunk_ms` span, the way a chunked store does. Time order
+    /// is kept for each series. `0` gives one sample per chunk.
     pub fn chunked(mut self, chunk_ms: i64) -> Self {
         self.chunk_ms = Some(chunk_ms);
         self
@@ -158,9 +180,8 @@ impl MemorySeriesSource {
     }
 
     /// Test mode: spread the selected series over `n` partitions by a hash
-    /// of their label set, each series whole in one partition and each
-    /// partition in struct order, the way a store scanning shards in
-    /// parallel does. Combines with [`Self::chunked`].
+    /// of their label set, each series whole in one partition, the way a
+    /// store scanning shards in parallel does. Combines with [`Self::chunked`].
     pub fn partitions(mut self, n: NonZeroUsize) -> Self {
         self.partitions = n.get();
         self
@@ -253,7 +274,10 @@ impl SeriesSource for MemorySeriesSource {
         // Obligation 1, filter.
         let labels = self.batch.column_by_name(LABELS).expect("canonical");
         let mask = mask_all(&compiled, labels.as_struct())?;
-        let selected = filter_record_batch(&self.batch, &mask)?;
+        // Assign IDs before filtering: a series keeps its ID when another
+        // selector narrows the label-name union or excludes earlier rows.
+        let raw = add_ids(&self.batch, self.ids)?;
+        let selected = filter_record_batch(&raw, &mask)?;
         let selected = drop_unused_labels(&selected).map_err(external)?;
 
         // Obligation 2, blocks: by default one over the whole window-end
@@ -272,12 +296,9 @@ impl SeriesSource for MemorySeriesSource {
         }
         .map_err(external)?;
 
-        // Obligations 3 and 4, partition and order, come for free: the
-        // stored batch already holds one series per label set in struct
-        // order with its samples ascending, and neither step here, nor the
-        // partitioning below, reorders anything within a partition. Blocks
-        // ascend because they were cut in order, and each block hashes its
-        // series to the same partition as every other.
+        // Partition full label sets before chunking so a series' repeated
+        // reach-back in later blocks lands in the same partition. Chunking
+        // preserves adjacency and chronology regardless of ID encoding.
         let schema = selected.schema();
         let mut partitions: Vec<Vec<RecordBatch>> = vec![Vec::new(); self.partitions];
         for block in &blocks {
@@ -302,6 +323,40 @@ impl SeriesSource for MemorySeriesSource {
     }
 }
 
+/// Identity is assigned over the immutable stored rows, not the selected
+/// labels: selections may have different label-name unions and row indices.
+fn add_ids(batch: &RecordBatch, id: SeriesIdEncoding) -> Result<RecordBatch> {
+    let values = (0..batch.num_rows()).map(|i| u64::MAX - i as u64);
+    let (ty, column): (DataType, ArrayRef) = match id {
+        SeriesIdEncoding::UInt64 => (
+            DataType::UInt64,
+            Arc::new(UInt64Array::from(values.collect::<Vec<_>>())),
+        ),
+        SeriesIdEncoding::FixedSizeBinary => {
+            let bytes = values.map(|id| {
+                let mut bytes = [0xA5; 16];
+                bytes[8..].copy_from_slice(&id.to_be_bytes());
+                Some(bytes)
+            });
+            (
+                DataType::FixedSizeBinary(16),
+                Arc::new(FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                    bytes, 16,
+                )?),
+            )
+        }
+    };
+    let mut fields = batch.schema().fields().to_vec();
+    fields.push(Arc::new(Field::new(SERIES_ID, ty, false)));
+    let schema = Arc::new(Schema::new_with_metadata(
+        fields,
+        batch.schema().metadata().clone(),
+    ));
+    let mut columns = batch.columns().to_vec();
+    columns.push(column);
+    Ok(RecordBatch::try_new(schema, columns)?)
+}
+
 /// Carry a series error out of `select` as an engine error, which
 /// `EngineError::from` takes back out of DataFusion with its cause intact.
 /// `DataFusionError::Execution` would flatten it to text first.
@@ -309,10 +364,8 @@ fn external(e: SeriesError) -> DataFusionError {
     DataFusionError::External(Box::new(EngineError::from(e)))
 }
 
-/// `batch`'s rows in struct order of their labels, the order DataFusion
-/// compares `labels` in, which is what `SeriesSetExec` declares and
-/// checks. It differs from the `(name, value)` order the rows may have
-/// been merged in, so it cannot be skipped for series that "look" sorted.
+/// Use struct order to make reference IDs deterministic. This is a storage
+/// choice, not ordering advertised to the outer optimizer.
 fn sort_by_labels(batch: &RecordBatch) -> std::result::Result<RecordBatch, ArrowError> {
     let labels = batch.column_by_name(LABELS).expect("canonical");
     let converter = RowConverter::new(vec![SortField::new(labels.data_type().clone())])?;
@@ -402,7 +455,6 @@ fn split_into_chunks(
     chunk_ms: i64,
     rows_per_batch: usize,
 ) -> Result<Vec<RecordBatch>> {
-    let labels = batch.column_by_name(LABELS).expect("canonical");
     let samples = batch
         .column_by_name(SAMPLES)
         .expect("canonical")
@@ -449,22 +501,21 @@ fn split_into_chunks(
             None,
         );
         let indices = UInt32Array::from(rows.to_vec());
-        let column = |name: &str| {
-            take(
-                batch.column_by_name(name).expect("canonical"),
-                &indices,
-                None,
-            )
-        };
-        out.push(RecordBatch::try_new(
-            batch.schema(),
-            vec![
-                take(labels, &indices, None)?,
-                Arc::new(list),
-                column(BLOCK_START)?,
-                column(BLOCK_END)?,
-            ],
-        )?);
+        let samples: ArrayRef = Arc::new(list);
+        let columns = batch
+            .schema()
+            .fields()
+            .iter()
+            .zip(batch.columns())
+            .map(|(field, column)| {
+                if field.name() == SAMPLES {
+                    Ok(Arc::clone(&samples))
+                } else {
+                    take(column, &indices, None)
+                }
+            })
+            .collect::<std::result::Result<Vec<_>, ArrowError>>()?;
+        out.push(RecordBatch::try_new(batch.schema(), columns)?);
     }
     Ok(out)
 }
@@ -481,7 +532,7 @@ mod tests {
     fn nz64(n: u64) -> NonZeroU64 {
         NonZeroU64::new(n).expect("a span of at least a millisecond")
     }
-    use datafusion::physical_plan::{collect, ExecutionPlanProperties};
+    use datafusion::physical_plan::{collect, ExecutionPlan, ExecutionPlanProperties};
     use datafusion::prelude::SessionContext;
     use promql_parser::ast::MatchOp;
     use promql_parser::posrange::PositionRange;
@@ -535,6 +586,254 @@ mod tests {
         assert!(err.to_string().contains(r#"__name__="up""#), "{err}");
     }
 
+    fn row_id(batch: &RecordBatch, row: usize) -> Vec<u8> {
+        let column = batch.column_by_name(SERIES_ID).expect("source identity");
+        match column.data_type() {
+            DataType::UInt64 => column
+                .as_primitive::<datafusion::arrow::datatypes::UInt64Type>()
+                .value(row)
+                .to_be_bytes()
+                .to_vec(),
+            DataType::FixedSizeBinary(_) => column
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .unwrap()
+                .value(row)
+                .to_vec(),
+            other => panic!("unexpected ID type {other}"),
+        }
+    }
+
+    #[test]
+    fn chunking_preserves_all_non_sample_columns_and_metadata() {
+        let original = source().batch;
+        let mut fields = original.schema().fields().to_vec();
+        fields.push(Arc::new(
+            Field::new("store_column", DataType::UInt64, false)
+                .with_metadata(HashMap::from([("store".into(), "opaque".into())])),
+        ));
+        let schema = Arc::new(Schema::new_with_metadata(
+            fields,
+            HashMap::from([("selection".into(), "metadata".into())]),
+        ));
+        let mut columns = original.columns().to_vec();
+        columns.push(Arc::new(UInt64Array::from(vec![13, 29, 41])));
+        let batch = RecordBatch::try_new(schema, columns).unwrap();
+        let chunks = split_into_chunks(&batch, 0, 2).unwrap();
+        let expected = batch
+            .column_by_name("store_column")
+            .unwrap()
+            .as_primitive::<datafusion::arrow::datatypes::UInt64Type>();
+        let mut actual = Vec::new();
+        for chunk in chunks {
+            assert_eq!(chunk.schema(), batch.schema());
+            let samples = chunk.column_by_name(SAMPLES).unwrap().as_list::<i32>();
+            assert!(samples.value_offsets().windows(2).all(|w| w[1] - w[0] == 1));
+            actual.extend_from_slice(
+                chunk
+                    .column_by_name("store_column")
+                    .unwrap()
+                    .as_primitive::<datafusion::arrow::datatypes::UInt64Type>()
+                    .values(),
+            );
+        }
+        let samples = batch.column_by_name(SAMPLES).unwrap().as_list::<i32>();
+        let expected: Vec<_> = (0..batch.num_rows())
+            .flat_map(|row| {
+                std::iter::repeat_n(expected.value(row), samples.value_length(row) as usize)
+            })
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn identity_is_stable_across_matchers_and_grouping_hints() {
+        let ctx = SessionContext::new();
+        for encoding in [SeriesIdEncoding::UInt64, SeriesIdEncoding::FixedSizeBinary] {
+            let src = source().with_ids(encoding);
+            let all = collect(
+                src.select(&ctx.state(), &[], SelectHints::range(0, 90_000))
+                    .await
+                    .unwrap(),
+                ctx.task_ctx(),
+            )
+            .await
+            .unwrap();
+            let all_ids: HashMap<String, Vec<u8>> = all
+                .iter()
+                .flat_map(|batch| {
+                    let labels = batch.column_by_name(LABELS).unwrap().as_struct();
+                    (0..batch.num_rows()).map(move |row| {
+                        (
+                            labels
+                                .column_by_name("pod")
+                                .unwrap()
+                                .as_string_view()
+                                .value(row)
+                                .to_string(),
+                            row_id(batch, row),
+                        )
+                    })
+                })
+                .collect();
+            // A narrower label-name union must not change identity. Advisory
+            // grouping also leaves the selected series' full labels intact.
+            let narrow = collect(
+                src.select(
+                    &ctx.state(),
+                    &[matcher("pod", MatchOp::Equal, "envoy-1")],
+                    SelectHints::range(0, 90_000)
+                        .with_grouping(crate::source::Grouping::new(vec![], true)),
+                )
+                .await
+                .unwrap(),
+                ctx.task_ctx(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                crate::series::label_names(&narrow[0].schema()),
+                ["__name__", "pod"]
+            );
+            assert_eq!(row_id(&narrow[0], 0), all_ids["envoy-1"]);
+            assert_eq!(
+                crate::series::decode(&narrow).unwrap()[0].label("pod"),
+                "envoy-1"
+            );
+            assert_eq!(
+                crate::series::decode(&narrow).unwrap()[0].label("__name__"),
+                "http_requests_total"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn chunks_stay_contiguous_across_batches_blocks_and_partitions() {
+        let ctx = SessionContext::new();
+        let many: Vec<Series> = (0..32)
+            .map(|i| {
+                counter(
+                    &[("__name__", "x"), ("pod", &format!("p{i:02}"))],
+                    0.0,
+                    1.0,
+                    10,
+                )
+            })
+            .collect();
+        for encoding in [SeriesIdEncoding::UInt64, SeriesIdEncoding::FixedSizeBinary] {
+            let src = MemorySeriesSource::try_new(many.clone())
+                .unwrap()
+                .with_ids(encoding)
+                .chunked(0)
+                .blocks(nz64(120_000))
+                .partitions(nz(4))
+                .rows_per_batch(nz(3));
+            let plan = src
+                .select(
+                    &ctx.state(),
+                    &[],
+                    SelectHints::range(0, 270_000).with_window_ms(30_000),
+                )
+                .await
+                .unwrap();
+            crate::series::validate(&plan.schema()).unwrap();
+            assert_eq!(plan.output_partitioning().partition_count(), 4);
+            let mut owners = HashMap::new();
+            let mut identities = HashMap::new();
+            for partition in 0..4 {
+                let batches = datafusion::physical_plan::common::collect(
+                    plan.execute(partition, ctx.task_ctx()).unwrap(),
+                )
+                .await
+                .unwrap();
+                assert!(batches.iter().all(|b| b.num_rows() <= 3));
+                let mut chunks: BTreeMap<(i64, Vec<u8>), Vec<i64>> = BTreeMap::new();
+                let mut sequences: BTreeMap<i64, Vec<Vec<u8>>> = BTreeMap::new();
+                let mut previous_block = None;
+                for batch in &batches {
+                    let series = crate::series::decode(std::slice::from_ref(batch)).unwrap();
+                    assert_eq!(series.len(), batch.num_rows());
+                    for (row, series) in series.iter().enumerate() {
+                        let id = row_id(batch, row);
+                        let block = crate::series::block_of(batch, row);
+                        assert!(previous_block.is_none_or(|prev| prev <= block.start_ms));
+                        previous_block = Some(block.start_ms);
+                        let labels = series
+                            .labels()
+                            .map(|(n, v)| (n.to_string(), v.to_string()))
+                            .collect::<Vec<_>>();
+                        if let Some(previous) = owners.insert(id.clone(), partition) {
+                            assert_eq!(previous, partition, "one ID crossed partitions");
+                        }
+                        if let Some(previous) = identities.insert(id.clone(), labels.clone()) {
+                            assert_eq!(previous, labels, "one ID changed its full label set");
+                        }
+                        assert_eq!(series.timestamps().len(), 1);
+                        chunks
+                            .entry((block.start_ms, id.clone()))
+                            .or_default()
+                            .extend_from_slice(series.timestamps());
+                        sequences.entry(block.start_ms).or_default().push(id);
+                    }
+                }
+                assert_eq!(
+                    sequences.keys().copied().collect::<Vec<_>>(),
+                    [30_000, 120_000, 240_000]
+                );
+                for sequence in sequences.values() {
+                    assert!(sequence.windows(2).any(|w| w[0] != w[1]));
+                    let mut runs = sequence.clone();
+                    runs.dedup();
+                    let unique = runs.iter().collect::<std::collections::HashSet<_>>();
+                    assert_eq!(runs.len(), unique.len(), "an ID resumed after another ID");
+                    assert!(sequence.windows(2).any(|w| w[0] == w[1]));
+                }
+                for ((start, _), timestamps) in chunks {
+                    let expected: &[i64] = match start {
+                        30_000 => &[0, 30_000, 60_000, 90_000],
+                        120_000 => &[90_000, 120_000, 150_000, 180_000, 210_000],
+                        240_000 => &[210_000, 240_000, 270_000],
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(timestamps, expected, "chunk chronology/reach-back changed");
+                }
+            }
+            assert_eq!(owners.len(), 32);
+            assert_eq!(identities.len(), 32);
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_selections_keep_the_five_column_schema() {
+        let ctx = SessionContext::new();
+        for encoding in [SeriesIdEncoding::UInt64, SeriesIdEncoding::FixedSizeBinary] {
+            for chunk_ms in [None, Some(0)] {
+                let mut src = source()
+                    .with_ids(encoding)
+                    .blocks(nz64(120_000))
+                    .partitions(nz(2));
+                src.chunk_ms = chunk_ms;
+                for hints in [SelectHints::range(0, 100_000), SelectHints::range(10, 0)] {
+                    let plan = src
+                        .select(
+                            &ctx.state(),
+                            &[matcher("pod", MatchOp::Equal, "missing")],
+                            hints,
+                        )
+                        .await
+                        .unwrap();
+                    crate::series::validate(&plan.schema()).unwrap();
+                    assert_eq!(plan.schema().fields().len(), 5);
+                    assert!(collect(plan, ctx.task_ctx())
+                        .await
+                        .unwrap()
+                        .iter()
+                        .all(|batch| batch.num_rows() == 0));
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn selects_by_matchers_and_clips_the_range() {
         let ctx = SessionContext::new();
@@ -546,6 +845,7 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(plan.schema().field(4).data_type(), &DataType::UInt64);
         crate::series::validate(&plan.schema()).unwrap();
         let batches = collect(plan, ctx.task_ctx()).await.unwrap();
         let decoded = crate::series::decode(&batches).unwrap();
@@ -672,8 +972,8 @@ mod tests {
             .collect()
     }
 
-    /// The store's order is DataFusion's struct order, the one
-    /// `SeriesSetExec` declares: `{b="1"}` is `("", "1")` and precedes
+    /// Reference IDs use deterministic struct order: `{b="1"}` is
+    /// `("", "1")` and precedes
     /// `{a="1"}`, `("1", "")`, although Prometheus sorts them the other
     /// way round and `from_descriptions` merges them in that order.
     #[tokio::test]

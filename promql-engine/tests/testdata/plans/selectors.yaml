@@ -8,8 +8,8 @@ defaults:
 tests:
   - name: instant selector
     description: >
-      The selector is an aggregate grouped by the whole labels struct, so
-      a label set split over several chunks is one group. The labels pass
+      The selector evaluates each complete series across its chunks. Its
+      contiguous fold finishes at each series-ID transition. The labels pass
       through untouched: an instant selector keeps every label it was
       given, __name__ included.
     load:
@@ -19,21 +19,20 @@ tests:
       http_requests_total{job="api"}
     plan: |
       Projection: labels, samples, block_start, block_end
-        Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+        SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
           TableScan: http_requests_total{job="api"}
     physical: |
-      ProjectionExec: expr=[labels@2, samples@3, block_start@0, block_end@1]
-        AggregateExec: mode=SinglePartitioned, gby=[block_start@2, block_end@3, labels@0], aggr=[vector_selector(samples@1, 600000..1200000 step 30s, lookback 5m)], ordering_mode=Sorted
-          SeriesSetExec: http_requests_total{job="api"} 300000..1200000 window=5m step=30s, partitioning=Hash([labels@0], 1)
-            DataSourceExec: partitions=1, partition_sizes=[1]
+      SeriesEvalExec: kernel=Selector(Value), grid=Params { start_ms: 600000, end_ms: 1200000, step_ms: 30000, window_ms: 300000, offset_ms: 0, at_ms: None }
+        SeriesSetExec: http_requests_total{job="api"} 300000..1200000 window=5m step=30s, partitioning=UnknownPartitioning(1)
+          DataSourceExec: partitions=1, partition_sizes=[1]
 
   - name: instant selector over chunks
     description: >
       The store hands each label set over as several chunks, each its own
       batch, which only the physical plan shows as the number of batches
       under SeriesSetExec. The logical plan is the whole-series case's: a
-      label set split over chunks is still one group of the Sorted
-      aggregate.
+      identity split over chunks is still one current series of the
+      contiguous fold.
     chunked_ms: 150000
     load:
       - x{pod="a"} 1+1x19
@@ -42,13 +41,12 @@ tests:
       x
     plan: |
       Projection: labels, samples, block_start, block_end
-        Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+        SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
           TableScan: x
     physical: |
-      ProjectionExec: expr=[labels@2, samples@3, block_start@0, block_end@1]
-        AggregateExec: mode=SinglePartitioned, gby=[block_start@2, block_end@3, labels@0], aggr=[vector_selector(samples@1, 600000..1200000 step 30s, lookback 5m)], ordering_mode=Sorted
-          SeriesSetExec: x 300000..1200000 window=5m step=30s, partitioning=Hash([labels@0], 1)
-            DataSourceExec: partitions=1, partition_sizes=[4]
+      SeriesEvalExec: kernel=Selector(Value), grid=Params { start_ms: 600000, end_ms: 1200000, step_ms: 30000, window_ms: 300000, offset_ms: 0, at_ms: None }
+        SeriesSetExec: x 300000..1200000 window=5m step=30s, partitioning=UnknownPartitioning(1)
+          DataSourceExec: partitions=1, partition_sizes=[4]
 
   - name: instant selector over blocks and chunks
     description: >
@@ -57,7 +55,7 @@ tests:
       chunks: the data ends at 570s, so the first block, reaching back
       from 600s by the lookback, holds two chunks per series, the second
       one, and the two after it nothing. The plan is the one-block
-      case's: the block is a group key the store fills, and the number of
+      case's: the block boundary closes the current series, and the number of
       batches is all that grows.
     chunked_ms: 150000
     blocks_ms: 200000
@@ -68,18 +66,17 @@ tests:
       x
     plan: |
       Projection: labels, samples, block_start, block_end
-        Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+        SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
           TableScan: x
     physical: |
-      ProjectionExec: expr=[labels@2, samples@3, block_start@0, block_end@1]
-        AggregateExec: mode=SinglePartitioned, gby=[block_start@2, block_end@3, labels@0], aggr=[vector_selector(samples@1, 600000..1200000 step 30s, lookback 5m)], ordering_mode=Sorted
-          SeriesSetExec: x 300000..1200000 window=5m step=30s, partitioning=Hash([labels@0], 1)
-            DataSourceExec: partitions=1, partition_sizes=[6]
+      SeriesEvalExec: kernel=Selector(Value), grid=Params { start_ms: 600000, end_ms: 1200000, step_ms: 30000, window_ms: 300000, offset_ms: 0, at_ms: None }
+        SeriesSetExec: x 300000..1200000 window=5m step=30s, partitioning=UnknownPartitioning(1)
+          DataSourceExec: partitions=1, partition_sizes=[6]
 
   - name: range function with an offset
     description: >
-      The offset is a literal argument of the aggregate, in the slot an @
-      fills too, so the shape does not change with either modifier.
+      The offset and @ modifier live in the evaluation parameters, so
+      the shape does not change with either modifier.
     load:
       - http_requests_total{job="api", pod="api-1"} 0
       - http_requests_total{job="web", pod="web-1"} 0
@@ -87,5 +84,5 @@ tests:
       rate(http_requests_total[5m] offset 5m)
     plan: |
       Projection: labels{job, pod}
-        Aggregate: rate(samples[5m] offset 5m, 600000..1200000 step 30s) per series per block
+        SeriesEval: rate(samples[5m] offset 5m, 600000..1200000 step 30s) per series per block
           TableScan: http_requests_total

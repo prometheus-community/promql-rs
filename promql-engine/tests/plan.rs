@@ -47,7 +47,7 @@
 //!
 //! `chunked_ms` and `partitions` run a case over
 //! [`MemorySeriesSource::chunked`] and [`MemorySeriesSource::partitions`],
-//! the store shapes the Sorted selector exists for.
+//! the ID-contiguous store shapes the evaluator consumes.
 //!
 //! # Why the series are per case
 //!
@@ -82,29 +82,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use datafusion::catalog::Session;
-use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{JoinType, NullEquality};
-use datafusion::datasource::memory::MemorySourceConfig;
-use datafusion::physical_expr::expressions::{lit, Column, UnKnownColumn};
-use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
-use datafusion::physical_plan::aggregates::AggregateExec;
-use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion::physical_plan::filter::FilterExec;
-use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
-use datafusion::physical_plan::projection::ProjectionExec;
-use datafusion::physical_plan::repartition::RepartitionExec;
-use datafusion::physical_plan::sorts::sort::SortExec;
-use datafusion::physical_plan::union::{InterleaveExec, UnionExec};
-use datafusion::physical_plan::{displayable, ExecutionPlan, InputOrderMode, Partitioning};
-use promql_engine::check_selector_plans;
-use promql_engine::series::{encode, label_names_of, Block};
-use promql_engine::{
-    range, selector, Engine, EngineError, EngineOptions, MemorySeriesSource, RangeQuery,
-    SelectHints, Series, SeriesSource,
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::{LexOrdering, OrderingRequirements, PhysicalSortExpr};
+use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
+use datafusion::physical_plan::{
+    displayable, Distribution, ExecutionPlan, ExecutionPlanProperties, Partitioning,
 };
-use promql_parser::ast::LabelMatcher;
+use promql_engine::{Engine, EngineOptions, MemorySeriesSource, RangeQuery, SeriesSource};
 use serde::Deserialize;
 use std::num::{NonZeroU64, NonZeroUsize};
 
@@ -229,8 +213,10 @@ fn plan_of(case: &Case, defaults: Bounds) -> (String, Option<String>) {
     // what the engine runs.
     let physical = case.physical.as_ref().map(|_| {
         let exec = rt
-            .block_on(engine.physical_plan_async(&source, query, range))
-            .expect("the plan lowers");
+            .block_on(engine.prepare_async(&source, query, range))
+            .expect("the plan lowers")
+            .physical_plan()
+            .clone();
         let rendered = promql_engine::explain_physical_plan(exec.as_ref());
         // A shuffle above the selector is as wide as the session's
         // target_partitions, DataFusion's default of one per core.
@@ -322,26 +308,13 @@ plan_files!(
     selectors
 );
 
-// The physical plan decides what the logical plan cannot: whether the
-// selector aggregate holds one open series per partition (Sorted) or every
-// series of the scan (Linear). The rest of this file checks that choice
-// directly rather than as text, because partition counts and the upper
-// aggregate's split make the larger plans too fragile to pin.
-
-/// Every selector and range-function aggregate in `plan`, Partial and Final
-/// alike.
-fn selector_aggregates(plan: &Arc<dyn ExecutionPlan>) -> Vec<&AggregateExec> {
+// Source ID contiguity is not a native hash or label-ordering guarantee.
+fn series_evaluations(plan: &Arc<dyn ExecutionPlan>) -> Vec<&Arc<dyn ExecutionPlan>> {
     let mut found = Vec::new();
     let mut stack = vec![plan];
     while let Some(node) = stack.pop() {
-        if let Some(agg) = node.downcast_ref::<AggregateExec>() {
-            if agg
-                .aggr_expr()
-                .iter()
-                .any(|e| [selector::NAME, range::NAME].contains(&e.fun().name()))
-            {
-                found.push(agg);
-            }
+        if node.name() == "SeriesEvalExec" {
+            found.push(node);
         }
         stack.extend(node.children());
     }
@@ -359,16 +332,18 @@ fn physical_plan(source: &dyn SeriesSource, query: &str) -> Arc<dyn ExecutionPla
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
-    rt.block_on(Engine::new().physical_plan_async(
+    rt.block_on(Engine::new().prepare_async(
         source,
         query,
         &RangeQuery::new(300_000, 600_000, 30_000),
     ))
     .unwrap_or_else(|e| panic!("{query}: {e}"))
+    .physical_plan()
+    .clone()
 }
 
 #[test]
-fn the_selector_aggregate_runs_sorted_at_one_and_four_partitions() {
+fn series_evaluation_preserves_store_width_without_a_hash_requirement() {
     for n in [1, 4] {
         let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0)
             .chunked(150_000)
@@ -376,307 +351,94 @@ fn the_selector_aggregate_runs_sorted_at_one_and_four_partitions() {
         for query in ["x", "rate(x[5m])", "sum by (pod) (rate(x[5m]))"] {
             let plan = physical_plan(&source, query);
             let shown = displayable(plan.as_ref()).indent(true).to_string();
-            let aggregates = selector_aggregates(&plan);
-            assert!(
-                !aggregates.is_empty(),
-                "{query} at {n} partitions has no selector aggregate:\n{shown}"
-            );
-            for agg in aggregates {
+            let evaluations = series_evaluations(&plan);
+            assert_eq!(evaluations.len(), 1, "{shown}");
+            for eval in evaluations {
+                assert!(
+                    matches!(
+                        eval.output_partitioning(),
+                        Partitioning::UnknownPartitioning(width) if *width == n
+                    ),
+                    "{shown}"
+                );
+                assert!(matches!(
+                    eval.input_distribution_requirements()
+                        .into_per_child()
+                        .as_slice(),
+                    [Distribution::UnspecifiedDistribution]
+                ));
+                assert_eq!(eval.benefits_from_input_partitioning(), [false]);
+                assert!(eval.equivalence_properties().constraints().is_empty());
+                assert_eq!(eval.children().len(), 1);
+                assert!(eval.children()[0].downcast_ref::<AggregateExec>().is_none());
+                let input = eval.children()[0];
+                assert!(
+                    matches!(
+                        input.output_partitioning(),
+                        Partitioning::UnknownPartitioning(width) if *width == n
+                    ),
+                    "{shown}"
+                );
+                let ordering = ["block_start"].map(|name| {
+                    PhysicalSortExpr::new_default(Arc::new(
+                        Column::new_with_schema(name, &input.schema()).unwrap(),
+                    ))
+                });
+                assert!(
+                    input
+                        .equivalence_properties()
+                        .ordering_satisfy(ordering.clone())
+                        .unwrap(),
+                    "{shown}"
+                );
                 assert_eq!(
-                    agg.input_order_mode(),
-                    &InputOrderMode::Sorted,
-                    "{query} at {n} partitions, {:?} aggregate:\n{shown}",
-                    agg.mode(),
+                    eval.required_input_ordering(),
+                    [Some(OrderingRequirements::from(
+                        LexOrdering::new(ordering).unwrap()
+                    ))],
+                    "{shown}"
                 );
             }
         }
     }
 }
 
-/// `plan` with `wrap` applied to the input of every selector aggregate,
-/// the aggregate rebuilt over it so it re-derives its input order.
-fn under_the_selector(
-    plan: Arc<dyn ExecutionPlan>,
-    wrap: impl Fn(Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan>,
-) -> Arc<dyn ExecutionPlan> {
-    plan.transform_up(|node| {
-        let is_selector = node.downcast_ref::<AggregateExec>().is_some_and(|agg| {
-            agg.aggr_expr()
-                .iter()
-                .any(|e| e.fun().name() == selector::NAME)
-        });
-        if !is_selector {
-            return Ok(Transformed::no(node));
-        }
-        let input = wrap(Arc::clone(node.children()[0]));
-        Ok(Transformed::yes(node.with_new_children(vec![input])?))
-    })
-    .expect("the plan rebuilds")
-    .data
-}
-
+/// An upper grouping must establish its own DataFusion distribution;
+/// arbitrary store partitioning is not a grouping hash.
 #[test]
-fn the_engine_accepts_its_own_plans() {
-    for n in [1, 4] {
-        let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0).partitions(nz(n));
-        for query in ["x", "rate(x[5m])", "sum(x)"] {
-            let plan = physical_plan(&source, query);
-            check_selector_plans(&plan).unwrap_or_else(|e| {
-                panic!(
-                    "{query} at {n} partitions: {e}\n{}",
-                    displayable(plan.as_ref()).indent(true)
-                )
-            });
-        }
-    }
-}
-
-#[test]
-fn a_repartition_under_the_selector_is_refused() {
-    let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0);
-    let plan = under_the_selector(physical_plan(&source, "x"), |input| {
-        Arc::new(RepartitionExec::try_new(input, Partitioning::RoundRobinBatch(4)).unwrap())
-    });
-    let shown = displayable(plan.as_ref()).indent(true).to_string();
-    match check_selector_plans(&plan) {
-        Err(EngineError::Query(_)) => {}
-        other => panic!("expected the plan refused, got {other:?}:\n{shown}"),
-    }
-}
-
-/// `sort_to_indices` has no Struct arm, so this plan would fail inside
-/// Arrow at execution; refusing it names the cause instead.
-#[test]
-fn a_sort_on_labels_under_the_selector_is_refused() {
-    let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0);
-    let plan = under_the_selector(physical_plan(&source, "x"), |input| {
-        let labels = Column::new_with_schema("labels", &input.schema()).unwrap();
-        let ordering = LexOrdering::new([PhysicalSortExpr::new_default(Arc::new(labels))]).unwrap();
-        Arc::new(SortExec::new(ordering, input))
-    });
-    let shown = displayable(plan.as_ref()).indent(true).to_string();
-    match check_selector_plans(&plan) {
-        Err(EngineError::Query(_)) => {}
-        other => panic!("expected the plan refused, got {other:?}:\n{shown}"),
-    }
-}
-
-/// A store emitting Prometheus's `labels.Compare` order rather than struct
-/// order: `{a="1"}` before `{b="1"}`, where struct order compares the `a`
-/// column first and puts `("", "1")` ahead of `("1", "")`.
-#[derive(Debug)]
-struct PrometheusOrdered;
-
-#[async_trait]
-impl SeriesSource for PrometheusOrdered {
-    async fn select(
-        &self,
-        _state: &dyn Session,
-        _matchers: &[LabelMatcher],
-        hints: SelectHints,
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let series = vec![
-            Series::new(&[("__name__", "x"), ("a", "1")], vec![300_000], vec![1.0]).unwrap(),
-            Series::new(&[("__name__", "x"), ("b", "1")], vec![300_000], vec![2.0]).unwrap(),
-        ];
-        let block = Block {
-            start_ms: hints.start_ms + hints.window_ms,
-            end_ms: hints.end_ms + 1,
-        };
-        let batch = encode(&label_names_of(&series), &series, block).unwrap();
-        let schema = batch.schema();
-        Ok(MemorySourceConfig::try_new_exec(
-            &[vec![batch]],
-            schema,
-            None,
-        )?)
-    }
-}
-
-#[test]
-fn prometheus_ordered_input_is_rejected() {
-    let engine = Engine::new();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
-    let result = rt.block_on(engine.range_query_async(
-        &PrometheusOrdered,
-        "x",
-        &RangeQuery::new(300_000, 300_000, 30_000),
-    ));
-    match result {
-        Err(EngineError::Source(_)) => {}
-        other => panic!("expected a source order error, got {other:?}"),
-    }
-}
-
-/// Hash(labels) from SeriesSetExec must not survive the projection that
-/// computes the group key above the range function: the key is a new
-/// expression, and an upper aggregate that believed its input already
-/// hash-partitioned by it would skip the shuffle and answer a group once
-/// per store partition.
-#[test]
-fn the_label_projection_drops_the_hash_partitioning() {
+fn upper_grouping_establishes_its_own_distribution() {
     let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0)
         .chunked(150_000)
         .partitions(nz(4));
     let plan = physical_plan(&source, "sum by (pod) (rate(x[5m]))");
     let shown = displayable(plan.as_ref()).indent(true).to_string();
-    // The ProjectionExec that feeds the upper Partial, right above the
-    // range function's aggregate.
-    let mut node = &plan;
-    while !node.children()[0]
-        .downcast_ref::<AggregateExec>()
-        .is_some_and(|agg| {
-            agg.aggr_expr()
+    assert_eq!(series_evaluations(&plan).len(), 1, "{shown}");
+    let mut stack = vec![&plan];
+    let mut checked = false;
+    while let Some(node) = stack.pop() {
+        if let Some(aggregate) = node.downcast_ref::<AggregateExec>() {
+            if matches!(
+                aggregate.mode(),
+                AggregateMode::Partial | AggregateMode::Single | AggregateMode::SinglePartitioned
+            ) && aggregate
+                .aggr_expr()
                 .iter()
-                .any(|e| e.fun().name() == range::NAME)
-        })
-    {
-        node = node.children()[0];
+                .any(|expr| expr.fun().name() == promql_engine::aggregate::NAME)
+            {
+                assert!(
+                    matches!(
+                        aggregate.input().output_partitioning(),
+                        Partitioning::UnknownPartitioning(_)
+                    ),
+                    "the source invented a hash before upper grouping:\n{shown}"
+                );
+                checked = true;
+            }
+        }
+        stack.extend(node.children());
     }
-    let projection = node;
-    assert!(projection.is::<ProjectionExec>(), "{shown}");
-    assert_eq!(
-        projection.children()[0]
-            .properties()
-            .partitioning
-            .to_string(),
-        "Hash([labels@2], 4)",
-        "{shown}"
-    );
-    // It still prints as Hash([labels@2], 4): Partitioning::project turns an
-    // expression the projection does not carry into an UnKnownColumn named
-    // after it. That placeholder equals nothing, itself included, so nothing
-    // above can find a requirement satisfied by it.
-    let Partitioning::Hash(exprs, 4) = &projection.properties().partitioning else {
-        panic!("{shown}");
-    };
-    assert!(exprs[0].is::<UnKnownColumn>(), "{exprs:?}\n{shown}");
-}
-
-/// `x` joined with itself partition by partition: the planner cannot
-/// produce this yet, binary operators are unsupported, but nothing stops
-/// DataFusion from trusting SeriesSetExec's Hash(labels) once they are.
-/// A hash repartition on each side replaces that trust with DataFusion's
-/// own hash, and is accepted.
-#[test]
-fn a_partitioned_join_over_the_store_partitioning_is_refused() {
-    let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0).partitions(nz(4));
-    let join = |wrap: &dyn Fn(Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan>| {
-        let (left, right) = (
-            wrap(physical_plan(&source, "x")),
-            wrap(physical_plan(&source, "x")),
-        );
-        let on = vec![(
-            Arc::new(Column::new_with_schema("labels", &left.schema()).unwrap()) as _,
-            Arc::new(Column::new_with_schema("labels", &right.schema()).unwrap()) as _,
-        )];
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(
-            HashJoinExec::try_new(
-                left,
-                right,
-                on,
-                None,
-                &JoinType::Inner,
-                None,
-                PartitionMode::Partitioned,
-                NullEquality::NullEqualsNothing,
-                false,
-            )
-            .unwrap(),
-        );
-        plan
-    };
-    let trusted = join(&|input| input);
-    let shown = displayable(trusted.as_ref()).indent(true).to_string();
-    match check_selector_plans(&trusted) {
-        Err(EngineError::Query(_)) => {}
-        other => panic!("expected the plan refused, got {other:?}:\n{shown}"),
-    }
-    let rehashed = join(&|input| {
-        let labels = Arc::new(Column::new_with_schema("labels", &input.schema()).unwrap());
-        Arc::new(RepartitionExec::try_new(input, Partitioning::Hash(vec![labels], 4)).unwrap())
-    });
-    check_selector_plans(&rehashed).unwrap_or_else(|e| panic!("{e}"));
-}
-
-/// `x or x` partition by partition: DataFusion turns a `UnionExec` into an
-/// `InterleaveExec` whenever every child declares the same partitioning
-/// (`enforce_distribution.rs:1458-1485`, `union.rs:664-676`), and two
-/// selectors over the same store both declare `Hash([labels], n)`. The
-/// interleave would then zip partition i of one scan with partition i of
-/// the other, handing a Sorted consumer above it the same label set twice.
-#[test]
-fn an_interleave_over_the_store_partitioning_is_refused() {
-    let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0).partitions(nz(4));
-    let inputs = vec![physical_plan(&source, "x"), physical_plan(&source, "x")];
-    let plan: Arc<dyn ExecutionPlan> = Arc::new(InterleaveExec::try_new(inputs).unwrap());
-    let shown = displayable(plan.as_ref()).indent(true).to_string();
-    match check_selector_plans(&plan) {
-        Err(EngineError::Query(_)) => {}
-        other => panic!("expected the plan refused, got {other:?}:\n{shown}"),
-    }
-}
-
-/// A plain `UnionExec` does not pair partitions by index — each child keeps
-/// contributing its own partitions — so coalescing both children first,
-/// which DataFusion cannot interleave because it no longer sees a shared
-/// Hash partitioning, must stay accepted.
-#[test]
-fn a_union_over_coalesced_children_is_accepted() {
-    let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0).partitions(nz(4));
-    let inputs = vec![
-        Arc::new(CoalescePartitionsExec::new(physical_plan(&source, "x")))
-            as Arc<dyn ExecutionPlan>,
-        Arc::new(CoalescePartitionsExec::new(physical_plan(&source, "x")))
-            as Arc<dyn ExecutionPlan>,
-    ];
-    let plan = UnionExec::try_new(inputs).unwrap();
     assert!(
-        plan.is::<UnionExec>(),
-        "{}",
-        displayable(plan.as_ref()).indent(true)
+        checked,
+        "no first-stage upper aggregation was checked:\n{shown}"
     );
-    check_selector_plans(&plan).unwrap_or_else(|e| panic!("{e}"));
-}
-
-/// `x` joined with itself, partitioned, with a `FilterExec` between each
-/// side and the selector: `FilterExec` reports the same
-/// `output_partitioning()` as its input (`filter.rs`'s
-/// `compute_properties`), so `Hash([labels], n)` reaches the join
-/// unchanged and the join must still be refused.
-#[test]
-fn a_partitioned_join_over_a_filter_over_the_store_partitioning_is_refused() {
-    let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0).partitions(nz(4));
-    let filtered = |input: Arc<dyn ExecutionPlan>| -> Arc<dyn ExecutionPlan> {
-        Arc::new(FilterExec::try_new(lit(true), input).unwrap())
-    };
-    let (left, right) = (
-        filtered(physical_plan(&source, "x")),
-        filtered(physical_plan(&source, "x")),
-    );
-    let on = vec![(
-        Arc::new(Column::new_with_schema("labels", &left.schema()).unwrap()) as _,
-        Arc::new(Column::new_with_schema("labels", &right.schema()).unwrap()) as _,
-    )];
-    let plan: Arc<dyn ExecutionPlan> = Arc::new(
-        HashJoinExec::try_new(
-            left,
-            right,
-            on,
-            None,
-            &JoinType::Inner,
-            None,
-            PartitionMode::Partitioned,
-            NullEquality::NullEqualsNothing,
-            false,
-        )
-        .unwrap(),
-    );
-    let shown = displayable(plan.as_ref()).indent(true).to_string();
-    match check_selector_plans(&plan) {
-        Err(EngineError::Query(_)) => {}
-        other => panic!("expected the plan refused, got {other:?}:\n{shown}"),
-    }
 }

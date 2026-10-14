@@ -1,17 +1,26 @@
 //! Peak heap of one query, which no timing bench or CPU profile shows.
 //!
 //! Every case runs once under a counting global allocator and reports:
-//! what was live before the query (the resident input), the high-water
-//! mark during it minus that (the engine's working set, the result
-//! included when it is kept), what stays live once it returns, and the
-//! result's own size, samples at 16 bytes plus the labels column, so
-//! intermediate state, the result and the result's spare capacity can be
-//! told apart.
+//! what was live before the query (process baseline, including input),
+//! the high-water mark during it minus that (the query's incremental
+//! heap, including source generation and any held result), what stays
+//! live once it returns, and the
+//! logical result payload (sample pairs plus visible label bytes) and unique
+//! retained Arrow backing capacities, so shared slices are not charged as
+//! separate allocations. Headers/schema/Arc overhead is in allocator readings,
+//! not backing capacity. Unknown external capacities are counted separately.
+//! Allocation-call/requested-byte traffic distinguishes repeated small scratch
+//! allocations from peak retention; realloc traffic is not bytes copied.
 //!
 //! `resident/…` cases collect the result as `Engine::range_query` does.
-//! `streamed/…` cases generate the input batch by batch as the plan polls
-//! and drop each output batch once counted, so neither input nor result
-//! is resident and the peak is what evaluation itself holds.
+//! `streamed/…` cases drop each output batch once counted. Most also generate
+//! input as polled, so neither input nor result is resident; the explicitly
+//! documented `streamed/focused/churn_*` controls use resident input to remove
+//! generator traffic. The measured interval includes planning, source-driven
+//! batch generation where applicable, execution and one live output batch,
+//! not just the evaluator. Source construction is outside it. These bytes are
+//! not DataFusion reservations or RSS; reservation checkpoints estimate a
+//! different set of owners.
 //!
 //! ```sh
 //! cargo bench -p promql-engine --bench memory              # every case
@@ -28,20 +37,26 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{AsArray, RecordBatch};
 use datafusion::execution::TaskContext;
+use datafusion::physical_plan::execution_plan::reset_plan_states;
 use datafusion::physical_plan::{execute_stream, ExecutionPlan};
 use futures::StreamExt;
-use promql_engine::series::{LABELS, SAMPLES};
-use promql_engine::{Engine, MemorySeriesSource, RangeQuery, Series, SeriesSource};
+use promql_engine::{
+    Engine, MemorySeriesSource, RangeQuery, Series, SeriesIdEncoding, SeriesSource,
+};
 
 #[path = "support/counting.rs"]
 mod counting;
+#[path = "support/focused.rs"]
+mod focused;
 #[path = "support/generated.rs"]
 mod generated;
+#[path = "support/result_memory.rs"]
+mod result_memory;
 
 use counting::Counting;
-use generated::{Generated, Shape};
+use generated::{ChunkProbe, Generated, Shape};
+use result_memory::logical_bytes;
 
 #[cfg(not(feature = "heap-profile"))]
 #[global_allocator]
@@ -135,9 +150,34 @@ fn memory(series: usize, samples: usize, scrape_ms: i64) -> Arc<dyn SeriesSource
 
 const SELECTOR: &str = "http_requests_total";
 const RATE: &str = "rate(http_requests_total[5m])";
+const TIMESTAMP: &str = "timestamp(http_requests_total)";
+const MIN: &str = "min_over_time(http_requests_total[5m])";
+
+fn contiguous_shape(series: usize, samples: usize) -> Shape {
+    Shape {
+        series,
+        samples,
+        scrape_ms: 15_000,
+        chunk: Some(4),
+        rows_per_batch: 1024,
+    }
+}
+
+/// The latest sample lies in the lookback, but none reaches the evaluation
+/// time: the current ID keeps an unfinished lookup until the next ID or EOF.
+fn one_step_tail() -> RangeQuery {
+    let at = 20 * 15_000;
+    RangeQuery::new(at, at, 30_000)
+}
+
+/// 31 steps with a last window ending 15s after the last input sample,
+/// retaining the current ID's range history/sweep and output until it closes.
+fn range_tail() -> RangeQuery {
+    RangeQuery::new(MINUTE_MS, 64 * 15_000, 30_000)
+}
 
 fn cases() -> Vec<Case> {
-    vec![
+    let mut cases = vec![
         Case {
             name: "resident/30d_1000/one_row/selector",
             query: SELECTOR,
@@ -245,15 +285,196 @@ fn cases() -> Vec<Case> {
             range: days(90, 60 * MINUTE_MS),
             streamed: true,
         },
-    ]
+        Case {
+            name: "streamed/contiguous/uint64/100k/chunk4_x1024/selector_one_step_tail",
+            query: SELECTOR,
+            source: || {
+                Arc::new(Generated::streamed_with_ids(
+                    contiguous_shape(100_000, 20),
+                    SeriesIdEncoding::UInt64,
+                ))
+            },
+            range: one_step_tail(),
+            streamed: true,
+        },
+        Case {
+            name: "streamed/contiguous/binary16/100k/chunk4_x1024/selector_one_step_tail",
+            query: SELECTOR,
+            source: || {
+                Arc::new(Generated::streamed_with_ids(
+                    contiguous_shape(100_000, 20),
+                    SeriesIdEncoding::FixedSizeBinary,
+                ))
+            },
+            range: one_step_tail(),
+            streamed: true,
+        },
+        Case {
+            name: "streamed/contiguous/uint64/100k/chunk4_x1024/timestamp_one_step_tail",
+            query: TIMESTAMP,
+            source: || {
+                Arc::new(Generated::streamed_with_ids(
+                    contiguous_shape(100_000, 20),
+                    SeriesIdEncoding::UInt64,
+                ))
+            },
+            range: one_step_tail(),
+            streamed: true,
+        },
+        Case {
+            name: "streamed/contiguous/binary16/100k/chunk4_x1024/timestamp_one_step_tail",
+            query: TIMESTAMP,
+            source: || {
+                Arc::new(Generated::streamed_with_ids(
+                    contiguous_shape(100_000, 20),
+                    SeriesIdEncoding::FixedSizeBinary,
+                ))
+            },
+            range: one_step_tail(),
+            streamed: true,
+        },
+        Case {
+            name: "streamed/contiguous/uint64/10k/chunk4_x1024/rate_5m_31_steps_tail",
+            query: RATE,
+            source: || {
+                Arc::new(Generated::streamed_with_ids(
+                    contiguous_shape(10_000, 64),
+                    SeriesIdEncoding::UInt64,
+                ))
+            },
+            range: range_tail(),
+            streamed: true,
+        },
+        Case {
+            name: "streamed/contiguous/binary16/10k/chunk4_x1024/rate_5m_31_steps_tail",
+            query: RATE,
+            source: || {
+                Arc::new(Generated::streamed_with_ids(
+                    contiguous_shape(10_000, 64),
+                    SeriesIdEncoding::FixedSizeBinary,
+                ))
+            },
+            range: range_tail(),
+            streamed: true,
+        },
+        Case {
+            name: "streamed/contiguous/uint64/10k/chunk4_x1024/min_5m_31_steps_tail",
+            query: MIN,
+            source: || {
+                Arc::new(Generated::streamed_with_ids(
+                    contiguous_shape(10_000, 64),
+                    SeriesIdEncoding::UInt64,
+                ))
+            },
+            range: range_tail(),
+            streamed: true,
+        },
+        Case {
+            name: "streamed/contiguous/binary16/10k/chunk4_x1024/min_5m_31_steps_tail",
+            query: MIN,
+            source: || {
+                Arc::new(Generated::streamed_with_ids(
+                    contiguous_shape(10_000, 64),
+                    SeriesIdEncoding::FixedSizeBinary,
+                ))
+            },
+            range: range_tail(),
+            streamed: true,
+        },
+    ];
+    cases.extend(focused_cases());
+    cases
 }
 
-/// Samples at 16 bytes each plus the labels column: what any engine must
-/// hand back, whatever it held on the way.
-fn result_bytes(b: &RecordBatch) -> usize {
-    let samples = b.column_by_name(SAMPLES).unwrap().as_list::<i32>();
-    let n = samples.offsets()[b.num_rows()] - samples.offsets()[0];
-    n as usize * 16 + b.column_by_name(LABELS).unwrap().get_array_memory_size()
+fn probe(probe: ChunkProbe) -> Arc<dyn SeriesSource> {
+    Arc::new(
+        Generated::streamed(Shape {
+            series: 4,
+            samples: 131072,
+            scrape_ms: 1000,
+            chunk: None,
+            rows_per_batch: 1,
+        })
+        .chunk_probe(probe),
+    )
+}
+
+fn churn() -> Arc<dyn SeriesSource> {
+    Arc::new(Generated::resident(Shape {
+        series: 8192,
+        samples: 32,
+        scrape_ms: 1000,
+        chunk: Some(4),
+        rows_per_batch: 1024,
+    }))
+}
+
+fn focused_cases() -> Vec<Case> {
+    vec![
+        Case {
+            name: "resident/focused/ordered_wide/16384",
+            query: focused::SELECTOR,
+            source: || focused::wide_source(16384, false, false),
+            range: focused::instant(),
+            streamed: false,
+        },
+        Case {
+            name: "resident/focused/shuffled_wide/16384",
+            query: focused::SELECTOR,
+            source: || focused::wide_source(16384, true, false),
+            range: focused::instant(),
+            streamed: false,
+        },
+        Case {
+            name: "resident/focused/empty_stale_wide/16384",
+            query: focused::SELECTOR,
+            source: || focused::wide_source(16384, true, true),
+            range: focused::instant(),
+            streamed: false,
+        },
+        Case {
+            name: "resident/focused/sparse_sum/4096groups_24blocks",
+            query: focused::SPARSE_SUM,
+            source: || focused::sparse_source(4096, 24),
+            range: focused::sparse_range(24),
+            streamed: false,
+        },
+        Case {
+            name: "streamed/focused/whole/4x131072",
+            query: focused::RATE,
+            source: || probe(ChunkProbe::Whole),
+            range: RangeQuery::new(0, 60_000, 1000),
+            streamed: true,
+        },
+        Case {
+            name: "streamed/focused/second/4x131072",
+            query: focused::RATE,
+            source: || probe(ChunkProbe::Second),
+            range: RangeQuery::new(0, 60_000, 1000),
+            streamed: true,
+        },
+        Case {
+            name: "streamed/focused/stale/4x131072",
+            query: focused::RATE,
+            source: || probe(ChunkProbe::Stale),
+            range: RangeQuery::new(0, 60_000, 1000),
+            streamed: true,
+        },
+        Case {
+            name: "streamed/focused/churn_rate_32steps/8192",
+            query: focused::RATE,
+            source: churn,
+            range: RangeQuery::new(0, 31_000, 1000),
+            streamed: true,
+        },
+        Case {
+            name: "streamed/focused/churn_rate_one_step/8192",
+            query: focused::RATE,
+            source: churn,
+            range: RangeQuery::new(31_000, 31_000, 1000),
+            streamed: true,
+        },
+    ]
 }
 
 /// The plan `Engine::range_query_async` runs, to stream instead of collect.
@@ -263,9 +484,11 @@ async fn physical(
     case: &Case,
 ) -> Arc<dyn ExecutionPlan> {
     engine
-        .physical_plan_async(source, case.query, &case.range)
+        .prepare_async(source, case.query, &case.range)
         .await
         .unwrap()
+        .physical_plan()
+        .clone()
 }
 
 #[derive(Default)]
@@ -281,10 +504,11 @@ struct Streamed {
 /// Drain the plan one batch at a time; `at` runs with each batch in hand.
 async fn stream(plan: Arc<dyn ExecutionPlan>, mut at: impl FnMut(usize)) -> Streamed {
     let mut out = Streamed::default();
+    let plan = reset_plan_states(plan).unwrap();
     let mut s = execute_stream(plan, Arc::new(TaskContext::default())).unwrap();
     while let Some(b) = s.next().await {
         let b = b.unwrap();
-        let bytes = result_bytes(&b);
+        let bytes = logical_bytes(&b);
         out.rows += b.num_rows();
         out.result += bytes;
         out.largest_batch = out.largest_batch.max(bytes);
@@ -322,18 +546,18 @@ fn main() {
         .unwrap();
     drop(warm);
 
-    println!("| case | input MiB | working set MiB | held after MiB | result MiB | output rows | output batches | largest output batch MiB |");
-    println!("|---|---|---|---|---|---|---|---|");
+    println!("| case | process baseline MiB | incremental peak MiB | held after MiB | logical payload MiB | unique retained Arrow capacity MiB | external owners | output rows | output batches | largest logical batch MiB | allocation calls | requested traffic MiB |");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|");
     for case in cases() {
         if !filters.is_empty() && !filters.iter().any(|f| case.name.contains(f.as_str())) {
             continue;
         }
         let source = (case.source)();
         let before = counting::live();
+        let traffic_before = counting::traffic();
         counting::reset_peak();
         let mut fullest = None;
         let mut resident = None;
-        let mut held = 0;
         let (rows, batches, result, largest) = if case.streamed {
             let plan = rt.block_on(physical(&engine, source.as_ref(), &case));
             let s = rt.block_on(stream(plan, |_| {}));
@@ -344,14 +568,23 @@ fn main() {
                 .block_on(engine.range_query_async(source.as_ref(), case.query, &case.range))
                 .unwrap();
             let rows = out.iter().map(|b| b.num_rows()).sum();
-            let result = out.iter().map(result_bytes).sum();
-            let largest = out.iter().map(result_bytes).max().unwrap_or(0);
-            held = counting::live() - before;
+            let result = out.iter().map(logical_bytes).sum();
+            let largest = out.iter().map(logical_bytes).max().unwrap_or(0);
             let batches = out.len();
             resident = Some(out);
             (rows, batches, result, largest)
         };
-        let working = counting::peak() - before;
+        let working = counting::peak().saturating_sub(before);
+        let held = counting::live().saturating_sub(before);
+        let traffic_after = counting::traffic();
+        let calls = traffic_after.0 - traffic_before.0;
+        let requested = traffic_after.1 - traffic_before.1;
+        // This allocating owner walk is intentionally outside peak/traffic
+        // measurement. Streamed results have no retained consumer owners.
+        let retained = resident
+            .as_deref()
+            .map(result_memory::retained)
+            .unwrap_or_default();
         if let Some(at) = fullest {
             heap_profile(&rt, &engine, source.as_ref(), &case, at);
         }
@@ -362,13 +595,16 @@ fn main() {
             drop(out);
         }
         println!(
-            "| {} | {} | {} | {} | {} | {rows} | {batches} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {rows} | {batches} | {} | {calls} | {} |",
             case.name,
             mib(before),
             mib(working),
             mib(held),
             mib(result),
+            mib(retained.bytes),
+            retained.external_owners,
             mib(largest),
+            mib(requested),
         );
     }
 }
