@@ -7,7 +7,19 @@
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
-use promql_engine::{series, Engine, EngineError, InstantResult, MemorySeriesSource, RangeQuery};
+use async_trait::async_trait;
+use datafusion::arrow::array::{
+    ArrayRef, AsArray, FixedSizeBinaryArray, Int64Array, ListArray, RecordBatch, StructArray,
+    UInt64Array,
+};
+use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema};
+use datafusion::catalog::Session;
+use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::physical_plan::ExecutionPlan;
+use promql_engine::{
+    series, Engine, EngineError, InstantResult, MemorySeriesSource, RangeQuery, SelectHints,
+    SeriesSource,
+};
 use promql_parser::SeriesDescription;
 
 fn load(lines: &[&str]) -> Vec<SeriesDescription> {
@@ -338,4 +350,218 @@ fn scalar_has_a_sample_at_every_step_of_a_range_query() {
     let (ts, vs) = run(r#"scalar(temperature{city="oslo"} offset 10m)"#);
     assert_eq!(ts, [0, 60_000, 120_000]);
     assert!(vs.iter().all(|v| v.is_nan()), "{vs:?}");
+}
+
+/// A source with a sliced samples child, nested metadata, opaque IDs and
+/// noncanonical column order. The extra column and ID must not escape a
+/// matrix projection, while scalar(v) must accept the native evaluator's
+/// metadata-bearing samples without a canonicalizing cast.
+#[derive(Debug)]
+struct SlicedRawSource {
+    fixed_ids: bool,
+}
+
+#[async_trait]
+impl SeriesSource for SlicedRawSource {
+    async fn select(
+        &self,
+        _: &dyn Session,
+        _: &[promql_parser::ast::LabelMatcher],
+        hints: SelectHints,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        let names = ["__name__".to_string(), "city".to_string()];
+        let rows = [
+            series::Series::new(
+                &[("__name__", "temperature"), ("city", "before")],
+                vec![30_000],
+                vec![99.0],
+            )
+            .unwrap(),
+            series::Series::new(
+                &[("__name__", "temperature"), ("city", "oslo")],
+                vec![0, 15_000, 30_000, 60_000, 90_000],
+                vec![
+                    1.0,
+                    f64::from_bits(promql_engine::selector::STALE_NAN_BITS),
+                    2.0,
+                    -0.0,
+                    9.0,
+                ],
+            )
+            .unwrap(),
+            series::Series::new(
+                &[("__name__", "temperature"), ("city", "after")],
+                vec![30_000],
+                vec![99.0],
+            )
+            .unwrap(),
+        ];
+        let block = series::Block {
+            start_ms: hints.start_ms + hints.window_ms,
+            end_ms: hints.end_ms + 1,
+        };
+        let batch = series::encode(&names, &rows, block).unwrap();
+        let samples = batch
+            .column_by_name(series::SAMPLES)
+            .unwrap()
+            .as_list::<i32>();
+        let entries = samples.values().as_struct();
+        let fields: Fields = entries
+            .fields()
+            .iter()
+            .map(|f| {
+                Arc::new(
+                    f.as_ref()
+                        .clone()
+                        .with_metadata([("child".into(), f.name().clone())].into_iter().collect()),
+                )
+            })
+            .collect();
+        let entries = StructArray::new(fields.clone(), entries.columns().to_vec(), None);
+        let item = Arc::new(
+            Field::new(series::LIST_ITEM, DataType::Struct(fields), false)
+                .with_metadata([("item".into(), "preserved".into())].into_iter().collect()),
+        );
+        let samples: ArrayRef = Arc::new(ListArray::new(
+            item,
+            samples.offsets().clone(),
+            Arc::new(entries),
+            None,
+        ));
+        let ids: ArrayRef = if self.fixed_ids {
+            Arc::new(
+                FixedSizeBinaryArray::try_from_iter(
+                    [10_u64, 20, 30].into_iter().map(u64::to_be_bytes),
+                )
+                .unwrap(),
+            )
+        } else {
+            Arc::new(UInt64Array::from(vec![10, 20, 30]))
+        };
+        let columns = vec![
+            samples,
+            Arc::new(Int64Array::from(vec![7, 7, 7])) as ArrayRef,
+            ids,
+            batch.column_by_name(series::BLOCK_END).unwrap().clone(),
+            batch.column_by_name(series::LABELS).unwrap().clone(),
+            batch.column_by_name(series::BLOCK_START).unwrap().clone(),
+        ];
+        let schema = Arc::new(Schema::new_with_metadata(
+            [
+                series::SAMPLES,
+                "extra",
+                series::SERIES_ID,
+                series::BLOCK_END,
+                series::LABELS,
+                series::BLOCK_START,
+            ]
+            .into_iter()
+            .zip(&columns)
+            .map(|(name, array)| {
+                Field::new(name, array.data_type().clone(), false)
+                    .with_metadata([("source-field".into(), name.into())].into_iter().collect())
+            })
+            .collect::<Vec<_>>(),
+            [("owner".into(), "source".into())].into_iter().collect(),
+        ));
+        // Only oslo is part of the source. Both adjacent rows remain in the
+        // backing buffers, so their in-window samples expose a span mismatch.
+        let batch = RecordBatch::try_new(schema.clone(), columns)?.slice(1, 1);
+        assert_eq!(
+            batch
+                .column_by_name(series::SAMPLES)
+                .unwrap()
+                .as_list::<i32>()
+                .offsets()[0],
+            1
+        );
+        Ok(MemorySourceConfig::try_new_exec(
+            &[vec![batch]],
+            schema,
+            None,
+        )?)
+    }
+}
+
+#[tokio::test]
+async fn instant_matrix_and_scalar_accept_sliced_reordered_sources_with_metadata() {
+    let engine = Engine::new();
+    for fixed_ids in [false, true] {
+        let source = SlicedRawSource { fixed_ids };
+        let InstantResult::Matrix(batches) = engine
+            .instant_query_async(&source, "temperature[1m]", 60_000)
+            .await
+            .unwrap()
+        else {
+            panic!("not a matrix")
+        };
+        let decoded = series::decode(&batches).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].label("city"), "oslo");
+        assert_eq!(decoded[0].timestamps(), &[30_000, 60_000]);
+        assert_eq!(
+            decoded[0]
+                .values()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            [2.0f64.to_bits(), (-0.0f64).to_bits()]
+        );
+        for batch in &batches {
+            let schema = batch.schema();
+            assert_eq!(
+                schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    series::LABELS,
+                    series::SAMPLES,
+                    series::BLOCK_START,
+                    series::BLOCK_END
+                ]
+            );
+            assert_eq!(
+                schema.metadata().get("owner").map(String::as_str),
+                Some("source")
+            );
+            for field in schema.fields() {
+                assert_eq!(field.metadata().get("source-field"), Some(field.name()));
+            }
+            let DataType::List(item) = schema.field_with_name(series::SAMPLES).unwrap().data_type()
+            else {
+                panic!("not a samples list")
+            };
+            assert_eq!(
+                item.metadata().get("item").map(String::as_str),
+                Some("preserved")
+            );
+            let DataType::Struct(fields) = item.data_type() else {
+                panic!("not samples")
+            };
+            for field in fields {
+                assert_eq!(field.metadata().get("child"), Some(field.name()));
+            }
+        }
+        let InstantResult::Scalar(value) = engine
+            .instant_query_async(&source, "scalar(temperature)", 60_000)
+            .await
+            .unwrap()
+        else {
+            panic!("not a scalar")
+        };
+        assert_eq!(value.to_bits(), (-0.0f64).to_bits());
+        let InstantResult::Vector(batches) = engine
+            .instant_query_async(&source, "-temperature", 60_000)
+            .await
+            .unwrap()
+        else {
+            panic!("not a vector")
+        };
+        let decoded = series::decode(&batches).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].label("__name__"), "");
+        assert_eq!(decoded[0].values()[0].to_bits(), 0.0f64.to_bits());
+    }
 }

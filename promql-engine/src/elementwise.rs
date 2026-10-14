@@ -27,9 +27,7 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::buffer::{BooleanBuffer, OffsetBuffer};
 use datafusion::arrow::compute::FilterBuilder;
-use datafusion::arrow::datatypes::{
-    DataType, Field, FieldRef, Float64Type, TimestampMillisecondType,
-};
+use datafusion::arrow::datatypes::{DataType, FieldRef, Float64Type, TimestampMillisecondType};
 use datafusion::common::{plan_err, ScalarValue};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{
@@ -530,7 +528,7 @@ impl ScalarUDFImpl for Elementwise {
                 return plan_err!("{NAME}: argument {i} must be Float64, got {t}");
             }
         }
-        Ok(series::samples_type())
+        Ok(arg_types[0].clone())
     }
 
     /// As in [`crate::selector`]: a null row maps to a null row, and
@@ -542,8 +540,13 @@ impl ScalarUDFImpl for Elementwise {
             .map(|f| f.data_type().clone())
             .collect();
         let data_type = self.return_type(&types)?;
-        let nullable = args.arg_fields[0].is_nullable();
-        Ok(Arc::new(Field::new(NAME, data_type, nullable)))
+        Ok(Arc::new(
+            args.arg_fields[0]
+                .as_ref()
+                .clone()
+                .with_name(NAME)
+                .with_data_type(data_type),
+        ))
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
@@ -596,7 +599,7 @@ fn float_arg(args: &ScalarFunctionArgs, i: usize) -> Result<Option<f64>> {
 /// `None` is [`Func::bind`]'s empty result: every series comes back empty.
 pub fn apply(samples: &ListArray, bound: Option<Bound>) -> Result<ListArray> {
     let Some(bound) = bound else {
-        return Ok(empty_rows(samples.len(), samples.nulls().cloned()));
+        return Ok(empty_rows(samples));
     };
 
     let offsets = samples.offsets();
@@ -658,12 +661,15 @@ pub fn apply(samples: &ListArray, bound: Option<Bound>) -> Result<ListArray> {
         )
     };
     let entries = StructArray::new(
-        series::sample_fields(),
+        entries.fields().clone(),
         vec![Arc::clone(timestamps), Arc::new(mapped)],
         None,
     );
+    let DataType::List(item) = samples.data_type() else {
+        unreachable!("a samples list")
+    };
     Ok(ListArray::new(
-        series::sample_item(),
+        Arc::clone(item),
         offsets,
         Arc::new(entries),
         samples.nulls().cloned(),
@@ -689,7 +695,7 @@ pub(crate) fn filtered(
         .optimize()
         .build();
     let entries = StructArray::new(
-        series::sample_fields(),
+        samples.values().as_struct().fields().clone(),
         vec![
             predicate.filter(timestamps.as_ref())?,
             predicate.filter(values)?,
@@ -700,8 +706,11 @@ pub(crate) fn filtered(
         let (lo, hi) = (row[0] as usize - first, row[1] as usize - first);
         holds.slice(lo, hi - lo).count_set_bits()
     });
+    let DataType::List(item) = samples.data_type() else {
+        unreachable!("a samples list")
+    };
     Ok(ListArray::new(
-        series::sample_item(),
+        Arc::clone(item),
         OffsetBuffer::from_lengths(kept),
         Arc::new(entries),
         samples.nulls().cloned(),
@@ -709,20 +718,23 @@ pub(crate) fn filtered(
 }
 
 /// `len` rows, every one of them an empty series.
-fn empty_rows(len: usize, nulls: Option<datafusion::arrow::buffer::NullBuffer>) -> ListArray {
+fn empty_rows(samples: &ListArray) -> ListArray {
     let entries = StructArray::new(
-        series::sample_fields(),
+        samples.values().as_struct().fields().clone(),
         vec![
             Arc::new(TimestampMillisecondArray::from(Vec::<i64>::new())),
             Arc::new(Float64Array::from(Vec::<f64>::new())),
         ],
         None,
     );
+    let DataType::List(item) = samples.data_type() else {
+        unreachable!("a samples list")
+    };
     ListArray::new(
-        series::sample_item(),
-        OffsetBuffer::new(vec![0i32; len + 1].into()),
+        Arc::clone(item),
+        OffsetBuffer::new(vec![0i32; samples.len() + 1].into()),
         Arc::new(entries),
-        nulls,
+        samples.nulls().cloned(),
     )
 }
 
@@ -1128,6 +1140,59 @@ mod tests {
             assert_eq!(out.len(), input.len());
             assert_eq!(out.offsets().to_vec(), vec![0; input.len() + 1]);
             assert_eq!(out.values().len(), 0);
+        }
+    }
+
+    #[test]
+    fn mapping_filtering_and_empty_results_preserve_nested_sample_metadata() {
+        use datafusion::arrow::datatypes::{Field, Fields};
+
+        let backing = samples();
+        let entries = backing.values().as_struct();
+        let fields: Fields = entries
+            .fields()
+            .iter()
+            .map(|f| {
+                Arc::new(
+                    f.as_ref()
+                        .clone()
+                        .with_metadata([("child".into(), f.name().clone())].into_iter().collect()),
+                )
+            })
+            .collect();
+        let entries = StructArray::new(fields.clone(), entries.columns().to_vec(), None);
+        let item = Arc::new(
+            Field::new(series::LIST_ITEM, DataType::Struct(fields), false)
+                .with_metadata([("item".into(), "preserved".into())].into_iter().collect()),
+        );
+        let input =
+            ListArray::new(item, backing.offsets().clone(), Arc::new(entries), None).slice(1, 2);
+        assert_eq!(
+            Elementwise::default()
+                .return_type(&[
+                    input.data_type().clone(),
+                    DataType::Utf8,
+                    DataType::Null,
+                    DataType::Null,
+                ])
+                .unwrap(),
+            *input.data_type()
+        );
+        for bound in [
+            Func::Abs.bind(None, None),
+            Func::Neg.bind(None, None),
+            Func::Timestamp.bind(None, None),
+            Func::Binary {
+                op: crate::binary::Op::Lss,
+                return_bool: false,
+            }
+            .bind(Some(0.0), None),
+            None,
+        ] {
+            let out = apply(&input, bound).unwrap();
+            assert_eq!(out.data_type(), input.data_type());
+            assert_eq!(out.offsets()[0], 0);
+            assert_eq!(out.values().len(), usize::from(bound.is_some()));
         }
     }
 

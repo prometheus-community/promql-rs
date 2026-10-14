@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, BooleanBufferBuilder, ListArray};
 use datafusion::arrow::buffer::BooleanBuffer;
-use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
+use datafusion::arrow::datatypes::{DataType, FieldRef};
 use datafusion::common::{plan_err, ScalarValue};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{
@@ -57,10 +57,9 @@ pub struct MatrixSelector {
 impl Default for MatrixSelector {
     fn default() -> Self {
         Self {
-            signature: Signature::exact(
-                vec![series::samples_type(), DataType::Int64, DataType::Int64],
-                Volatility::Immutable,
-            ),
+            // Exact would coerce away nested source-field metadata before
+            // filtering. Validate the numerical shape in `return_type`.
+            signature: Signature::any(3, Volatility::Immutable),
         }
     }
 }
@@ -84,23 +83,32 @@ impl ScalarUDFImpl for MatrixSelector {
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        if arg_types.first() != Some(&series::samples_type()) {
+        if !arg_types.first().is_some_and(series::is_samples_type) {
             return plan_err!(
                 "{NAME}: first argument must be {}, got {:?}",
                 series::samples_type(),
                 arg_types.first()
             );
         }
-        Ok(series::samples_type())
+        for (i, t) in arg_types.iter().enumerate().skip(1) {
+            if t != &DataType::Int64 {
+                return plan_err!("{NAME}: argument {i} must be Int64, got {t}");
+            }
+        }
+        Ok(arg_types[0].clone())
     }
 
-    /// A null row maps to a null row, as in [`crate::elementwise`].
+    /// Filtering does not change the sample fields or their metadata.
     fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
-        Ok(Arc::new(Field::new(
-            NAME,
-            series::samples_type(),
-            args.arg_fields[0].is_nullable(),
-        )))
+        let types: Vec<_> = args
+            .arg_fields
+            .iter()
+            .map(|f| f.data_type().clone())
+            .collect();
+        self.return_type(&types)?;
+        Ok(Arc::new(
+            args.arg_fields[0].as_ref().clone().with_name(NAME),
+        ))
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
@@ -149,4 +157,146 @@ pub fn apply(samples: &ListArray, window: Window) -> Result<ListArray> {
         .expect("a canonical samples entry")
         .as_primitive();
     filtered(samples, timestamps, values, &holds)
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::arrow::array::{Float64Array, StructArray, TimestampMillisecondArray};
+    use datafusion::arrow::buffer::OffsetBuffer;
+    use datafusion::arrow::datatypes::{Field, Fields};
+
+    use super::*;
+
+    fn samples() -> ListArray {
+        let stale = f64::from_bits(crate::selector::STALE_NAN_BITS);
+        let rows: &[&[(i64, f64)]] = &[
+            &[(12, 99.0)], // Unreferenced prefix would pass the window.
+            &[
+                (10, 1.0),
+                (11, stale),
+                (12, f64::NAN),
+                (13, -0.0),
+                (14, 4.0),
+                (15, 5.0),
+            ],
+            &[],
+            &[(9, 9.0), (12, 22.0), (14, 24.0), (16, 26.0)],
+            &[(12, 99.0)], // So would the unreferenced suffix.
+        ];
+        let (ts, vs): (Vec<_>, Vec<_>) = rows.iter().flat_map(|row| row.iter().copied()).unzip();
+        let fields: Fields = series::sample_fields()
+            .iter()
+            .map(|f| {
+                Arc::new(
+                    f.as_ref().clone().with_metadata(
+                        [("child".to_string(), f.name().clone())]
+                            .into_iter()
+                            .collect(),
+                    ),
+                )
+            })
+            .collect();
+        let entries = StructArray::new(
+            fields.clone(),
+            vec![
+                Arc::new(TimestampMillisecondArray::from(ts)),
+                Arc::new(Float64Array::from(vs)),
+            ],
+            None,
+        );
+        let item = Arc::new(
+            Field::new(series::LIST_ITEM, DataType::Struct(fields), false)
+                .with_metadata([("item".into(), "preserved".into())].into_iter().collect()),
+        );
+        ListArray::new(
+            item,
+            OffsetBuffer::from_lengths(rows.iter().map(|row| row.len())),
+            Arc::new(entries),
+            None,
+        )
+    }
+
+    fn rows(list: &ListArray) -> Vec<Vec<(i64, u64)>> {
+        (0..list.len())
+            .map(|i| {
+                let entries = list.value(i);
+                let (ts, vs) = series::sample_slices(entries.as_struct());
+                ts.iter().zip(vs).map(|(&t, &v)| (t, v.to_bits())).collect()
+            })
+            .collect()
+    }
+
+    const WINDOW: Window = Window { mint: 10, maxt: 14 };
+
+    /// `matrixIterSlice`'s bounds and stale test must use the same rebased
+    /// predicate as filtering comparisons, not offsets into the backing child.
+    #[test]
+    fn sliced_matrix_filters_only_its_referenced_span() {
+        let backing = samples();
+        let input = backing.slice(1, 3);
+        assert_eq!(input.offsets().as_ref(), &[1, 7, 7, 11]);
+        let out = apply(&input, WINDOW).unwrap();
+        assert_eq!(out.offsets().as_ref(), &[0, 3, 3, 5]);
+        assert_eq!(out.values().len(), 5);
+        assert_eq!(
+            out.data_type(),
+            input.data_type(),
+            "nested metadata survives"
+        );
+        assert_eq!(
+            rows(&out),
+            [
+                vec![
+                    (12, f64::NAN.to_bits()),
+                    (13, (-0.0f64).to_bits()),
+                    (14, 4.0f64.to_bits())
+                ],
+                vec![],
+                vec![(12, 22.0f64.to_bits()), (14, 24.0f64.to_bits())],
+            ]
+        );
+
+        // A zero first offset does not imply the backing suffix is referenced.
+        let prefix = apply(&backing.slice(0, 3), WINDOW).unwrap();
+        assert_eq!(prefix.offsets().as_ref(), &[0, 1, 4, 4]);
+        assert_eq!(prefix.values().len(), 4);
+    }
+
+    #[test]
+    fn empty_referenced_spans_and_empty_windows_do_not_pull_in_backing_samples() {
+        let backing = samples();
+        for input in [backing.slice(2, 1), backing.slice(2, 0)] {
+            assert_eq!(input.offsets()[0], 7);
+            let out = apply(&input, WINDOW).unwrap();
+            assert_eq!(out.len(), input.len());
+            assert_eq!(out.offsets().to_vec(), vec![0; input.len() + 1]);
+            assert_eq!(out.values().len(), 0);
+            assert_eq!(out.data_type(), input.data_type());
+        }
+        let input = backing.slice(1, 3);
+        let out = apply(&input, Window { mint: 14, maxt: 14 }).unwrap();
+        assert_eq!(out.offsets().as_ref(), &[0, 0, 0, 0]);
+        assert_eq!(out.values().len(), 0);
+        assert_eq!(out.data_type(), input.data_type());
+    }
+
+    #[test]
+    fn matrix_return_field_keeps_source_metadata_and_nullability() {
+        let input = Arc::new(
+            Field::new(series::SAMPLES, samples().data_type().clone(), true)
+                .with_metadata([("unit".into(), "samples".into())].into_iter().collect()),
+        );
+        let args = [
+            input.clone(),
+            Arc::new(Field::new("mint", DataType::Int64, false)),
+            Arc::new(Field::new("maxt", DataType::Int64, false)),
+        ];
+        let out = MatrixSelector::default()
+            .return_field_from_args(ReturnFieldArgs {
+                arg_fields: &args,
+                scalar_arguments: &[None, None, None],
+            })
+            .unwrap();
+        assert_eq!(out.as_ref(), &input.as_ref().clone().with_name(NAME));
+    }
 }

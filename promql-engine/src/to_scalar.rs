@@ -141,15 +141,9 @@ pub struct Scalar {
 impl Default for Scalar {
     fn default() -> Self {
         Self {
-            signature: Signature::exact(
-                vec![
-                    series::samples_type(),
-                    DataType::Int64,
-                    DataType::Int64,
-                    DataType::Int64,
-                ],
-                Volatility::Immutable,
-            ),
+            // Evaluated source samples may retain nested field metadata.
+            // Their numerical shape is checked without casting it away.
+            signature: Signature::any(4, Volatility::Immutable),
         }
     }
 }
@@ -195,12 +189,17 @@ impl AggregateUDFImpl for Scalar {
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        if arg_types.first() != Some(&series::samples_type()) {
+        if !arg_types.first().is_some_and(series::is_samples_type) {
             return plan_err!(
                 "{NAME}: first argument must be {}, got {:?}",
                 series::samples_type(),
                 arg_types.first()
             );
+        }
+        for (i, t) in arg_types.iter().enumerate().skip(1) {
+            if t != &DataType::Int64 {
+                return plan_err!("{NAME}: argument {i} must be Int64, got {t}");
+            }
         }
         Ok(series::samples_type())
     }
@@ -272,6 +271,30 @@ mod tests {
         };
         let (ts, vs) = series::sample_slices(list.values().as_struct());
         ts.iter().copied().zip(vs.iter().copied()).collect()
+    }
+
+    #[test]
+    fn return_type_accepts_sample_metadata_but_not_a_different_shape_or_grid_type() {
+        let item = Arc::new(
+            series::sample_item().as_ref().clone().with_metadata(
+                [("source".into(), "preserved".into())]
+                    .into_iter()
+                    .collect(),
+            ),
+        );
+        let scalar = Scalar::default();
+        let mut types = vec![
+            DataType::List(item),
+            DataType::Int64,
+            DataType::Int64,
+            DataType::Int64,
+        ];
+        assert_eq!(scalar.return_type(&types).unwrap(), series::samples_type());
+        types[1] = DataType::Float64;
+        assert!(scalar.return_type(&types).is_err());
+        types[1] = DataType::Int64;
+        types[0] = DataType::Float64;
+        assert!(scalar.return_type(&types).is_err());
     }
 
     /// `funcScalar` with no float, one, and more than one.
