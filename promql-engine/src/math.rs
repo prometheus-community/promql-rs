@@ -4,7 +4,7 @@
 //! Kahan-compensated, `avg` switches to an incremental mean when the
 //! running sum would overflow, `min`/`max` let a number beat a NaN but
 //! never the other way round, and `stddev`/`stdvar` are Welford's online
-//! algorithm. The differential suite compares against the Go engine to
+//! algorithm, with Kahan-compensated terms over time. The differential suite compares against the Go engine to
 //! `1e-6` absolute or `1e-10` relative, so these rules are ported, not
 //! approximated. Each is a small value type here, shared by the
 //! aggregation and the `*_over_time` functions.
@@ -312,6 +312,28 @@ pub fn mean_of(values: &[f64]) -> f64 {
         m.add(*v);
     }
     m.result()
+}
+
+/// The population variance of a window's values: `varianceOverTime`
+/// (`promql/functions.go` at 83962c35), behind `stdvar_over_time` and
+/// `stddev_over_time`.
+///
+/// Not [`Welford`], although it is the same recurrence: upstream carries
+/// both the mean and the squared deviations as Kahan sums, and reads the
+/// mean back with its compensation on every step, which moves the low bits
+/// on ordinary inputs (`[1e16, 1, -1e16, 3]` is exactly `5e31` here and
+/// `4.999999999999999e31` under Welford). The operations stay in upstream's
+/// order, `mean + c_mean` re-read after the mean moves, so the bits match
+/// Go's.
+pub fn variance_of(values: &[f64]) -> f64 {
+    let (mut count, mut mean, mut c_mean, mut aux, mut c_aux) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    for &f in values {
+        count += 1.0;
+        let delta = f - (mean + c_mean);
+        (mean, c_mean) = kahan_inc(delta / count, mean, c_mean);
+        (aux, c_aux) = kahan_inc(delta * (f - (mean + c_mean)), aux, c_aux);
+    }
+    (aux + c_aux) / count
 }
 
 /// The smallest value, where any number beats a NaN. `None` if empty.
@@ -950,5 +972,54 @@ mod tests {
         w.add(1.0);
         w.add(f64::INFINITY);
         assert!(w.variance().is_nan());
+    }
+
+    /// `functions.test`'s `metric 0 8 8 2 3`: mean 4.2, squared deviations
+    /// summing to 52.8, over 5.
+    #[test]
+    fn variance_of_matches_the_corpus() {
+        let v = variance_of(&[0.0, 8.0, 8.0, 2.0, 3.0]);
+        assert!((v - 10.56).abs() < 1e-12, "{v}");
+        assert!((v.sqrt() - 3.249615).abs() < 1e-6, "{}", v.sqrt());
+    }
+
+    /// prometheus#4927, `functions.test`'s regression: equal samples have no
+    /// variance at all, not a rounding residue.
+    #[test]
+    fn equal_samples_have_exactly_zero_variance() {
+        assert_eq!(variance_of(&[1.5990505637277868; 3]).to_bits(), 0);
+    }
+
+    /// The bits upstream's `varianceOverTime` loop produces in Go 1.26 for
+    /// these inputs. Welford's uncompensated mean lands elsewhere on both,
+    /// which is why `variance_of` is its own loop rather than `Welford`.
+    #[test]
+    fn variance_of_matches_go_bit_for_bit_where_welford_does_not() {
+        let welford = |values: &[f64]| {
+            let mut w = Welford::default();
+            values.iter().for_each(|v| w.add(*v));
+            w.variance()
+        };
+        for (values, go_bits) in [
+            (&[1e16, 1.0, -1e16, 3.0][..], 0x4683_b8b5_b505_6e17_u64),
+            (
+                &[1e8 + 0.1, 1e8 + 0.2, 1e8 + 0.3][..],
+                0x3f7b_4e81_c28f_5c00,
+            ),
+        ] {
+            assert_eq!(variance_of(values).to_bits(), go_bits, "{values:?}");
+            assert_ne!(welford(values).to_bits(), go_bits, "{values:?}");
+        }
+    }
+
+    /// One sample deviates from nothing; NaN and Inf poison the result
+    /// through arithmetic, as upstream's loop does (`Inf - Inf` is NaN).
+    /// An empty slice is `0 / 0`, which `range::evaluate` never asks for.
+    #[test]
+    fn variance_of_edge_cases() {
+        assert_eq!(variance_of(&[42.0]), 0.0);
+        assert!(variance_of(&[1.0, f64::NAN, 3.0]).is_nan());
+        assert!(variance_of(&[1.0, f64::INFINITY]).is_nan());
+        assert!(variance_of(&[]).is_nan());
     }
 }

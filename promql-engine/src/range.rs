@@ -23,6 +23,8 @@ pub enum Func {
     CountOverTime,
     LastOverTime,
     PresentOverTime,
+    StddevOverTime,
+    StdvarOverTime,
     Changes,
     Resets,
 }
@@ -42,6 +44,8 @@ impl Func {
             "count_over_time" => Func::CountOverTime,
             "last_over_time" => Func::LastOverTime,
             "present_over_time" => Func::PresentOverTime,
+            "stddev_over_time" => Func::StddevOverTime,
+            "stdvar_over_time" => Func::StdvarOverTime,
             "changes" => Func::Changes,
             "resets" => Func::Resets,
             _ => return None,
@@ -62,6 +66,8 @@ impl Func {
             Func::CountOverTime => "count_over_time",
             Func::LastOverTime => "last_over_time",
             Func::PresentOverTime => "present_over_time",
+            Func::StddevOverTime => "stddev_over_time",
+            Func::StdvarOverTime => "stdvar_over_time",
             Func::Changes => "changes",
             Func::Resets => "resets",
         }
@@ -77,6 +83,8 @@ impl Func {
             | Self::AvgOverTime
             | Self::MinOverTime
             | Self::MaxOverTime
+            | Self::StddevOverTime
+            | Self::StdvarOverTime
             | Self::Changes
             | Self::Resets => samples,
             _ => 0,
@@ -125,6 +133,8 @@ pub fn evaluate(func: Func, w: &Window) -> Option<f64> {
         Func::CountOverTime => Some(w.vs.len() as f64),
         Func::LastOverTime => Some(w.vs[w.vs.len() - 1]),
         Func::PresentOverTime => Some(1.0),
+        Func::StddevOverTime => Some(math::variance_of(w.vs).sqrt()),
+        Func::StdvarOverTime => Some(math::variance_of(w.vs)),
         Func::Changes => Some(
             w.vs.windows(2)
                 .filter(|p| p[1] != p[0] && !(p[1].is_nan() && p[0].is_nan()))
@@ -692,6 +702,27 @@ mod tests {
         assert_eq!(one(Func::Resets), 0.0);
         assert!((one(Func::Irate) - 1.0 / 30.0).abs() < 1e-12);
         assert_eq!(one(Func::Idelta), 1.0);
+        // 2..=11 in steps of one: the variance of ten consecutive integers.
+        assert_eq!(one(Func::StdvarOverTime), 8.25);
+        assert_eq!(one(Func::StddevOverTime), 8.25f64.sqrt());
+    }
+
+    /// The window's edges decide what the variance sees: a single sample is
+    /// exactly 0, not "no sample", and a step with an empty window answers
+    /// nothing rather than NaN.
+    #[test]
+    fn stddev_and_stdvar_over_time_at_the_window_edges() {
+        let ts = [5 * M];
+        let vs = [7.0];
+        for f in [Func::StddevOverTime, Func::StdvarOverTime] {
+            assert_eq!(run(f, &ts, &vs, at_5m()), vec![(5 * M, 0.0)]);
+            let p = Params {
+                start_ms: 20 * M,
+                end_ms: 20 * M,
+                ..at_5m()
+            };
+            assert!(run(f, &ts, &vs, p).is_empty());
+        }
     }
 
     #[test]
@@ -762,7 +793,7 @@ mod tests {
     /// recomputes both bounds per step with `partition_point`, so it
     /// pins each walk against an independent oracle rather than
     /// against itself.
-    const ALL: [Func; 14] = [
+    const ALL: [Func; 16] = [
         Func::Rate,
         Func::Increase,
         Func::Delta,
@@ -775,9 +806,20 @@ mod tests {
         Func::CountOverTime,
         Func::LastOverTime,
         Func::PresentOverTime,
+        Func::StddevOverTime,
+        Func::StdvarOverTime,
         Func::Changes,
         Func::Resets,
     ];
+
+    /// The executor's oracles resolve a query through `parse` too, so a name
+    /// bound to the wrong kernel answers wrongly on both sides and agrees.
+    #[test]
+    fn every_name_parses_back_to_its_function() {
+        for func in ALL {
+            assert_eq!(Func::parse(func.as_str()), Some(func));
+        }
+    }
 
     /// Counter resets, NaN runs, a staleness marker, signed zeros and a
     /// gap wider than the window: one series that reaches every branch

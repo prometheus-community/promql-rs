@@ -680,7 +680,7 @@ async fn native_resource_total_overflow_does_not_grow_the_reservation() {
     assert_eq!(ctx.runtime_env().memory_pool.reserved(), 0);
 }
 
-const KERNEL_NAMES: [&str; 16] = [
+const KERNEL_NAMES: [&str; 18] = [
     "selector",
     "timestamp",
     "rate",
@@ -695,6 +695,8 @@ const KERNEL_NAMES: [&str; 16] = [
     "count_over_time",
     "last_over_time",
     "present_over_time",
+    "stddev_over_time",
+    "stdvar_over_time",
     "changes",
     "resets",
 ];
@@ -827,7 +829,8 @@ async fn all_kernels_and_modifiers_have_independent_nonempty_literal_answers() {
                     "sum_over_time" => 12.,
                     "count_over_time" => 3.,
                     "present_over_time" => 1.,
-                    "rate" | "increase" | "delta" | "irate" | "idelta" | "changes" | "resets" => 0.,
+                    "rate" | "increase" | "delta" | "irate" | "idelta" | "stddev_over_time"
+                    | "stdvar_over_time" | "changes" | "resets" => 0.,
                     _ => unreachable!(),
                 };
                 let ctx = SessionContext::new_with_config(SessionConfig::new().with_batch_size(1));

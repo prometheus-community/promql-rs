@@ -230,8 +230,12 @@ fn math_reductions(c: &mut Criterion) {
         g.bench_function(BenchmarkId::new("mean_of", n), |b| {
             b.iter(|| math::mean_of(black_box(&vs)))
         });
-        // No slice-at-a-time welford reduction exists; `stddev_over_time`
-        // folds the accumulator itself, so the bench folds it too.
+        g.bench_function(BenchmarkId::new("variance_of", n), |b| {
+            b.iter(|| math::variance_of(black_box(&vs)))
+        });
+        // No slice-at-a-time welford reduction exists; the `stddev` and
+        // `stdvar` aggregations fold the accumulator a sample at a time, so
+        // the bench folds it too.
         g.bench_function(BenchmarkId::new("welford_of", n), |b| {
             b.iter(|| {
                 let mut w = Welford::default();
@@ -375,6 +379,7 @@ fn range_function(c: &mut Criterion) {
             ("increase", Func::Increase, &vs),
             ("count_over_time", Func::CountOverTime, &vs),
             ("max_over_time", Func::MaxOverTime, &vs),
+            ("stddev_over_time", Func::StddevOverTime, &vs),
             ("rate_stale_every_100", Func::Rate, &stale),
         ] {
             let plan = selected_plan(

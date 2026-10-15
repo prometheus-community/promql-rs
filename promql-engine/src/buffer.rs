@@ -817,7 +817,7 @@ mod tests {
 
     const S: i64 = 1000;
 
-    const FUNCS: [Func; 14] = [
+    const FUNCS: [Func; 16] = [
         Func::Rate,
         Func::Increase,
         Func::Delta,
@@ -830,6 +830,8 @@ mod tests {
         Func::CountOverTime,
         Func::LastOverTime,
         Func::PresentOverTime,
+        Func::StddevOverTime,
+        Func::StdvarOverTime,
         Func::Changes,
         Func::Resets,
     ];
