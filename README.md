@@ -12,14 +12,26 @@ numbers come from.
 
 ## Layout
 
-The workspace has four crates:
+The workspace has five crates. Each README lists the crate's public interface
+and how to use it.
 
 | Crate | What it is |
 |---|---|
-| `promql-engine/` | Evaluates PromQL as DataFusion plans. Defines `SeriesSource`, the trait a store implements, and the Arrow schema its data comes back in. |
-| `promql-parser/` | The parser. Grammar, lexer, AST, and error types ported from upstream `promql/parser`. |
-| `promql-conformance/` | Replays Prometheus's promqltest corpus against the engine and records what passes. |
-| `promql-sync/` | Developer-invoked CLI that checks, pulls, and regenerates the vendored upstream files. |
+| [`promql-engine/`](promql-engine/README.md) | Evaluates PromQL as DataFusion plans. Defines `SeriesSource`, the trait a store implements, and the Arrow schema its data comes back in. |
+| [`promql-parser/`](promql-parser/README.md) | The parser. Grammar, lexer, AST, and error types ported from upstream `promql/parser`. |
+| [`promql-common/`](promql-common/README.md) | The parts of `prometheus/common`'s `model` package the parser and engine share: `Duration` and its parsing. |
+| [`promql-conformance/`](promql-conformance/README.md) | Replays Prometheus's promqltest corpus against the engine and records what passes. |
+| [`promql-sync/`](promql-sync/README.md) | Developer-invoked CLI that checks, pulls, and regenerates the vendored upstream files. |
+
+A query crosses them in this order. The engine's README walks each step:
+
+```text
+query text ─► promql-parser ─► Expr ─► promql-engine planner ─► DataFusion LogicalPlan
+                                              │                        │
+                         SeriesSource::select (your store, at plan time)
+                                                                       ▼
+                     RecordBatches ◄─ finalize ◄─ execute ◄─ ExecutionPlan (PreparedQuery)
+```
 
 Vendored upstream material sits next to the crate that consumes it.
 `promql-parser/upstream/` holds the Go sources the port is derived from.

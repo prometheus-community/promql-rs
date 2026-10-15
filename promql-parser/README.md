@@ -1,93 +1,122 @@
 # promql-parser
 
-Standalone PromQL parser. Structural hand-port of
-`prometheus/prometheus@<sha>` `promql/parser/`.
+A standalone PromQL parser: a structural hand-port of upstream
+`prometheus/prometheus` `promql/parser/` at the commit pinned in
+[`upstream/UPSTREAM.md`](upstream/UPSTREAM.md). It turns query text into an
+`Expr` tree that mirrors upstream's `ast.go`. It knows nothing about storage
+or evaluation; [`promql-engine`](../promql-engine) consumes the AST.
+
+## Public interface
+
+| Item | Upstream | Use it to |
+|---|---|---|
+| `parse_expr(&str) -> Result<Expr, ParseErrors>` | `parser.ParseExpr` | Parse a query with every experimental gate off. |
+| `parse_metric_selector(&str)` | `ParseMetricSelector` | Parse `foo{a="b"}` into its `Vec<LabelMatcher>`. The bare name becomes a `__name__` matcher. |
+| `parse_metric(&str)` | `START_METRIC` mode | Parse a bare label set, `{a="b"}`. |
+| `parse_series_desc(&str) -> SeriesDescription` | `ParseSeriesDesc` | Parse a promqltest `load` line, `x{a="b"} 1+1x10`. Value runs are expanded at parse time. |
+| `Parser::new(ParserOptions)` | `NewParser(Options)` | The same four entry points under non-default options. |
+| `ParserOptions`, `FEATURE_FLAGS`, `FeatureFlag` | `parser.Options` | The four experimental gates. `ParserOptions::all()` is upstream's `TestParserOpts`; `with_flag("promql-…", true)` sets one by its `--enable-feature` name. |
+| `ast::*` (`Expr`, `VectorSelector`, `MatrixSelector`, `AggregateExpr`, `BinaryExpr`, `Call`, `LabelMatcher`, `MatchOp`, `VectorMatching`, …) | `ast.go` | The tree. `Expr` is one enum over upstream's node structs; field names are upstream's, in `snake_case`. |
+| `ParseError`, `ParseErrors` | `ParseErr`, `ParseErrors` | Every error with its `PositionRange`. Parsing continues after a fault, as upstream does. |
+| `posrange::PositionRange`, `token::{Item, ItemType}` | `posrange`, `lex.go` | Byte positions and token types. Operators and aggregations in the AST are `ItemType`s. |
+| `functions::is_experimental` | `Functions[…].Experimental` | Whether a function needs `enable_experimental_functions`. |
+| `parse_duration_seconds` | `model.ParseDuration` | Parse `5m`, `1h30m`, and so on, in seconds. |
+
+```rust
+use promql_parser::{parse_expr, ast::Expr, Parser, ParserOptions};
+
+let expr = parse_expr(r#"sum by (job) (rate(http_requests_total{code=~"5.."}[5m]))"#)?;
+if let Expr::Aggregate(agg) = &expr {
+    assert_eq!(agg.grouping, ["job"]);
+}
+
+// Experimental syntax is refused, with upstream's message, unless its gate is on.
+let opts = ParserOptions::default().with_flag("promql-experimental-functions", true).unwrap();
+let expr = Parser::new(opts).parse_expr("sort_by_label(up, \"job\")")?;
+```
+
+What the parser does not settle, the engine settles. The parser fills a stub
+`FunctionRef` for every call: return type `Vector`, no argument types. Arity,
+argument types and return types are checked in `promql-engine`'s `function.rs`
+and `value_type.rs`.
 
 ## Status
 
-- Crate compiles end to end with grmtools (`lrlex` + `lrpar` +
-  `cfgrammar`).
-- AST types, token types, position ranges, and error types are ported
-  verbatim from upstream.
-- Grammar and lexer are **placeholders**. The real structural port of
-  `upstream/generated_parser.y` (grammar + actions) and `upstream/lex.go`
-  (custom state-machine lexer) lands as follow-up tasks.
-- Public entry points (`parse_expr`, `parse_metric_selector`) return
-  `ParseErrors` until the real grammar lands.
+The grammar is generated from upstream's `generated_parser.y`. The Rust
+actions come from `grammar-actions.toml`. An upstream alternative with no
+action still compiles, as an `Err(())` placeholder, and parses as an error.
+`cargo run -p promql-sync -- generate-grammar` prints those alternatives and
+their count.
 
-See `docs/parser-sync.md` for the full plan.
+Deliberately not ported yet (the `skip_rules` in `grammar-actions.toml`):
+native-histogram descriptors in series lines (`{{schema:1 …}}`). The open
+follow-ups are in [`docs/parser-sync.md`](../docs/parser-sync.md#open-follow-ups).
+The main one is wiring `src/lexer.rs`, a tested port of `lex.go`, in place of
+the two regex lexers.
+
+`tests/conformance.rs` replays upstream's `parse_test.go` corpus. The
+`scripts/gen-conformance` script materialises that corpus to
+`tests/fixtures/parse_test_corpus.json`, and the test checks that success or
+failure matches upstream, above a pass-rate floor.
 
 ## Layout
 
-```
+```text
 src/
-├── lib.rs            Public API + grmtools module wiring
-├── ast.rs            Rust mirror of upstream ast.go
-├── token.rs          ItemType / Item; mirror of upstream lex.go
-├── posrange.rs       PositionRange; mirror of upstream posrange/
-├── error.rs          ParseError + ParseErrors accumulator
-├── parser.rs         Public entry points (currently stubs)
-├── grammar.y         grmtools yacc grammar (placeholder)
-└── lexer.l           lrlex regex lexer (placeholder)
+├── lib.rs        Public re-exports; grmtools module wiring
+├── parser.rs     Entry points; START_* token injection; picks the lexer per mode
+├── grammar.y     GENERATED by promql-sync from upstream/generated_parser.y + sidecars
+├── actions.rs    Rust bodies the grammar's actions call, one helper per production
+├── context.rs    ParserCtx: accumulates errors so parsing can continue
+├── lexer.l       lrlex lexer for expressions
+├── series.l      lrlex lexer for series descriptions (modal: INITIAL/BRACES/SERIES)
+├── lexer.rs      State-machine port of lex.go, tested, not wired in yet
+├── ast.rs        ast.go
+├── token.rs      ItemType / Item from lex.go
+├── posrange.rs   posrange/
+├── error.rs      ParseError / ParseErrors
+├── options.rs    parser.Options and the four --enable-feature gates
+└── functions.rs  The Experimental bit of functions.go
 
-upstream/             Vendored verbatim from prometheus/prometheus
-├── UPSTREAM.md       Provenance + sync workflow
-├── MANIFEST.toml     sha256 per vendored file
-├── generated_parser.y
-├── lex.go
-├── ast.go
-├── parse.go
-├── functions.go
-└── printer.go
-
-sync-meta.toml        Machine-readable state for the sync tool
+grammar-actions.toml   Per-rule return types and per-alternative Rust actions
+grammar-tokens.toml    Token mapping between upstream and grmtools
+sync-meta.toml         State for promql-sync
+upstream/              Vendored verbatim from prometheus/prometheus, hashed in MANIFEST.toml
+build.rs               Compiles grammar.y, lexer.l, series.l into OUT_DIR
 ```
+
+### Parse modes
+
+Upstream serves expressions, metric selectors, bare metrics and series
+descriptions from one grammar. It injects a leading `START_*` pseudo-token
+that the `start` rule dispatches on. `parser.rs`'s `InjectingLexer` does the
+same against grmtools. A series description needs significant spaces and `x`
+as an operator, so it lexes with `series.l` instead of `lexer.l`. The module
+doc in `parser.rs` maps `series.l`'s start conditions to `lex.go`'s state
+functions.
 
 ## Translation discipline
 
-- Grammar file stays structural-one-to-one with upstream: non-terminal
-  names, rule ordering, precedence declarations preserved. Only action
-  bodies are rewritten.
-- Actions are one-line calls into a dedicated `actions.rs` so the
-  grammar file remains diff-friendly against future upstream revisions.
-- Error accumulation matches upstream: `ParserCtx` holds a
-  `Vec<ParseError>` and parsing continues after faults, producing a
-  best-effort AST with diagnostics.
-- Experimental-feature gating is in-action (mirroring upstream's
-  `options.Enable*` checks), not a post-parse pass.
-  `ParserOptions` mirrors `parser.Options`, off by default; see
-  `docs/feature-flags.md`.
+- `grammar.y` stays structurally one-to-one with upstream: non-terminal names,
+  rule order and precedence. Only action bodies differ. They are one-line
+  calls into `actions.rs`, so the grammar diffs cleanly against a new upstream.
+- Errors accumulate as upstream's do: an action records a `ParseError` in
+  `ParserCtx` and parsing continues.
+- Experimental gates are checked inside the action that builds the construct,
+  as upstream's `options.Enable*` checks are, not in a pass after parsing.
+  [`docs/feature-flags.md`](../docs/feature-flags.md) lists the gates.
 
-## Upstream sync
+[`docs/parser-sync.md`](../docs/parser-sync.md) is the full design.
 
-Developer-invoked. The `promql-sync` tool (separate crate) has three
-subcommands:
+## Upgrading upstream
 
-- `promql-sync check` — CI-friendly. Verifies `upstream/<file>` hashes
-  against `upstream/MANIFEST.toml`; no network, no mutations.
-- `promql-sync pull --target <sha>` — fetches upstream at the target
-  revision and overwrites the vendored files + `MANIFEST.toml` +
-  `sync-meta.toml`. Never commits.
-- `promql-sync generate-grammar` — reads
-  `upstream/generated_parser.y` + `grammar-actions.toml` +
-  `grammar-tokens.toml` and rewrites `src/grammar.y`. The *structure*
-  of the grammar (rule ordering, alternatives, precedence
-  declarations) comes from upstream; per-rule return types and
-  per-alt Rust action bodies live in `grammar-actions.toml`. Any alt
-  without a sidecar mapping gets an `Err(())` placeholder so the
-  grammar still compiles; the CLI prints the list of unmapped alts
-  at the end.
-
-Typical upgrade flow:
+`promql-sync` (see [its README](../promql-sync/README.md)) moves the pin:
 
 ```sh
-cargo run -p promql-sync -- pull --target <sha>
+cargo run -p promql-sync -- pull --set parser --target <sha>
 cargo run -p promql-sync -- generate-grammar
-# inspect git diff promql-parser/
-# for any new unmapped alts, add a [[actions]] entry in
-# grammar-actions.toml and (if needed) a helper in src/actions.rs.
+# add an [[actions]] entry in grammar-actions.toml, and a helper in
+# src/actions.rs if needed, for each alternative reported as unmapped
 cargo run -p promql-sync -- generate-grammar
 cargo test -p promql-parser
 ```
-
-See `upstream/UPSTREAM.md` for the vendoring provenance.
