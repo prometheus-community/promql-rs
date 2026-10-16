@@ -21,41 +21,40 @@ jobs:
           # touched UNSUPPORTED.md, which a shallow clone cannot see.
           fetch-depth: 0
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install build tools
+        uses: jdx/mise-action@v3
         with:
-          toolchain: "1.94"
-          components: rustfmt, clippy
+          version: "2026.10.11"
 
-      - name: Cache cargo registry
+      - name: Cache Rust builds
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+            ~/.cache/mbx
+          key: ${{ runner.os }}-mbx-${{ hashFiles('rust-toolchain.toml', 'mise.lock', 'Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-mbx-
 
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: mise run fmt-check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: mise run lint
 
       - name: Build
-        run: cargo build --workspace
+        run: mise run build
 
       - name: Test
-        run: cargo test --workspace
+        run: mise run test
 
       # Compiled but not run: benches that do not build rot silently.
       - name: Build benchmarks
-        run: cargo build --workspace --benches
+        run: mise run build-benches
 
       - name: Check vendored upstream files
-        run: cargo run -p promql-sync -- check
+        run: mise run check-upstream
 
       # The allowlist ratchet already fails when the pass set changes, but it
       # cannot see a SUPPORTED.toml committed without its matching
@@ -63,7 +62,7 @@ jobs:
       # what makes each commit's pass count trustworthy after the fact.
       - name: Check the promqltest allowlist is current
         run: |
-          PROMQL_PROMQLTEST_BLESS=1 cargo test -p promql-conformance --test promqltest
+          PROMQL_PROMQLTEST_BLESS=1 mise run test -p promql-conformance --test promqltest
           git diff --exit-code -- promql-conformance/testdata/prometheus/
 
       - name: Report promqltest progress

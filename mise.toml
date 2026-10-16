@@ -1,0 +1,45 @@
+[settings]
+lockfile = true
+locked = true
+idiomatic_version_file_enable_tools = ["rust"]
+
+[tools]
+# Explicit mbx invocations avoid duplicating the Rust version from rust-toolchain.toml.
+mr-boxington = "1.22.0"
+
+[tasks.build]
+description = "Build the workspace; extra arguments go to cargo"
+# This virtual workspace defaults to all members; -p can narrow the selection.
+run = "mbx build --locked"
+
+[tasks.test]
+description = "Run workspace tests, including doctests"
+run = "mbx test --locked"
+
+[tasks.lint]
+description = "Check all workspace targets with Clippy"
+run = "mbx clippy --locked --workspace --all-targets -- -D warnings"
+
+[tasks.build-benches]
+description = "Compile benchmarks without running them"
+run = "mbx build --locked --workspace --benches"
+
+[tasks.bench]
+description = "Run workspace benchmarks"
+run = "mbx bench --locked --workspace --benches"
+
+[tasks.check-upstream]
+description = "Verify vendored upstream hashes without network access"
+run = "mbx run --locked -p promql-sync -- check"
+
+[tasks.fmt]
+description = "Format the workspace in place"
+run = "cargo fmt --all"
+
+[tasks.fmt-check]
+description = "Check workspace formatting"
+run = "cargo fmt --all -- --check"
+
+[tasks.clean]
+description = "Remove this checkout's Cargo build directory"
+run = "cargo clean"

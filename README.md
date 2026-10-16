@@ -93,12 +93,41 @@ PROMQL_PROMQLTEST_BLESS=1 cargo test -p promql-conformance --test promqltest
 
 ## Build and test commands
 
-[`Cargo.toml`](Cargo.toml) records the minimum Rust version. The standard
-workspace build and test commands are:
+Install [mise](https://mise.jdx.dev/) 2026.10.11 or newer, then run from the
+repository root:
 
 ```sh
-cargo build --workspace
-cargo test --workspace
+mise trust
+mise install
+mise run build
+mise run test
+```
+
+[`rust-toolchain.toml`](rust-toolchain.toml) pins the compiler and components
+for both rustup and mise; [`Cargo.toml`](Cargo.toml) records the minimum Rust
+version. [`mise.lock`](mise.lock) locks tool downloads. After changing a tool
+version, run `mise lock` explicitly and commit the updated lockfile.
+
+The tasks in [`mise.toml`](mise.toml) compile through
+[mbx](https://mr-boxington.jdx.dev/), which caches compiler outputs across
+checkouts. Each checkout still needs its own target directory: do not point
+`CARGO_TARGET_DIR` at another worktree's directory, because conformance tests
+embed their fixture paths at compile time. Plain Cargo remains supported,
+but does not use mbx's shared cache.
+
+Use `mise tasks` to list tasks. `mise run lint`, `mise run fmt-check`,
+`mise run build-benches`, and `mise run check-upstream` run the corresponding
+CI checks; `mise run fmt` formats in place. `mise run bench` runs benchmarks,
+and `mise run clean` removes this checkout's build outputs, not the shared cache.
+Inspect the cache with `mise exec -- mbx cache stats`.
+
+Extra arguments are forwarded to Cargo. mise consumes the first `--`, so
+test-binary or benchmark flags need two separators:
+
+```sh
+mise run test -p promql-parser
+mise run test -p promql-parser -- -- --nocapture
+mise run bench -- -- --output-format bencher
 ```
 
 The [CI workflow](.github/workflows/ci.yml) defines the full checks and their

@@ -1,5 +1,14 @@
 # Working on promql-rs
 
+## Build tools
+
+Run builds and checks through the root `mise.toml` tasks: `mise run build`,
+`mise run test`, `mise run lint`, `mise run fmt-check`,
+`mise run build-benches`, and `mise run check-upstream`. Compile tasks use
+mbx's shared compiler cache; keep target directories separate as described below.
+`rust-toolchain.toml` owns the compiler pin. See README.md for installation,
+argument forwarding, and benchmark commands.
+
 ## The spec
 
 Prometheus at the commit named in `promql-conformance/testdata/prometheus/UPSTREAM.md`
