@@ -1,58 +1,70 @@
 # promql-sync
 
-A developer-invoked CLI that keeps the vendored upstream files honest and
-regenerates the parser's grammar from them. It never commits, branches or
-opens a pull request: an upgrade is a worktree diff that you review.
+A CLI that checks vendored Prometheus files, fetches upstream revisions, and
+generates the Rust parser grammar. It changes files in the worktree but never
+creates commits, branches, or pull requests.
 
-It manages two vendored sets, each with its own `MANIFEST.toml` (SHA-256 per
-file) and `UPSTREAM.md`:
+## Vendored sets
+
+Each set has a `MANIFEST.toml` with per-file SHA-256 hashes and an `UPSTREAM.md`
+with provenance:
 
 | `--set` | Directory | Contents |
 |---|---|---|
-| `parser` | `promql-parser/upstream/` | The Go sources the parser ports: `generated_parser.y`, `lex.go`, `ast.go`, `parse.go`, `functions.go`, `printer.go`. |
+| `parser` | `promql-parser/upstream/` | Go parser sources listed in the [parser provenance](../promql-parser/upstream/UPSTREAM.md). |
 | `promqltest` | `promql-conformance/testdata/prometheus/` | The `.test` corpus. |
 
-## Commands
+## Command reference
+
+Commands run from the repository root by default. The global `--root <path>`
+option selects another repository directory.
+
+### `check`
 
 ```sh
 cargo run -p promql-sync -- check [--set parser|promqltest]
 ```
 
-Verifies every vendored file against its manifest hash. It needs no network
-and changes nothing, so CI runs it on every pull request. A hand-edited
-vendored file fails by name.
+Verifies each vendored file against its manifest hash. Without `--set`, it
+checks all sets. It needs no network access and changes no files. A hash
+mismatch reports the file name and fails the check. CI runs this command on
+every pull request.
+
+### `pull`
 
 ```sh
 cargo run -p promql-sync -- pull --set parser --target <sha-or-tag> [--dry-run] [--report <path>]
 ```
 
-Fetches upstream at the target and compares it with the vendored files.
-`--set` defaults to `parser`. Without `--dry-run` it overwrites them, their `MANIFEST.toml` and the set's
-`sync-meta.toml`. It pulls one set per run, because each set needs different
-follow-up work: re-pinning `promqltest` moves test content, so the
-regeneration step in that set's `UPSTREAM.md` lands in the same change. The
-report defaults to `target/promql-sync-report.md`.
+Fetches upstream files at the target revision and compares them with the
+vendored files. Each run selects one set. `--set` defaults to `parser`.
+Without `--dry-run`, the command overwrites the vendored files,
+`MANIFEST.toml`, and the set's `sync-meta.toml`.
+
+The report path defaults to `target/promql-sync-report.md`. With `--dry-run`,
+the command still writes the report but leaves the vendored files, manifest,
+and revision metadata unchanged.
+
+A `promqltest` revision change also requires regeneration of `SUPPORTED.toml`
+and `UNSUPPORTED.md`. The
+[corpus upgrade procedure](../promql-conformance/testdata/prometheus/UPSTREAM.md#re-vendoring)
+describes the required checks.
+
+### `generate-grammar`
 
 ```sh
 cargo run -p promql-sync -- generate-grammar [--dry-run] [--out <path>]
 ```
 
-Rewrites `promql-parser/src/grammar.y`. The structure (rules, alternatives,
-precedence) comes from `upstream/generated_parser.y`. The Rust parts come from
-two sidecars: `grammar-actions.toml` (per-rule return types and per-alternative
-actions) and `grammar-tokens.toml`. An alternative without an action is
-emitted as an `Err(())` placeholder, so the grammar still compiles, and the
-tool lists every one at the end. `--dry-run` prints the grammar to stdout
-instead of writing it.
+Generates `promql-parser/src/grammar.y`. The vendored
+`upstream/generated_parser.y` supplies rules, alternatives, and precedence.
+`grammar-actions.toml` supplies return types and Rust actions.
+`grammar-tokens.toml` supplies token mappings.
 
-## Source layout
+An alternative without an action produces an `Err(())` placeholder, so the
+grammar still compiles. The command lists missing actions and their count.
+`--dry-run` prints the grammar to stdout without writing it. `--out` changes
+the output path.
 
-| File | Role |
-|---|---|
-| `src/main.rs` | CLI, vendored-set definitions, `check` and `pull` |
-| `src/yacc.rs` | Reads upstream's goyacc grammar |
-| `src/sidecar.rs` | Reads `grammar-actions.toml` and `grammar-tokens.toml` |
-| `src/emitter.rs` | Writes the grmtools `grammar.y` |
-
-[`docs/parser-sync.md`](../docs/parser-sync.md) is the design: classification
-of upstream changes, hashing, and resuming a sync that went red.
+The [parser sync design](../docs/parser-sync.md) describes upstream change
+classification, hashing, and the procedure for an upgrade that fails checks.

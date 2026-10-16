@@ -1,67 +1,88 @@
 # promql-conformance
 
-Replays Prometheus's own promqltest corpus against `promql-engine` and records
-what passes. The corpus is the 20-odd `.test` files under
-`testdata/prometheus/`, vendored from the commit pinned in `UPSTREAM.md`. Each
-`eval` carries its expected values inline. No oracle, Go toolchain or network
-is needed, so the suite runs in CI on every commit.
+Replays Prometheus's promqltest corpus against `promql-engine`. The `.test`
+files in `testdata/prometheus/` contain queries and expected values from the
+[vendored Prometheus revision](testdata/prometheus/UPSTREAM.md).
+The suite needs no reference server, Go toolchain, or network access.
 
-## How it fits
+## Test pipeline
 
-```text
-testdata/prometheus/*.test
-   │  prometheus::script        line scanner for load/eval/clear directives;
-   │                            series lines go through promql_parser::parse_series_desc
-   ▼
-Script { commands: [Load, Eval, Clear, …] }
-   │  prometheus::run           one Outcome per eval, against any result::Engine
-   ▼
-result::Engine  ◄── datafusion::DataFusionEngine
-   │                  seeds a MemorySeriesSource from the load blocks,
-   │                  runs promql_engine::Engine, maps errors
-   ▼
-Outcome / Verdict per eval
-   │  prometheus::supported     the gate: SUPPORTED.toml (an allowlist)
-   │  prometheus::report        the roadmap: UNSUPPORTED.md (scoreboard, missing features)
-```
+The modules process each script in this order:
+
+1. `prometheus::script` reads directives such as `load`, `eval`, and `clear`.
+   It passes series lines to `promql_parser::parse_series_desc`.
+2. `prometheus::run` evaluates the script through `result::Engine` and records
+   one `Outcome` per eval.
+3. `prometheus::supported` compares outcomes with `SUPPORTED.toml`.
+4. `prometheus::report` generates the counts and unsupported-feature report
+   in `UNSUPPORTED.md`.
+
+`tests/script.rs` checks the script parser against every vendored file without
+an engine. Script parse failures are distinct from evaluation failures.
 
 ## Public interface
 
-| Item | Use it to |
+The crate exposes an engine adapter interface and corpus utilities:
+
+| Item | Contract |
 |---|---|
-| `result::Engine` | The seam. `range_query(load, query, start, end, step)` and `instant_query(load, query, at)` return a `QueryResult`. It is synchronous because `libtest-mimic` trials are plain closures. |
-| `DataFusionEngine` | The `Engine` backed by `promql-engine`. Its `SourceMode` (`PROMQL_CONFORMANCE_SOURCE=plain\|chunked[=ms]\|blocks[=ms]\|partitions[=n]`) replays the corpus through the store shapes a real store produces. The answers must not depend on the mode. |
-| `QueryResult`, `Series`, `Sample`, `Point`, `Labels` | Engine-neutral results. |
-| `EngineError` | `Unsupported` ("not built yet") is kept apart from `Other` ("built wrong"). |
-| `prometheus::{load_corpus, Script, Command, Eval, Expect, …}` | The parsed corpus. |
-| `prometheus::{run_script, Outcome, Verdict, almost_equal}` | Running a script and comparing values the way upstream does. |
-| `prometheus::{Supported, Batch, Violation}` | Reading and checking `SUPPORTED.toml`. |
-| `prometheus::{scoreboard, inventory_markdown, FileStats}` | Producing `UNSUPPORTED.md`. |
+| `result::Engine` | Synchronous `range_query` and `instant_query` methods returning `QueryResult`. Synchronous methods match the `libtest-mimic` trial closures. |
+| `DataFusionEngine` | Adapter backed by `promql-engine`. Builds a `MemorySeriesSource` from each script's loaded data. |
+| `QueryResult`, `Series`, `Sample`, `Point`, `Labels` | Engine-independent result types. |
+| `EngineError` | Distinguishes `Unsupported` features from `Other` errors. |
+| `prometheus::{load_corpus, Script, Command, Eval, Expect}` | Corpus loading and parsed script types. |
+| `prometheus::{run_script, Outcome, Verdict, almost_equal}` | Script execution and upstream-compatible value comparison. `run_script` accepts any implementation of `result::Engine`. |
+| `prometheus::{Supported, Batch, Violation}` | Loading and validation of `SUPPORTED.toml`. |
+| `prometheus::{scoreboard, inventory_markdown, FileStats}` | Per-file results and generated report data. |
 
-To run the corpus against another engine, implement `result::Engine` and pass
-it to `run_script`.
+## Test commands
 
-## Running it
+The default command checks the allowlist and prints per-file results and
+unsupported features:
 
 ```sh
-cargo test -p promql-conformance --test promqltest          # the CI gate + scoreboard
-PROMQL_PROMQLTEST_ALL=1 cargo test -p promql-conformance --test promqltest            # every eval as a trial
-PROMQL_PROMQLTEST_ALL=1 cargo test -p promql-conformance --test promqltest -- topk    # narrowed
-PROMQL_CONFORMANCE_SOURCE=chunked cargo test -p promql-conformance --test promqltest  # one sample per chunk
-PROMQL_PROMQLTEST_BLESS=1 cargo test -p promql-conformance --test promqltest          # rewrite SUPPORTED.toml + UNSUPPORTED.md
+cargo test -p promql-conformance --test promqltest
 ```
 
-The gate is `SUPPORTED.toml`, not the pass count. CI turns red when:
+`PROMQL_PROMQLTEST_ALL=1` exposes every eval as a trial, including unsupported
+queries. A trial filter selects a file or feature:
 
-- a listed eval stops passing;
-- an unlisted eval starts passing (declare it by re-blessing);
-- a listed eval no longer exists after a re-pin.
+```sh
+PROMQL_PROMQLTEST_ALL=1 cargo test -p promql-conformance --test promqltest
+PROMQL_PROMQLTEST_ALL=1 cargo test -p promql-conformance --test promqltest -- operators/
+PROMQL_PROMQLTEST_ALL=1 cargo test -p promql-conformance --test promqltest -- topk
+```
 
-`UNSUPPORTED.md` is generated. It holds the pass counts by category (core,
-native histograms, subqueries, flag-gated), the per-file scoreboard and the
-missing features, each with the number of evals it blocks. Commit both files
-with the code that moved them (see `AGENTS.md`, gate 2).
+`PROMQL_CONFORMANCE_SOURCE` selects the input shape. Accepted values are
+`plain`, `chunked[=ms]`, `blocks[=ms]`, and `partitions[=n]`. Results must not
+depend on the source mode. For example, this command uses one sample per chunk:
 
-`tests/script.rs` checks that the line scanner reads every vendored file
-before any engine is involved. A scanner bug then cannot pass for an engine
-bug.
+```sh
+PROMQL_CONFORMANCE_SOURCE=chunked cargo test -p promql-conformance --test promqltest
+```
+
+## Allowlist and report
+
+[`SUPPORTED.toml`](testdata/prometheus/SUPPORTED.toml) determines whether CI
+passes, not the pass count. The suite fails when any of these conditions holds:
+
+- A listed eval fails.
+- An unlisted eval passes.
+- A listed eval no longer exists after an upstream revision change.
+
+[`UNSUPPORTED.md`](testdata/prometheus/UNSUPPORTED.md) contains generated pass
+counts by category, per-file results, and unsupported features with the number
+of evals each one blocks. This command regenerates both files:
+
+```sh
+PROMQL_PROMQLTEST_BLESS=1 cargo test -p promql-conformance --test promqltest
+```
+
+The [conformance requirement](../AGENTS.md) requires both generated files in
+the same change as the code that changes the results.
+
+## Comparison limits
+
+The [test documentation](tests/promqltest.rs) records the checks the suite
+performs and the annotation expectations it does not assert. A passing eval
+establishes only the behavior those checks cover.
