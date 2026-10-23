@@ -56,7 +56,7 @@ use crate::labels;
 use crate::matcher::{effective_matchers, METRIC_NAME};
 use crate::matrix;
 use crate::params::{step_count, Params};
-use crate::range::Func;
+use crate::range::{Func, RangeOp};
 use crate::selector;
 use crate::series::{Block, Series, BLOCK_END, BLOCK_START, LABELS, SAMPLES};
 use crate::series_eval::SeriesEval;
@@ -677,7 +677,7 @@ impl Planner<'_> {
         }
         if name == "absent_over_time" {
             let input = self
-                .range_over(call, Func::PresentOverTime, name, None)
+                .range_over(call, RangeOp::Func(Func::PresentOverTime), name, None)
                 .await?;
             return self.absent(&call.args[0], input);
         }
@@ -1144,6 +1144,7 @@ impl Planner<'_> {
     }
 
     /// A function of one range selector: `rate(x[5m])` and its family.
+    /// `predict_linear` is the one member with a scalar projection horizon.
     ///
     /// This call is what stands directly over the selector, so of `above`
     /// only the enclosing `by` reaches the store.
@@ -1156,12 +1157,23 @@ impl Planner<'_> {
         // an invalid query whether or not this engine has `deriv`.
         check_range_modifiers(call)?;
         let name = call.func.name.as_str();
+        if name == "predict_linear" {
+            // Prometheus evaluates this scalar alongside the matrix. This
+            // engine's scalar planning contract currently accepts only a
+            // step-invariant value; keep that limitation explicit instead
+            // of silently projecting with the first step's horizon.
+            let seconds = self.constant(&call.args[1], "the predict_linear function")?;
+            return self
+                .range_over(call, RangeOp::predict_linear(seconds), name, above.grouping)
+                .await;
+        }
         let func = Func::parse(name)
             .ok_or_else(|| EngineError::Unsupported(format!("the {name} function")))?;
-        self.range_over(call, func, name, above.grouping).await
+        self.range_over(call, RangeOp::Func(func), name, above.grouping)
+            .await
     }
 
-    /// `func` over the one range selector `call` takes, told to the store
+    /// `op` over the one range selector `call` takes, told to the store
     /// as `name`: the function the user wrote, which is not always the
     /// kernel that answers it. `absent_over_time` runs `present_over_time`
     /// below its complement, and the store should still hear the name
@@ -1169,36 +1181,46 @@ impl Planner<'_> {
     async fn range_over(
         &mut self,
         call: &Call,
-        func: Func,
+        op: RangeOp,
         name: &str,
         grouping: Option<&Grouping>,
     ) -> Result<Planned, EngineError> {
-        let (ms, vs) = match call.args.as_slice() {
-            [arg] => match unwrap_arg(arg) {
-                Expr::MatrixSelector(ms) => match ms.vector_selector.as_ref() {
-                    Expr::VectorSelector(vs) => (ms, vs),
+        let (ms, vs) = match (call.args.as_slice(), &op) {
+            // `check_call` has fixed the arity before planning. Keeping the
+            // two shapes distinct here makes it impossible for a future
+            // two-argument range function to have its scalar ignored.
+            ([arg], RangeOp::Func(_)) | ([arg, _], RangeOp::PredictLinear(_)) => {
+                match unwrap_arg(arg) {
+                    Expr::MatrixSelector(ms) => match ms.vector_selector.as_ref() {
+                        Expr::VectorSelector(vs) => (ms, vs),
+                        other => {
+                            return Err(EngineError::Unsupported(format!(
+                                "a range selector over {}",
+                                describe(other)
+                            )))
+                        }
+                    },
+                    Expr::Subquery(_) => return Err(EngineError::Unsupported("a subquery".into())),
                     other => {
                         return Err(EngineError::Unsupported(format!(
-                            "a range selector over {}",
+                            "the {name} function over {}",
                             describe(other)
                         )))
                     }
-                },
-                Expr::Subquery(_) => return Err(EngineError::Unsupported("a subquery".into())),
-                other => {
-                    return Err(EngineError::Unsupported(format!(
-                        "the {name} function over {}",
-                        describe(other)
-                    )))
                 }
-            },
-            // Out of reach: every range function this engine knows takes
-            // exactly one argument, and `check_call` has already said so.
+            }
+            // Unreachable for calls that passed `check_call`; retain a
+            // query error rather than letting an internal pairing mistake
+            // turn into an omitted vector.
             _ => {
+                let expected = match op {
+                    RangeOp::Func(_) => "exactly one argument",
+                    RangeOp::PredictLinear(_) => "exactly two arguments",
+                };
                 return Err(EngineError::Query(format!(
-                    "{name} expects exactly one argument, got {}",
+                    "{name} expects {expected}, got {}",
                     call.args.len()
-                )))
+                )));
             }
         };
         if ms.range_expr.is_some() {
@@ -1217,12 +1239,11 @@ impl Planner<'_> {
         };
         check_selector_bounds(params.at_ms, params.offset_ms)?;
         check_time_bound("the range", params.window_ms)?;
-        // `func` is this function, not the aggregation over it: `rate` is
-        // what decides which samples the store may skip. The aggregation's
-        // `by` still travels as `grouping`, because `rate` keeps each
-        // series' labels and so the labels it names are the ones read off
-        // these series. It does not license merging them: two counters
-        // merged below `rate` break reset detection.
+        // The range op decides which samples the store may skip. The
+        // aggregation's `by` still travels as `grouping`, because a range
+        // kernel keeps each series' labels and so the labels it names are
+        // the ones read off these series. It does not license merging
+        // them: two counters merged below `rate` break reset detection.
         let hints = self.hints(
             &params,
             Some(params.window_ms),
@@ -1232,11 +1253,12 @@ impl Planner<'_> {
             },
         );
         let (builder, input_names) = self.scan(vs, hints).await?;
-        let eval = SeriesEval::try_new(builder.build()?, Kernel::Range(func), params)?.into_plan();
+        let drops_metric_name = op.drops_metric_name();
+        let eval = SeriesEval::try_new(builder.build()?, Kernel::Range(op), params)?.into_plan();
         let builder = LogicalPlanBuilder::from(eval);
         // `__name__` is dropped above the grouping, not below it: below, two
         // series differing only in their name would fold into one group.
-        if !func.drops_metric_name() {
+        if !drops_metric_name {
             return Ok(Planned {
                 plan: builder.project(canonical(col(LABELS)))?.build()?,
                 label_names: input_names,

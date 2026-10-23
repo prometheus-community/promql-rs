@@ -1,0 +1,7 @@
+---
+source: promql-engine/tests/plan/functions.rs
+expression: "predict_linear(http_requests_total[5m], 3600)"
+---
+Projection: labels{job, pod}
+  SeriesEval: predict_linear(samples[5m], 3600, 600000..1200000 step 30s) per series per block
+    TableScan: http_requests_total

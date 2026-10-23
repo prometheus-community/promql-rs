@@ -636,7 +636,9 @@ mod tests {
         for kernel in [
             Kernel::Selector(Pick::Value),
             Kernel::Selector(Pick::Timestamp),
-            Kernel::Range(crate::range::Func::CountOverTime),
+            Kernel::Range(crate::range::RangeOp::Func(
+                crate::range::Func::CountOverTime,
+            )),
         ] {
             let grid = Params {
                 end_ms: 4 * M,

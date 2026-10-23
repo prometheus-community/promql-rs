@@ -266,7 +266,7 @@ mod tests {
         for kernel in [
             Kernel::Selector(selector::Pick::Value),
             Kernel::Selector(selector::Pick::Timestamp),
-            Kernel::Range(range::Func::Rate),
+            Kernel::Range(range::RangeOp::Func(range::Func::Rate)),
         ] {
             let input = raw();
             let physical: Arc<dyn ExecutionPlan> = Arc::new(crate::source::SeriesSetExec::new(
@@ -377,8 +377,12 @@ mod tests {
     #[test]
     fn logical_rebuild_retains_typed_parameters_and_name_bound_dependencies() {
         let input = raw();
-        let eval =
-            SeriesEval::try_new(input.clone(), Kernel::Range(range::Func::Rate), params()).unwrap();
+        let eval = SeriesEval::try_new(
+            input.clone(),
+            Kernel::Range(range::RangeOp::Func(range::Func::Rate)),
+            params(),
+        )
+        .unwrap();
         let rebuilt = eval.with_exprs_and_inputs(vec![], vec![input]).unwrap();
         assert_eq!(rebuilt, eval);
         assert_eq!(rebuilt.partial_cmp(&eval), Some(Ordering::Equal));

@@ -123,6 +123,37 @@ fn count_over_time() {
     assert_snapshot!("count_over_time", case.plan(query), query);
 }
 
+/// predict_linear is a range SeriesEval that carries its scalar horizon
+/// beside the window. It drops __name__ like other range kernels, so
+/// the labels are rebuilt field by field above it.
+#[test]
+fn predict_linear() {
+    let case = Case::new(
+        RANGE,
+        &[
+            r#"http_requests_total{job="api", pod="api-1"} 0"#,
+            r#"http_requests_total{job="web", pod="web-1"} 0"#,
+        ],
+    );
+    let query = "predict_linear(http_requests_total[5m], 3600)";
+    assert_snapshot!("predict_linear", case.plan(query), query);
+}
+
+/// deriv is an ordinary one-arg range SeriesEval: same boundary as rate,
+/// slope from linear_regression with intercept at the first sample.
+#[test]
+fn deriv() {
+    let case = Case::new(
+        RANGE,
+        &[
+            r#"http_requests_total{job="api", pod="api-1"} 0"#,
+            r#"http_requests_total{job="web", pod="web-1"} 0"#,
+        ],
+    );
+    let query = "deriv(http_requests_total[5m])";
+    assert_snapshot!("deriv", case.plan(query), query);
+}
+
 /// Four store partitions, each series whole in one of them and chunked
 /// within it. Each partition's Partial folds its own series Sorted and
 /// emits them finished; a merge on labels hands them in order to one Final,

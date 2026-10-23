@@ -29,3 +29,19 @@ fn an_at_modifier_on_a_range_function() {
         query
     );
 }
+
+/// @ pins the sample window on the SeriesEval while the scalar horizon
+/// stays beside it. The runtime still reanchors the regression on each
+/// evaluation step; the plan only records the pinned window.
+#[test]
+fn an_at_modifier_on_predict_linear() {
+    let case = Case::new(
+        RANGE,
+        &[
+            r#"http_requests_total{job="api", pod="api-1"} 0"#,
+            r#"http_requests_total{job="web", pod="web-1"} 0"#,
+        ],
+    );
+    let query = "predict_linear(http_requests_total[5m] @ 900, 3600)";
+    assert_snapshot!("an_at_modifier_on_predict_linear", case.plan(query), query);
+}

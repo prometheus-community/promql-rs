@@ -25,7 +25,7 @@
 //! behind, so the reach-back a block repeats is folded afresh.
 
 use crate::params::{step_count, Params};
-use crate::range::{advance_range, Func, Sweep};
+use crate::range::{advance_predict_linear, advance_range, RangeOp, Sweep};
 use crate::selector::{advance_selector, is_stale, Pick};
 
 /// Maximum new history between readiness/retirement checks, independent of
@@ -79,7 +79,8 @@ pub(crate) struct PushCursor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Hash)]
 pub(crate) enum Kernel {
     Selector(Pick),
-    Range(Func),
+    /// Window fold: ordinary range functions and `predict_linear`.
+    Range(RangeOp),
 }
 
 /// Immutable configuration belongs to the block, not to each series. The
@@ -291,8 +292,8 @@ impl BufferedSeriesIterator {
 impl WindowBuffer {
     pub(crate) fn new(context: &EvalContext) -> Self {
         let sweep = match context.kernel() {
-            Kernel::Range(func) => Sweep::new(func),
-            Kernel::Selector(_) => None,
+            Kernel::Range(RangeOp::Func(func)) => Sweep::new(func),
+            Kernel::Range(RangeOp::PredictLinear(_)) | Kernel::Selector(_) => None,
         };
         Self {
             sweep,
@@ -475,7 +476,12 @@ impl WindowBuffer {
     ) {
         match context.kernel() {
             Kernel::Selector(pick) => advance_selector(self, context, ts, vs, pick, budget, emit),
-            Kernel::Range(func) => advance_range(self, context, ts, vs, func, budget, emit),
+            Kernel::Range(RangeOp::Func(func)) => {
+                advance_range(self, context, ts, vs, func, budget, emit)
+            }
+            Kernel::Range(RangeOp::PredictLinear(seconds)) => {
+                advance_predict_linear(self, context, ts, vs, f64::from_bits(seconds), budget, emit)
+            }
         }
     }
 
@@ -817,7 +823,7 @@ mod tests {
 
     const S: i64 = 1000;
 
-    const FUNCS: [Func; 16] = [
+    const FUNCS: [Func; 17] = [
         Func::Rate,
         Func::Increase,
         Func::Delta,
@@ -834,11 +840,14 @@ mod tests {
         Func::StdvarOverTime,
         Func::Changes,
         Func::Resets,
+        Func::Deriv,
     ];
 
     /// `None` is the value selector; the sweeps use the same function set.
     fn kernel(func: Option<Func>) -> Kernel {
-        func.map_or(Kernel::Selector(Pick::Value), Kernel::Range)
+        func.map_or(Kernel::Selector(Pick::Value), |f| {
+            Kernel::Range(RangeOp::Func(f))
+        })
     }
 
     fn name(func: Option<Func>) -> &'static str {
@@ -956,7 +965,7 @@ mod tests {
                     Kernel::Selector(pick) => {
                         (a < b && !is_stale(vs[b - 1])).then(|| pick.of(ts[b - 1], vs[b - 1]))
                     }
-                    Kernel::Range(func) => {
+                    Kernel::Range(RangeOp::Func(func)) => {
                         let (ts, vs): (Vec<_>, Vec<_>) = ts[a..b]
                             .iter()
                             .copied()
@@ -972,6 +981,25 @@ mod tests {
                                 range_end: end,
                                 range_ms: p.window_ms,
                             },
+                        )
+                    }
+                    Kernel::Range(RangeOp::PredictLinear(seconds)) => {
+                        let (ts, vs): (Vec<_>, Vec<_>) = ts[a..b]
+                            .iter()
+                            .copied()
+                            .zip(vs[a..b].iter().copied())
+                            .filter(|(_, v)| !is_stale(*v))
+                            .unzip();
+                        crate::range::predict_linear(
+                            &crate::range::Window {
+                                ts: &ts,
+                                vs: &vs,
+                                range_start: end - p.window_ms,
+                                range_end: end,
+                                range_ms: p.window_ms,
+                            },
+                            f64::from_bits(seconds),
+                            step,
                         )
                     }
                 };
@@ -1052,7 +1080,7 @@ mod tests {
             at_ms: None,
         };
         for func in FUNCS {
-            let kernel = Kernel::Range(func);
+            let kernel = Kernel::Range(RangeOp::Func(func));
             let context = EvalContext::new(kernel, p);
             let mut it = BufferedSeriesIterator::new(&context);
             let mut out = Vec::new();
@@ -1074,7 +1102,7 @@ mod tests {
     #[test]
     fn one_indivisible_range_fold_is_charged_before_another_step_runs() {
         let context = EvalContext::new(
-            Kernel::Range(Func::SumOverTime),
+            Kernel::Range(RangeOp::Func(Func::SumOverTime)),
             Params {
                 start_ms: 10_000,
                 end_ms: 10_009,
@@ -1121,7 +1149,7 @@ mod tests {
             at_ms: None,
         };
         for func in FUNCS {
-            let kernel = Kernel::Range(func);
+            let kernel = Kernel::Range(RangeOp::Func(func));
             let expected = fresh(kernel, p, &ts, &vs);
             for units in [1, 2, 3, 257] {
                 assert_bits(
@@ -1173,9 +1201,9 @@ mod tests {
             };
             for kernel in [
                 Kernel::Selector(Pick::Value),
-                Kernel::Range(Func::Rate),
-                Kernel::Range(Func::MinOverTime),
-                Kernel::Range(Func::SumOverTime),
+                Kernel::Range(RangeOp::Func(Func::Rate)),
+                Kernel::Range(RangeOp::Func(Func::MinOverTime)),
+                Kernel::Range(RangeOp::Func(Func::SumOverTime)),
             ] {
                 let context = EvalContext::new(kernel, p);
                 let mut it = BufferedSeriesIterator::new(&context);
@@ -1220,8 +1248,8 @@ mod tests {
             };
             for kernel in [
                 Kernel::Selector(Pick::Value),
-                Kernel::Range(Func::Rate),
-                Kernel::Range(Func::SumOverTime),
+                Kernel::Range(RangeOp::Func(Func::Rate)),
+                Kernel::Range(RangeOp::Func(Func::SumOverTime)),
             ] {
                 let context = EvalContext::new(kernel, p);
                 let mut it = BufferedSeriesIterator::new(&context);
@@ -1383,7 +1411,7 @@ mod tests {
             Func::MaxOverTime,
             Func::LastOverTime,
         ] {
-            let context = EvalContext::new(Kernel::Range(func), params());
+            let context = EvalContext::new(Kernel::Range(RangeOp::Func(func)), params());
             let mut it = BufferedSeriesIterator::new(&context);
             it.push(
                 &context,
@@ -1417,7 +1445,7 @@ mod tests {
 
     #[test]
     fn boundary_on_range_start() {
-        let context = EvalContext::new(Kernel::Range(Func::CountOverTime), at_10m());
+        let context = EvalContext::new(Kernel::Range(RangeOp::Func(Func::CountOverTime)), at_10m());
         let mut it = BufferedSeriesIterator::new(&context);
         let mut out = SamplesBuilder::default();
         it.push(
@@ -1440,7 +1468,7 @@ mod tests {
             end_ms: 11 * M,
             ..at_10m()
         };
-        let context = EvalContext::new(Kernel::Range(Func::CountOverTime), p);
+        let context = EvalContext::new(Kernel::Range(RangeOp::Func(Func::CountOverTime)), p);
         let mut it = BufferedSeriesIterator::new(&context);
         let mut out = SamplesBuilder::default();
         it.push(&context, &[9 * M, 10 * M], &[1.0, 2.0], |t, v| {
@@ -1539,7 +1567,7 @@ mod tests {
             .zip([15.0, 16.0, 3.0, 4.0, 5.0, 6.0])
             .unzip();
 
-        let context = EvalContext::new(Kernel::Range(Func::Rate), p);
+        let context = EvalContext::new(Kernel::Range(RangeOp::Func(Func::Rate)), p);
         let mut it = BufferedSeriesIterator::new(&context);
         let mut out = SamplesBuilder::default();
         it.push(&context, &a0.0, &a0.1, |t, v| out.push(t, v));
@@ -1695,7 +1723,7 @@ mod tests {
         // A 5m window at 1m spacing holds five samples.
         let window_size = 5;
         for chunk in [1, 3, 10, 50] {
-            let context = EvalContext::new(Kernel::Range(Func::Rate), p);
+            let context = EvalContext::new(Kernel::Range(RangeOp::Func(Func::Rate)), p);
             let mut it = BufferedSeriesIterator::new(&context);
             let mut out = SamplesBuilder::default();
             let empty = out.size();
