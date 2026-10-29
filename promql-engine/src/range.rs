@@ -749,7 +749,7 @@ pub(crate) fn advance_predict_linear(
             }
             h += 1;
         }
-        if budget.exhausted() {
+        if !budget.take() {
             break;
         }
         // Intercept is the evaluation step, not `range_end`: with an

@@ -1148,16 +1148,49 @@ mod tests {
             offset_ms: 0,
             at_ms: None,
         };
-        for func in FUNCS {
-            let kernel = Kernel::Range(RangeOp::Func(func));
+        let kernels = FUNCS
+            .map(|func| Kernel::Range(RangeOp::Func(func)))
+            .into_iter()
+            .chain([Kernel::Range(RangeOp::predict_linear(3600.0))]);
+        for kernel in kernels {
             let expected = fresh(kernel, p, &ts, &vs);
             for units in [1, 2, 3, 257] {
                 assert_bits(
                     &budgeted(kernel, p, &[(&ts, &vs)], units),
                     &expected,
-                    &format!("{func:?} units={units}"),
+                    &format!("{kernel:?} units={units}"),
                 );
             }
+        }
+    }
+
+    #[test]
+    fn empty_predict_linear_windows_still_charge_one_unit_per_step() {
+        // One sample at the first step; past the fifth step every window is
+        // empty, so neither edge moves and the fold charges nothing. Only
+        // the per-step charge can stop the loop there.
+        let context = EvalContext::new(
+            Kernel::Range(RangeOp::predict_linear(3600.0)),
+            Params {
+                start_ms: 1000 * S,
+                end_ms: 1000 * S + 9_999 * S,
+                step_ms: S,
+                window_ms: 5 * S,
+                offset_ms: 0,
+                at_ms: None,
+            },
+        );
+        for units in [1, 2, 3, 257] {
+            let mut it = BufferedSeriesIterator::new(&context);
+            it.push(&context, &[1000 * S], &[1.], |_, _| {});
+            assert_eq!(window(&it).next_step, 1);
+            let before = window(&it).next_step;
+            assert!(
+                !it.close_budgeted(&context, &mut WorkBudget::new(units), |_, _| {}),
+                "units={units}: one budgeted close finished all 10000 steps"
+            );
+            let ran = window(&it).next_step - before;
+            assert!(ran <= units as i128, "units={units}: ran {ran} steps");
         }
     }
 
