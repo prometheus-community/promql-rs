@@ -864,19 +864,14 @@ mod tests {
         let ts: Vec<_> = (0..=10).map(|i| i * 5 * M).collect();
         let vs = [0., 10., 20., 30., 40., 0., 10., 20., 30., 40., 50.];
         let w = Window {
-            ts: &ts,
-            vs: &vs,
+            ts: &ts[1..],
+            vs: &vs[1..],
             range_start: 0,
             range_end: 50 * M,
             range_ms: 50 * M,
         };
         // PromQL's window is open at its left edge, so the sample at 0 is
         // excluded: this is the `functions.test` result at 50m.
-        let w = Window {
-            ts: &ts[1..],
-            vs: &vs[1..],
-            ..w
-        };
         assert_eq!(predict_linear(&w, 3600.0, 50 * M), Some(70.0));
     }
 
@@ -923,6 +918,29 @@ mod tests {
             },
         );
         assert_eq!(out, vec![(50 * M, 70.0)]);
+    }
+
+    #[test]
+    fn predict_linear_offset_intercept_is_eval_step_not_window_end() {
+        let ts: Vec<_> = (0..=10).map(|i| i * 5 * M).collect();
+        let vs = [0., 10., 20., 30., 40., 0., 10., 20., 30., 40., 50.];
+        let out = run_predict_linear(
+            3600.0,
+            &ts,
+            &vs,
+            Params {
+                start_ms: 55 * M,
+                end_ms: 55 * M,
+                window_ms: 50 * M,
+                offset_ms: 5 * M,
+                ..at_5m()
+            },
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].0, 55 * M);
+        // Offset 5m keeps the (0, 50m] window, whose fit reaches 70 at 50m.
+        // The 55m eval step adds 300s at 1/110 per second, yielding 800/11; the window end gives 70.
+        assert!((out[0].1 - 800.0 / 11.0).abs() < 1e-12, "{out:?}");
     }
 
     #[test]

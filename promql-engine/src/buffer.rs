@@ -1053,6 +1053,7 @@ mod tests {
             for kernel in kernels()
                 .map(kernel)
                 .chain([Kernel::Selector(Pick::Timestamp)])
+                .chain([Kernel::Range(RangeOp::predict_linear(3600.0))])
             {
                 let expected = fresh(kernel, p, &ts, &vs);
                 for units in [1, 2, 7, 31, 255, 256, 257, 8192] {
