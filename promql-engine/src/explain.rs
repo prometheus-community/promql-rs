@@ -48,6 +48,7 @@ use promql_parser::ast::LabelMatcher;
 
 use crate::buffer::Kernel;
 use crate::matcher::METRIC_NAME;
+use crate::range::RangeOp;
 use crate::series_eval::SeriesEval;
 use crate::source::{SelectHints, SelectorTable, SeriesSetExec};
 use crate::{absent, aggregate, labels, selector, series, to_scalar};
@@ -438,9 +439,15 @@ fn render_series_eval(eval: &SeriesEval) -> Option<String> {
                 p.start_ms, p.end_ms,
             )
         }
-        Kernel::Range(func) => format!(
+        Kernel::Range(RangeOp::Func(func)) => format!(
             "{}({samples}, {}..{} step {step})",
             func.as_str(),
+            p.start_ms,
+            p.end_ms,
+        ),
+        Kernel::Range(RangeOp::PredictLinear(seconds)) => format!(
+            "predict_linear({samples}, {}, {}..{} step {step})",
+            f64::from_bits(seconds),
             p.start_ms,
             p.end_ms,
         ),
@@ -1159,7 +1166,7 @@ mod tests {
                 "SeriesEval: vector_selector(samples offset 1h @ 900000, 600000..1200000 step 30s, lookback 5m, timestamp) per series per block",
             ),
             (
-                Kernel::Range(range::Func::Rate),
+                Kernel::Range(range::RangeOp::Func(range::Func::Rate)),
                 "SeriesEval: rate(samples[5m] offset 1h @ 900000, 600000..1200000 step 30s) per series per block",
             ),
         ] {
@@ -1174,15 +1181,22 @@ mod tests {
         }
         let mut p = params(0, None);
         p.step_ms = i64::MAX;
-        let plan = SeriesEval::try_new(input(), Kernel::Range(range::Func::Rate), p)
-            .unwrap()
-            .into_plan();
+        let plan = SeriesEval::try_new(
+            input(),
+            Kernel::Range(range::RangeOp::Func(range::Func::Rate)),
+            p,
+        )
+        .unwrap()
+        .into_plan();
         assert_eq!(render_line(&plan, true), plan.display().to_string());
     }
 
     #[test]
     fn range_function_renders_its_name_and_window() {
-        let plan = typed_eval(Kernel::Range(range::Func::Rate), params(0, None));
+        let plan = typed_eval(
+            Kernel::Range(range::RangeOp::Func(range::Func::Rate)),
+            params(0, None),
+        );
         assert_eq!(
             render_line(&plan, true),
             "SeriesEval: rate(samples[5m], 600000..1200000 step 30s) per series per block"
@@ -1192,7 +1206,7 @@ mod tests {
     #[test]
     fn range_function_with_offset_and_at() {
         let plan = typed_eval(
-            Kernel::Range(range::Func::Rate),
+            Kernel::Range(range::RangeOp::Func(range::Func::Rate)),
             params(3_600_000, Some(900_000)),
         );
         assert_eq!(render_line(&plan, true),
@@ -1203,7 +1217,7 @@ mod tests {
     fn range_function_with_unrenderable_step_falls_through_to_datafusion() {
         let mut p = params(0, None);
         p.step_ms = i64::MAX;
-        let plan = typed_eval(Kernel::Range(range::Func::Rate), p);
+        let plan = typed_eval(Kernel::Range(range::RangeOp::Func(range::Func::Rate)), p);
         assert_eq!(render_line(&plan, true), plan.display().to_string());
     }
 

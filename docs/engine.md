@@ -157,10 +157,14 @@ Other functions refold through `range::evaluate`; order-dependent functions
 read already chronological history.
 
 `offset` and `@` move window ends, which determine the answering block. Under
-`@`, every step shares one pinned window, so one block answers the whole grid.
-Its value (including an absent result) is computed once and repeated under the
-step budget; samples outside that window are not copied. Overlap is another
-reason chunks cannot be evaluated independently and their answers combined.
+`@`, every step shares one pinned sample window, so one block answers the
+whole grid and samples outside that window are not copied. Ordinary range
+kernels (`rate`, `*_over_time`, …) reduce that window once and repeat the
+value (including an absent result) under the step budget. `predict_linear`
+keeps the pinned samples but re-folds at each evaluation timestamp: upstream
+anchors the regression on `enh.Ts`, which still moves with the step when `@`
+has fixed the window. Overlap is another reason chunks cannot be evaluated
+independently and their answers combined.
 
 **Overlap.** Within a block, samples at or before the last timestamp already
 seen for the identity are skipped: first chunk wins, following Thanos's
