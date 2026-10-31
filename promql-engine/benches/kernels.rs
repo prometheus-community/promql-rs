@@ -260,7 +260,7 @@ fn runtime() -> tokio::runtime::Runtime {
 /// benchmark-only wrappers must not keep the removed native UDAFs alive.
 fn selected_plan(
     rt: &tokio::runtime::Runtime,
-    func: Option<Func>,
+    func: Option<BenchRangeFunc>,
     p: &Params,
     rows: Vec<Series>,
 ) -> Arc<dyn ExecutionPlan> {
@@ -270,9 +270,13 @@ fn selected_plan(
         .map(|at| format!(" @ {}", at / 1000))
         .unwrap_or_default();
     let query = match func {
-        Some(func) => format!(
+        Some(BenchRangeFunc::Func(func)) => format!(
             "{}(http_requests_total[{}ms]{modifier})",
             func.as_str(),
+            p.window_ms
+        ),
+        Some(BenchRangeFunc::PredictLinear) => format!(
+            "predict_linear(http_requests_total[{}ms]{modifier}, 3600)",
             p.window_ms
         ),
         None => format!("http_requests_total{modifier}"),
@@ -286,6 +290,12 @@ fn selected_plan(
     .unwrap()
     .physical_plan()
     .clone()
+}
+
+#[derive(Clone, Copy)]
+enum BenchRangeFunc {
+    Func(Func),
+    PredictLinear,
 }
 
 fn drain_plan(rt: &tokio::runtime::Runtime, plan: &Arc<dyn ExecutionPlan>, ctx: &Arc<TaskContext>) {
@@ -380,13 +390,44 @@ fn range_function(c: &mut Criterion) {
             ("count_over_time", Func::CountOverTime, &vs),
             ("max_over_time", Func::MaxOverTime, &vs),
             ("stddev_over_time", Func::StddevOverTime, &vs),
+            ("deriv", Func::Deriv, &vs),
             ("rate_stale_every_100", Func::Rate, &stale),
         ] {
             let plan = selected_plan(
                 &rt,
-                Some(func),
+                Some(BenchRangeFunc::Func(func)),
                 &p,
                 single_counter(ts.clone(), values.clone()),
+            );
+            assert_answers(&rt, &plan, &ctx);
+            g.bench_function(BenchmarkId::new(name, n), |b| {
+                b.iter(|| drain_plan(&rt, black_box(&plan), &ctx))
+            });
+        }
+    }
+    g.finish();
+}
+
+/// The pinned window is reused, while `predict_linear` refits at every
+/// evaluation timestamp because Prometheus anchors the intercept there.
+fn predict_linear_series(c: &mut Criterion) {
+    let rt = runtime();
+    let ctx = Arc::new(TaskContext::default());
+    let mut g = c.benchmark_group("series_eval/predict_linear");
+    for n in LENGTHS {
+        let (ts, vs) = counter(n);
+        let p = range_params(n);
+        let pinned = Params {
+            at_ms: Some(p.end_ms),
+            ..p
+        };
+        g.throughput(Throughput::Elements(n as u64));
+        for (name, params) in [("moving", &p), ("at_pinned", &pinned)] {
+            let plan = selected_plan(
+                &rt,
+                Some(BenchRangeFunc::PredictLinear),
+                params,
+                single_counter(ts.clone(), vs.clone()),
             );
             assert_answers(&rt, &plan, &ctx);
             g.bench_function(BenchmarkId::new(name, n), |b| {
@@ -402,7 +443,12 @@ fn range_apply(c: &mut Criterion) {
     let (k, n) = (1_000usize, 1_000usize);
     let rt = runtime();
     let ctx = Arc::new(TaskContext::default());
-    let plan = selected_plan(&rt, Some(Func::Rate), &range_params(n), labelled(k, n));
+    let plan = selected_plan(
+        &rt,
+        Some(BenchRangeFunc::Func(Func::Rate)),
+        &range_params(n),
+        labelled(k, n),
+    );
     assert_answers(&rt, &plan, &ctx);
     let mut g = c.benchmark_group("series_eval/range_apply");
     g.throughput(Throughput::Elements((k * n) as u64));
@@ -741,6 +787,7 @@ criterion_group! {
         selector_eval_series,
         selector_apply,
         range_function,
+        predict_linear_series,
         range_apply,
         aggregate_add_series,
         aggregate_singleton_spans,

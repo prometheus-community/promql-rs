@@ -5,6 +5,7 @@
 //! Floats only; native histograms are a later slice.
 
 use std::collections::VecDeque;
+use std::fmt;
 
 use crate::buffer::{EvalContext, WindowBuffer, WorkBudget};
 use crate::math;
@@ -27,6 +28,7 @@ pub enum Func {
     StdvarOverTime,
     Changes,
     Resets,
+    Deriv,
 }
 
 impl Func {
@@ -48,6 +50,7 @@ impl Func {
             "stdvar_over_time" => Func::StdvarOverTime,
             "changes" => Func::Changes,
             "resets" => Func::Resets,
+            "deriv" => Func::Deriv,
             _ => return None,
         })
     }
@@ -70,6 +73,7 @@ impl Func {
             Func::StdvarOverTime => "stdvar_over_time",
             Func::Changes => "changes",
             Func::Resets => "resets",
+            Func::Deriv => "deriv",
         }
     }
 
@@ -86,7 +90,8 @@ impl Func {
             | Self::StddevOverTime
             | Self::StdvarOverTime
             | Self::Changes
-            | Self::Resets => samples,
+            | Self::Resets
+            | Self::Deriv => samples,
             _ => 0,
         }
     }
@@ -95,6 +100,40 @@ impl Func {
     /// which "acts like offset" (`dropName` in `evalCall`).
     pub fn drops_metric_name(&self) -> bool {
         !matches!(self, Func::LastOverTime)
+    }
+}
+
+/// A window fold: an ordinary one-arg range function, or `predict_linear`
+/// with its scalar horizon. Lives under [`crate::buffer::Kernel::Range`] so
+/// the top-level kernel split stays selector vs window.
+///
+/// The horizon is `f64` bits so the logical node stays `Eq`/`Hash` for NaN.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Hash)]
+pub enum RangeOp {
+    Func(Func),
+    PredictLinear(u64),
+}
+
+impl RangeOp {
+    pub fn predict_linear(seconds: f64) -> Self {
+        Self::PredictLinear(seconds.to_bits())
+    }
+
+    pub fn drops_metric_name(&self) -> bool {
+        match self {
+            RangeOp::Func(func) => func.drops_metric_name(),
+            RangeOp::PredictLinear(_) => true,
+        }
+    }
+}
+
+/// Flatten `Func(Rate)` to `Rate` so physical-plan pins stay `Range(Rate)`.
+impl fmt::Debug for RangeOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RangeOp::Func(func) => write!(f, "{func:?}"),
+            RangeOp::PredictLinear(bits) => write!(f, "PredictLinear({bits})"),
+        }
     }
 }
 
@@ -141,7 +180,68 @@ pub fn evaluate(func: Func, w: &Window) -> Option<f64> {
                 .count() as f64,
         ),
         Func::Resets => Some(w.vs.windows(2).filter(|p| p[1] < p[0]).count() as f64),
+        // Prometheus's `funcDeriv`: slope only, intercept at the first
+        // sample so the fit stays near the data (`#2674`).
+        Func::Deriv => linear_regression(w.ts, w.vs, w.ts[0]).map(|(slope, _)| slope),
     }
+}
+
+/// Prometheus's `linearRegression` (`promql/functions.go` at 83962c35):
+/// least squares with timestamps relative to `intercept_ms`, Kahan sums
+/// folded in before the covariance. `deriv` uses the first sample's time;
+/// `predict_linear` uses the evaluation timestamp.
+///
+/// The constant-series path is intentional. Computing the covariance for a
+/// horizontal line can turn an exactly constant input into a rounded nearby
+/// output, while upstream returns slope 0 and the first value verbatim. An
+/// infinite constant is NaN, matching `linearRegression`'s `IsInf` guard.
+pub(crate) fn linear_regression(ts: &[i64], vs: &[f64], intercept_ms: i64) -> Option<(f64, f64)> {
+    if ts.len() < 2 {
+        return None;
+    }
+    // Locals, not `KahanSum` methods: same shape as `math::kahan_sum`, so
+    // the four compensations stay in registers for the whole window.
+    let (mut sum_x, mut c_x) = (0.0, 0.0);
+    let (mut sum_y, mut c_y) = (0.0, 0.0);
+    let (mut sum_xy, mut c_xy) = (0.0, 0.0);
+    let (mut sum_x2, mut c_x2) = (0.0, 0.0);
+    let first = vs[0];
+    let mut constant = true;
+    for (&t, &y) in ts.iter().zip(vs) {
+        constant &= y == first;
+        let x = (t - intercept_ms) as f64 / 1e3;
+        (sum_x, c_x) = math::kahan_inc(x, sum_x, c_x);
+        (sum_y, c_y) = math::kahan_inc(y, sum_y, c_y);
+        (sum_xy, c_xy) = math::kahan_inc(x * y, sum_xy, c_xy);
+        (sum_x2, c_x2) = math::kahan_inc(x * x, sum_x2, c_x2);
+    }
+    if constant {
+        return Some(if first.is_infinite() {
+            (f64::NAN, f64::NAN)
+        } else {
+            (0.0, first)
+        });
+    }
+    // Upstream folds each compensation into its sum before cov/var.
+    sum_x += c_x;
+    sum_y += c_y;
+    sum_xy += c_xy;
+    sum_x2 += c_x2;
+    let n = ts.len() as f64;
+    let cov_xy = sum_xy - sum_x * sum_y / n;
+    let var_x = sum_x2 - sum_x * sum_x / n;
+    let slope = cov_xy / var_x;
+    let intercept = sum_y / n - slope * sum_x / n;
+    Some((slope, intercept))
+}
+
+/// Prometheus's `funcPredictLinear`: project `linearRegression` from the
+/// evaluation timestamp (`enh.Ts`) by `seconds`. The window that supplies
+/// the samples may end at `@` or at `t − offset`; that end is not the
+/// regression origin.
+pub fn predict_linear(w: &Window, seconds: f64, intercept_ms: i64) -> Option<f64> {
+    let (slope, intercept) = linear_regression(w.ts, w.vs, intercept_ms)?;
+    Some(slope * seconds + intercept)
 }
 
 /// `result` in `extrapolatedRate`: the span of the window plus, for a
@@ -564,6 +664,106 @@ pub(crate) fn advance_range(
     (*lo, *hi, *next_step) = (base + l, base + h.max(l), next);
 }
 
+/// `predict_linear` walks the same sample window as an ordinary range
+/// function, but folds with the step timestamp as the regression
+/// intercept (`enh.Ts`). Under `@` the samples stay pinned while each
+/// step still gets its own intercept, so the value is not replayed.
+pub(crate) fn advance_predict_linear(
+    it: &mut WindowBuffer,
+    context: &EvalContext,
+    ts: &[i64],
+    vs: &[f64],
+    seconds: f64,
+    budget: &mut WorkBudget,
+    mut emit: impl FnMut(i64, f64),
+) {
+    let WindowBuffer {
+        base,
+        lo,
+        hi,
+        next_step,
+        last_t,
+        ..
+    } = it;
+    let p = context.params();
+    let steps = context.steps();
+    if p.window_ms <= 0 || *next_step >= steps {
+        return;
+    }
+    let Some(ready) = *last_t else {
+        return;
+    };
+    let window = |l: usize, h: usize, range_end: i64| Window {
+        ts: &ts[l..h],
+        vs: &vs[l..h],
+        range_start: range_end - p.window_ms,
+        range_end,
+        range_ms: p.window_ms,
+    };
+    if let Some(at) = p.at_ms {
+        let range_end = at - p.offset_ms;
+        if range_end > ready {
+            return;
+        }
+        let l = ts.partition_point(|t| *t <= range_end - p.window_ms);
+        let h = ts.partition_point(|t| *t <= range_end);
+        let w = window(l, h, range_end);
+        while *next_step < steps {
+            if budget.exhausted() {
+                return;
+            }
+            let step = context.step_at(*next_step);
+            if !budget.take() {
+                return;
+            }
+            if let Some(value) = predict_linear(&w, seconds, step) {
+                emit(step, value);
+            }
+            budget.account_kernel(h - l);
+            *next_step += 1;
+        }
+        return;
+    }
+    let base = *base;
+    let (mut l, mut h, mut next) = (*lo - base, *hi - base, *next_step);
+    let mut step = (i128::from(p.start_ms) + next * i128::from(p.step_ms)) as i64;
+    while next < steps {
+        let range_end = step - p.offset_ms;
+        if range_end > ready {
+            break;
+        }
+        let range_start = range_end - p.window_ms;
+        while l < ts.len() && ts[l] <= range_start {
+            if !budget.take() {
+                break;
+            }
+            l += 1;
+        }
+        if budget.exhausted() {
+            break;
+        }
+        h = h.max(l);
+        while h < ts.len() && ts[h] <= range_end {
+            if !budget.take() {
+                break;
+            }
+            h += 1;
+        }
+        if !budget.take() {
+            break;
+        }
+        // Intercept is the evaluation step, not `range_end`: with an
+        // offset those differ, and upstream still passes `enh.Ts`.
+        if let Some(value) = predict_linear(&window(l, h, range_end), seconds, step) {
+            emit(step, value);
+        }
+        budget.account_kernel(h - l);
+        next += 1;
+        step = step.wrapping_add(p.step_ms);
+    }
+    (*lo, *hi, *next_step) = (base + l, base + h.max(l), next);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,7 +778,22 @@ mod tests {
 
     /// One series in one chunk, pushed and closed.
     fn run(func: Func, ts: &[i64], vs: &[f64], p: Params) -> Vec<(i64, f64)> {
-        let context = EvalContext::new(Kernel::Range(func), p);
+        let context = EvalContext::new(Kernel::Range(RangeOp::Func(func)), p);
+        let mut it = BufferedSeriesIterator::new(&context);
+        let mut out = SamplesBuilder::default();
+        it.push(&context, ts, vs, |t, v| out.push(t, v));
+        it.close(&context, |t, v| out.push(t, v));
+        out.finish_row();
+        let row = out.take_all().value(0);
+        let (ts, vs) = series::sample_slices(row.as_struct());
+        ts.iter().copied().zip(vs.iter().copied()).collect()
+    }
+
+    /// The same streamed evaluator used by planning, rather than a direct
+    /// call to `predict_linear`, so this holds the scalar horizon and window
+    /// boundary behaviour together.
+    fn run_predict_linear(seconds: f64, ts: &[i64], vs: &[f64], p: Params) -> Vec<(i64, f64)> {
+        let context = EvalContext::new(Kernel::Range(RangeOp::predict_linear(seconds)), p);
         let mut it = BufferedSeriesIterator::new(&context);
         let mut out = SamplesBuilder::default();
         it.push(&context, ts, vs, |t, v| out.push(t, v));
@@ -619,6 +834,136 @@ mod tests {
         assert!((out[0].1 - 10.0).abs() < 1e-12, "{out:?}");
         let out = run(Func::Delta, &ts, &vs, at_5m());
         assert!((out[0].1 - 10.0).abs() < 1e-12, "{out:?}");
+    }
+
+    #[test]
+    fn deriv_is_the_slope_anchored_at_the_first_sample() {
+        // `functions.test`: same series as predict_linear's fit, slope
+        // 0.010606... with intercept at the first in-window sample.
+        let ts: Vec<_> = (0..=10).map(|i| i * 5 * M).collect();
+        let vs = [0., 10., 20., 30., 40., 0., 10., 20., 30., 40., 50.];
+        let out = run(
+            Func::Deriv,
+            &ts,
+            &vs,
+            Params {
+                start_ms: 50 * M,
+                end_ms: 50 * M,
+                window_ms: 100 * M,
+                ..at_5m()
+            },
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!((out[0].1 - 0.010606060606060607).abs() < 1e-12, "{out:?}");
+    }
+
+    #[test]
+    fn predict_linear_projects_from_the_eval_timestamp() {
+        // `functions.test`: a reset in the middle makes the fitted line's
+        // value at 3000s 38.636..., and one hour beyond it exactly 70.
+        let ts: Vec<_> = (0..=10).map(|i| i * 5 * M).collect();
+        let vs = [0., 10., 20., 30., 40., 0., 10., 20., 30., 40., 50.];
+        let w = Window {
+            ts: &ts[1..],
+            vs: &vs[1..],
+            range_start: 0,
+            range_end: 50 * M,
+            range_ms: 50 * M,
+        };
+        // PromQL's window is open at its left edge, so the sample at 0 is
+        // excluded: this is the `functions.test` result at 50m.
+        assert_eq!(predict_linear(&w, 3600.0, 50 * M), Some(70.0));
+    }
+
+    #[test]
+    fn predict_linear_keeps_constant_values_exact() {
+        let w = Window {
+            ts: &[10_000, 20_000, 30_000],
+            vs: &[1.5990505637277868; 3],
+            range_start: 0,
+            range_end: 30_000,
+            range_ms: 30_000,
+        };
+        assert_eq!(
+            predict_linear(&w, 3600.0, 30_000).unwrap().to_bits(),
+            w.vs[0].to_bits()
+        );
+    }
+
+    #[test]
+    fn predict_linear_turns_a_constant_infinity_into_nan() {
+        let w = Window {
+            ts: &[10_000, 20_000, 30_000],
+            vs: &[f64::INFINITY; 3],
+            range_start: 0,
+            range_end: 30_000,
+            range_ms: 30_000,
+        };
+        assert!(predict_linear(&w, 3600.0, 30_000).unwrap().is_nan());
+    }
+
+    #[test]
+    fn predict_linear_streams_the_same_window_as_other_range_kernels() {
+        let ts: Vec<_> = (0..=10).map(|i| i * 5 * M).collect();
+        let vs = [0., 10., 20., 30., 40., 0., 10., 20., 30., 40., 50.];
+        let out = run_predict_linear(
+            3600.0,
+            &ts,
+            &vs,
+            Params {
+                start_ms: 50 * M,
+                end_ms: 50 * M,
+                window_ms: 50 * M,
+                ..at_5m()
+            },
+        );
+        assert_eq!(out, vec![(50 * M, 70.0)]);
+    }
+
+    #[test]
+    fn predict_linear_offset_intercept_is_eval_step_not_window_end() {
+        let ts: Vec<_> = (0..=10).map(|i| i * 5 * M).collect();
+        let vs = [0., 10., 20., 30., 40., 0., 10., 20., 30., 40., 50.];
+        let out = run_predict_linear(
+            3600.0,
+            &ts,
+            &vs,
+            Params {
+                start_ms: 55 * M,
+                end_ms: 55 * M,
+                window_ms: 50 * M,
+                offset_ms: 5 * M,
+                ..at_5m()
+            },
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].0, 55 * M);
+        // Offset 5m keeps the (0, 50m] window, whose fit reaches 70 at 50m.
+        // The 55m eval step adds 300s at 1/110 per second, yielding 800/11; the window end gives 70.
+        assert!((out[0].1 - 800.0 / 11.0).abs() < 1e-12, "{out:?}");
+    }
+
+    #[test]
+    fn predict_linear_under_at_reanchors_each_eval_timestamp() {
+        // `functions.test`: samples through 50m, window ends at `@ 3000`
+        // (50m), eval at 10m. Samples stay on the pinned window; the fit
+        // uses the 10m evaluation timestamp.
+        let ts: Vec<_> = (0..=10).map(|i| i * 5 * M).collect();
+        let vs = [0., 10., 20., 30., 40., 0., 10., 20., 30., 40., 50.];
+        let out = run_predict_linear(
+            3600.0,
+            &ts,
+            &vs,
+            Params {
+                start_ms: 10 * M,
+                end_ms: 10 * M,
+                window_ms: 55 * M,
+                at_ms: Some(50 * M),
+                ..at_5m()
+            },
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!((out[0].1 - 51.36363636363637).abs() < 1e-9, "{out:?}");
     }
 
     #[test]
@@ -793,7 +1138,7 @@ mod tests {
     /// recomputes both bounds per step with `partition_point`, so it
     /// pins each walk against an independent oracle rather than
     /// against itself.
-    const ALL: [Func; 16] = [
+    const ALL: [Func; 17] = [
         Func::Rate,
         Func::Increase,
         Func::Delta,
@@ -810,6 +1155,7 @@ mod tests {
         Func::StdvarOverTime,
         Func::Changes,
         Func::Resets,
+        Func::Deriv,
     ];
 
     /// The executor's oracles resolve a query through `parse` too, so a name
@@ -983,7 +1329,7 @@ mod tests {
         base: usize,
         k: usize,
     ) -> Vec<(i64, f64)> {
-        let context = EvalContext::new(Kernel::Range(func), p);
+        let context = EvalContext::new(Kernel::Range(RangeOp::Func(func)), p);
         let mut it = WindowBuffer::new(&context);
         (it.base, it.lo, it.hi) = (base, base, base);
         let mut out = Vec::new();

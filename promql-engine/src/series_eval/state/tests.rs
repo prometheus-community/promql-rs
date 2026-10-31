@@ -4,7 +4,7 @@ use super::*;
 use crate::buffer::Kernel;
 use crate::error::EngineError;
 use crate::params::Params;
-use crate::range::Func;
+use crate::range::{Func, RangeOp};
 use datafusion::arrow::array::{Array, AsArray, StringViewArray, StringViewBuilder};
 use datafusion::arrow::buffer::Buffer;
 use datafusion::arrow::datatypes::{DataType, Field};
@@ -126,7 +126,7 @@ fn aliased_source_children_become_independent_owned_values_without_interning() {
 #[test]
 fn finalization_retains_window_and_sweep_capacity_until_release_checkpoint() {
     let context = EvalContext::new(
-        Kernel::Range(Func::Rate),
+        Kernel::Range(RangeOp::Func(Func::Rate)),
         Params {
             start_ms: 3000,
             end_ms: 6000,
@@ -164,7 +164,7 @@ fn empty_chunks_keep_the_block_grid_and_batch_owner_emits_one_empty_row() {
     for kernel in [
         Kernel::Selector(crate::selector::Pick::Value),
         Kernel::Selector(crate::selector::Pick::Timestamp),
-        Kernel::Range(Func::Rate),
+        Kernel::Range(RangeOp::Func(Func::Rate)),
     ] {
         let context = EvalContext::new(kernel, grid());
         let mut fold = SeriesFold::new(&context);
