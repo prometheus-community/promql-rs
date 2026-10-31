@@ -13,13 +13,13 @@ env:
   RUST_BACKTRACE: 1
   # The cached target/ is what CI stores and restores, so shrink it. Line
   # tables keep file:line in test backtraces (RUST_BACKTRACE is on) without
-  # full variable info. The bench profile's `debug = true` exists for local
-  # pprof runs and CI only compiles benches. Incremental state is rebuilt per
-  # commit and the cache action prunes it anyway.
+  # full variable info. Incremental state is rebuilt per commit and the cache
+  # action prunes it anyway. No bench-profile override: `build --benches`
+  # compiles benches in the dev profile, so `[profile.bench] debug = true`
+  # never reaches CI.
   CARGO_INCREMENTAL: 0
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
-  CARGO_PROFILE_BENCH_DEBUG: 0
 
 jobs:
   ci:
