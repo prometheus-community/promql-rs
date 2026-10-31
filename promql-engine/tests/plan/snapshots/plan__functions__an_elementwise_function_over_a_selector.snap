@@ -1,0 +1,9 @@
+---
+source: promql-engine/tests/plan/functions.rs
+expression: abs(temperature)
+---
+Projection: labels{city}, promql_elementwise(abs_0.samples, Utf8("abs"), Float64(NULL), Float64(NULL))
+  SubqueryAlias: abs_0
+    Projection: labels, samples, block_start, block_end
+      SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+        TableScan: temperature

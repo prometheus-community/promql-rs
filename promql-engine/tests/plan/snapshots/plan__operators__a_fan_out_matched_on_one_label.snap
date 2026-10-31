@@ -1,0 +1,19 @@
+---
+source: promql-engine/tests/plan/operators.rs
+expression: requests / on(job) group_left(zone) limit
+---
+Projection: __pairs__.labels, __pairs__.samples, TimestampMillisecond(-9223372036854775808, None), TimestampMillisecond(9223372036854775807, None)
+  Unnest: lists[] structs[__pairs__]
+    Unnest: lists[__pairs__|depth=1] structs[]
+      Aggregate: groupBy=[[labels.job AS __group__job]], aggr=[[promql_binary(samples, __rhs, labels, Utf8("/"), Utf8("on(job) group_left(zone)"), Int64(600000), Int64(1200000), Int64(30000)) AS __pairs__]]
+        Union
+          Projection: binary_0.labels{__name__, job, pod, zone: Utf8("")} AS labels, binary_0.samples, Boolean(false) AS __rhs
+            SubqueryAlias: binary_0
+              Projection: labels, samples, block_start, block_end
+                SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+                  TableScan: selector_0 requests
+          Projection: binary_1.labels{__name__, job, pod: Utf8(""), zone} AS labels, binary_1.samples, Boolean(true) AS __rhs
+            SubqueryAlias: binary_1
+              Projection: labels, samples, block_start, block_end
+                SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+                  TableScan: selector_1 limit

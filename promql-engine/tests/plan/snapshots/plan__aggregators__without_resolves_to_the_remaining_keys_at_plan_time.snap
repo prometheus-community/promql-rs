@@ -1,0 +1,9 @@
+---
+source: promql-engine/tests/plan/aggregators.rs
+expression: "sum without (pod) (rate(http_requests_total[5m]))"
+---
+Projection: labels{job: __group__job}
+  Aggregate: sum by (job) (samples, 600000..1200000 step 30s) per block
+    Projection: labels{job, pod}
+      SeriesEval: rate(samples[5m], 600000..1200000 step 30s) per series per block
+        TableScan: http_requests_total

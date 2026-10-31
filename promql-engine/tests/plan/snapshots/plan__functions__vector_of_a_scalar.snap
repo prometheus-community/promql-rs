@@ -1,0 +1,5 @@
+---
+source: promql-engine/tests/plan/functions.rs
+expression: vector(time())
+---
+TableScan: scalar_0

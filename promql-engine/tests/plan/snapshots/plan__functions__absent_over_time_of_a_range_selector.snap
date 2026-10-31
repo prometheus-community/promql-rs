@@ -1,0 +1,9 @@
+---
+source: promql-engine/tests/plan/functions.rs
+expression: "absent_over_time(temperature{city=\"oslo\"}[5m])"
+---
+Projection: labels{city: Utf8("oslo")}, TimestampMillisecond(-9223372036854775808, None), TimestampMillisecond(9223372036854775807, None)
+  Aggregate: absent(samples, 600000..1200000 step 30s) over the whole range
+    Projection: labels{city}
+      SeriesEval: present_over_time(samples[5m], 600000..1200000 step 30s) per series per block
+        TableScan: temperature{city="oslo"}

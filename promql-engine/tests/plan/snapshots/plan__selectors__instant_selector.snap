@@ -1,0 +1,7 @@
+---
+source: promql-engine/tests/plan/selectors.rs
+expression: "http_requests_total{job=\"api\"}"
+---
+Projection: labels, samples, block_start, block_end
+  SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+    TableScan: http_requests_total{job="api"}

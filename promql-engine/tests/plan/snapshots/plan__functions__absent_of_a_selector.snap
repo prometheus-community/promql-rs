@@ -1,0 +1,9 @@
+---
+source: promql-engine/tests/plan/functions.rs
+expression: "absent(temperature{city=\"oslo\", region=~\"eu.*\"})"
+---
+Projection: labels{city: Utf8("oslo")}, TimestampMillisecond(-9223372036854775808, None), TimestampMillisecond(9223372036854775807, None)
+  Aggregate: absent(samples, 600000..1200000 step 30s) over the whole range
+    Projection: labels, samples, block_start, block_end
+      SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+        TableScan: temperature{city="oslo",region=~"eu.*"}

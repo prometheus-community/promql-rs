@@ -1,0 +1,7 @@
+---
+source: promql-engine/tests/plan/functions.rs
+expression: year()
+---
+Projection: labels{}, promql_elementwise(year_1.samples, Utf8("year"), Float64(NULL), Float64(NULL))
+  SubqueryAlias: year_1
+    TableScan: scalar_0

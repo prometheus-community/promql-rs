@@ -1,4 +1,4 @@
-//! The planner's output shape, pinned as text in `testdata/plans/*.yaml`.
+//! The planner's output shape, pinned as insta snapshots in `plan/snapshots/`.
 //!
 //! Every other suite here checks numbers, which a planner change can keep
 //! right while quietly moving work between nodes: a projection that stops
@@ -10,42 +10,44 @@
 //! pin needs its own reader-facing text and what makes that text safe to
 //! trust.
 //!
-//! The expectations are descriptive, not normative: a deliberate planner
-//! change updates the YAML, and that diff is the review. The corpus is
-//! meant to grow one query at a time as shapes are added.
+//! The snapshots are descriptive, not normative: a deliberate planner
+//! change re-blesses them with `cargo insta review` (or `cargo insta
+//! accept`, or `INSTA_UPDATE=always cargo test`), in a commit of its own
+//! whose message says why the shape moved, and that diff is the review.
+//! The corpus is meant to grow one query at a time as shapes are added.
 //!
-//! # One file per upstream topic
+//! # One module per upstream topic
 //!
-//! Each file is named after the promqltest file in
+//! Each module under `plan/` is named after the promqltest file in
 //! `promql-conformance/testdata/prometheus/` whose topic it covers, so a
-//! shape sits next to the evaluations that check its numbers. A file is
-//! self-contained like a `.test` file: its `defaults` are the query range
-//! its cases plan with, so the literals in a plan never differ within a
-//! file unless a case sets a `range` of its own, for a shape that only
-//! exists at other bounds. Each file is its own `#[test]`, named after
-//! it, and a file missing from the list at the bottom fails the suite
-//! rather than never running.
+//! shape sits next to the evaluations that check its numbers. A module's
+//! `RANGE` is the query range its cases plan with, so the literals in a
+//! plan never differ within a module unless a case passes bounds of its
+//! own, for a shape that only exists at other bounds.
+//!
+//! Modules are code, so none can be left out of a run the way a data file
+//! could. What can go stale is the other direction, a `.snap` file whose
+//! test was renamed or deleted: `cargo insta test --unreferenced=reject`
+//! names those.
 //!
 //! # Adding a case
 //!
-//! Append an entry to the file for its topic, or start a file named after
-//! the upstream `.test` file and add it to `plan_files!`, with a `name`, a
-//! `description` saying what shape it pins, the `load` series the query
-//! runs over, the `query: |`, and an empty `plan: |` block. Both of those
-//! are block scalars even for a one-line query, so every entry has one
-//! shape and a long query can be wrapped. Run the test:
-//! the failure prints the rendered plan, and pasting it in is the whole
-//! edit. Read it before pasting — the point is to notice a shape you did
-//! not expect, not to record one.
+//! Add a test to the module for its topic, or start a module named after
+//! the upstream `.test` file, with a doc comment saying what shape it pins,
+//! the series the query runs over, and an `assert_snapshot!` named after
+//! the test whose third argument is the query, so the `.snap` header shows
+//! it. Run `cargo insta test --review`: a case without a snapshot fails and
+//! the review prints the rendered plan. Read it before accepting. The
+//! point is to notice a shape you did not expect, not to record one.
 //!
-//! A `physical: |` block, added the same way, also pins the
-//! `ExecutionPlan`, rendered by `promql_engine::explain_physical_plan`:
-//! the calls read as in the logical plan, and every column printed keeps
-//! the `@index` the node evaluates. Only small cases can carry one: partition
-//! counts and repartitioning make larger physical plans too fragile to
-//! hold as text.
+//! [`Case::physical`], asserted as a second snapshot named `<test>_physical`,
+//! also pins the `ExecutionPlan`, rendered by
+//! `promql_engine::explain_physical_plan`: the calls read as in the logical
+//! plan, and every column printed keeps the `@index` the node evaluates.
+//! Only small cases can carry one: partition counts and repartitioning make
+//! larger physical plans too fragile to hold as text.
 //!
-//! `chunked_ms` and `partitions` run a case over
+//! [`Case::chunked`] and [`Case::partitions`] run a case over
 //! [`MemorySeriesSource::chunked`] and [`MemorySeriesSource::partitions`],
 //! the ID-contiguous store shapes the evaluator consumes.
 //!
@@ -56,22 +58,10 @@
 //! the shape being pinned, and a case that shares someone else's fixture
 //! would pin someone else's schema. Only the label set reaches the
 //! planner, so one sample per series is enough and a second adds
-//! nothing; the loader rejects any series carrying more, so the corpus
-//! cannot drift into looking like a data-driven evaluation suite. A
-//! chunked case is the exception: there the samples decide how many
+//! nothing; [`Case::source`] rejects any series carrying more, so the
+//! corpus cannot drift into looking like a data-driven evaluation suite.
+//! A chunked case is the exception: there the samples decide how many
 //! batches the store hands over, which the physical plan shows.
-//!
-//! # Conventions borrowed
-//!
-//! The file layout — `defaults` holding the query range, which a case
-//! may override with a `range` of its own, `tests` holding
-//! `name`/`description`/`load`/`query` — is the shared engine test-case
-//! format that `promql-testcases` binds (thanos-io/promql-engine's
-//! `testcases/range_queries.yaml`), read with the same `serde_norway`,
-//! with `plan` added and `load` as a list of series rather than a
-//! promqltest block. It sits under `testdata/` and resolves against
-//! `CARGO_MANIFEST_DIR`, like the conformance corpus, so the suite does
-//! not care where it was invoked from.
 //!
 //! # Why no Filter appears
 //!
@@ -79,7 +69,6 @@
 //! so they never become a plan node, and two queries differing only in
 //! their matchers render the same text.
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use datafusion::physical_expr::expressions::Column;
@@ -89,8 +78,22 @@ use datafusion::physical_plan::{
     displayable, Distribution, ExecutionPlan, ExecutionPlanProperties, Partitioning,
 };
 use promql_engine::{Engine, EngineOptions, MemorySeriesSource, RangeQuery, SeriesSource};
-use serde::Deserialize;
 use std::num::{NonZeroU64, NonZeroUsize};
+
+// A test crate's root resolves `mod` against `tests/`, where each file is
+// a test binary of its own and `functions.rs` already is one.
+#[path = "plan/aggregators.rs"]
+mod aggregators;
+#[path = "plan/at_modifier.rs"]
+mod at_modifier;
+#[path = "plan/functions.rs"]
+mod functions;
+#[path = "plan/operators.rs"]
+mod operators;
+#[path = "plan/range_queries.rs"]
+mod range_queries;
+#[path = "plan/selectors.rs"]
+mod selectors;
 
 fn nz(n: usize) -> NonZeroUsize {
     NonZeroUsize::new(n).expect("a count of at least one")
@@ -100,120 +103,131 @@ fn nz64(n: u64) -> NonZeroU64 {
     NonZeroU64::new(n).expect("a span of at least a millisecond")
 }
 
-#[derive(Debug, Deserialize)]
-struct Suite {
-    defaults: Bounds,
-    tests: Vec<Case>,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy)]
 struct Bounds {
     start_ms: i64,
     end_ms: i64,
     step_ms: i64,
 }
 
-#[derive(Debug, Deserialize)]
+/// The series a pinned query plans over, and the store shape that hands
+/// them over.
+#[derive(Debug)]
 struct Case {
-    name: String,
-    #[allow(dead_code)]
-    description: Option<String>,
-    load: Vec<String>,
-    query: String,
-    plan: String,
-    /// The `ExecutionPlan`, for shapes the logical plan cannot show: the
-    /// store-order wrapper and the physical operators DataFusion picks.
-    /// Pinned only where the text does not depend on the machine.
-    physical: Option<String>,
-    /// [`MemorySeriesSource::chunked`]: the store hands each series over
-    /// as chunks of at most this span, which only the physical plan shows.
+    range: Bounds,
+    load: &'static [&'static str],
     chunked_ms: Option<i64>,
-    /// [`MemorySeriesSource::blocks`].
     blocks_ms: Option<u64>,
-    /// [`MemorySeriesSource::partitions`].
     partitions: Option<usize>,
-    /// The default bounds, unless the shape only exists at other ones:
-    /// the ordering functions plan a `Sort` over an instant query and
-    /// nothing at all over a range.
-    range: Option<Bounds>,
-    /// Plan as an instant query at the range's start, the only way to
-    /// plan a range selector, which a range query refuses. No physical
-    /// plan: the engine lowers only the plan a range query runs.
-    #[serde(default)]
     instant: bool,
 }
 
-fn plans_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/testdata/plans")
-}
-
-/// The logical plan's text, and the physical plan's when `case` pins one.
-fn plan_of(case: &Case, defaults: Bounds) -> (String, Option<String>) {
-    let b = case.range.unwrap_or(defaults);
-    let range = &RangeQuery::new(b.start_ms, b.end_ms, b.step_ms);
-    let series: Vec<_> = case
-        .load
-        .iter()
-        .map(|l| {
-            let desc = promql_parser::parse_series_desc(l).expect("series line parses");
-            // Chunking is the one thing that turns the sample count into
-            // plan shape, as the number of batches the store hands over.
-            assert!(
-                desc.values.len() == 1 || case.chunked_ms.is_some() || case.blocks_ms.is_some(),
-                "case {:?}: series {l:?} has {} samples; an unchunked plan case carries \
-                 exactly one, because nothing but the label set reaches the planner",
-                case.name,
-                desc.values.len(),
-            );
-            desc
-        })
-        .collect();
-    // The interval only spaces samples out, and no sample is ever read.
-    let mut source = MemorySeriesSource::from_descriptions(&series, 30.0);
-    // One chunk per batch: the cases show a label set crossing batches
-    // as the batch count under SeriesSetExec.
-    if let Some(ms) = case.chunked_ms {
-        source = source.chunked(ms).rows_per_batch(nz(1));
-    }
-    if let Some(ms) = case.blocks_ms {
-        source = source.blocks(nz64(ms));
-    }
-    if let Some(n) = case.partitions {
-        source = source.partitions(nz(n));
+impl Case {
+    fn new(range: Bounds, load: &'static [&'static str]) -> Self {
+        Case {
+            range,
+            load,
+            chunked_ms: None,
+            blocks_ms: None,
+            partitions: None,
+            instant: false,
+        }
     }
 
-    // `Engine::new`, not `blocking`: an engine that owns a runtime cannot
-    // be dropped from inside one, and the runtime here is this function's.
-    //
-    // Every gate is open: a pin is about the plan a query gets, and the
-    // corpus spans the experimental surface (fill in `operators`, and
-    // whatever the next topic adds). Whether stock options refuse that
-    // syntax is `tests/feature_flags.rs`'s question.
-    let engine = Engine::with_options(EngineOptions {
-        parser: promql_parser::ParserOptions::all(),
-    });
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
-    // Both `query` and `plan` are `|` block scalars, so both shed the
-    // newline it appends; a query wrapped over several lines keeps its
-    // own newlines, which PromQL treats as whitespace.
-    let query = case.query.trim_end();
-    let plan = rt
-        .block_on(async {
-            if case.instant {
-                engine.plan_instant_async(&source, query, b.start_ms).await
-            } else {
-                engine.plan_async(&source, query, range).await
-            }
-        })
-        .expect("the query plans");
-    let logical = promql_engine::explain_plan(&plan);
-    // The engine's own physical plan, not one lowered here, so the text is
-    // what the engine runs.
-    let physical = case.physical.as_ref().map(|_| {
-        let exec = rt
-            .block_on(engine.prepare_async(&source, query, range))
+    /// [`MemorySeriesSource::chunked`]: the store hands each series over
+    /// as chunks of at most this span, which only the physical plan shows.
+    fn chunked(mut self, ms: i64) -> Self {
+        self.chunked_ms = Some(ms);
+        self
+    }
+
+    /// [`MemorySeriesSource::blocks`].
+    fn blocks(mut self, ms: u64) -> Self {
+        self.blocks_ms = Some(ms);
+        self
+    }
+
+    /// [`MemorySeriesSource::partitions`].
+    fn partitions(mut self, n: usize) -> Self {
+        self.partitions = Some(n);
+        self
+    }
+
+    /// Plan as an instant query at the range's start, the only way to
+    /// plan a range selector, which a range query refuses.
+    fn instant(mut self) -> Self {
+        self.instant = true;
+        self
+    }
+
+    fn source(&self) -> MemorySeriesSource {
+        let series: Vec<_> = self
+            .load
+            .iter()
+            .map(|l| {
+                let desc = promql_parser::parse_series_desc(l).expect("series line parses");
+                // Chunking is the one thing that turns the sample count into
+                // plan shape, as the number of batches the store hands over.
+                assert!(
+                    desc.values.len() == 1 || self.chunked_ms.is_some() || self.blocks_ms.is_some(),
+                    "series {l:?} has {} samples; an unchunked plan case carries exactly one, \
+                     because nothing but the label set reaches the planner",
+                    desc.values.len(),
+                );
+                desc
+            })
+            .collect();
+        // The interval only spaces samples out, and no sample is ever read.
+        let mut source = MemorySeriesSource::from_descriptions(&series, 30.0);
+        // One chunk per batch: the cases show a label set crossing batches
+        // as the batch count under SeriesSetExec.
+        if let Some(ms) = self.chunked_ms {
+            source = source.chunked(ms).rows_per_batch(nz(1));
+        }
+        if let Some(ms) = self.blocks_ms {
+            source = source.blocks(nz64(ms));
+        }
+        if let Some(n) = self.partitions {
+            source = source.partitions(nz(n));
+        }
+        source
+    }
+
+    fn range_query(&self) -> RangeQuery {
+        RangeQuery::new(self.range.start_ms, self.range.end_ms, self.range.step_ms)
+    }
+
+    /// The `LogicalPlan`, rendered by `promql_engine::explain_plan`.
+    fn plan(&self, query: &str) -> String {
+        let source = self.source();
+        let engine = engine();
+        let plan = runtime()
+            .block_on(async {
+                if self.instant {
+                    engine
+                        .plan_instant_async(&source, query, self.range.start_ms)
+                        .await
+                } else {
+                    engine.plan_async(&source, query, &self.range_query()).await
+                }
+            })
+            .expect("the query plans");
+        promql_engine::explain_plan(&plan)
+    }
+
+    /// The `ExecutionPlan`, for shapes the logical plan cannot show: the
+    /// store-order wrapper and the physical operators DataFusion picks.
+    /// Pinned only where the text does not depend on the machine.
+    fn physical(&self, query: &str) -> String {
+        assert!(
+            !self.instant,
+            "the engine lowers only the plan a range query runs"
+        );
+        let source = self.source();
+        // The engine's own physical plan, not one lowered here, so the text is
+        // what the engine runs.
+        let exec = runtime()
+            .block_on(engine().prepare_async(&source, query, &self.range_query()))
             .expect("the plan lowers")
             .physical_plan()
             .clone();
@@ -225,88 +239,27 @@ fn plan_of(case: &Case, defaults: Bounds) -> (String, Option<String>) {
             &format!("], {cores}), input_partitions="),
             "], target_partitions), input_partitions=",
         )
-    });
-    (logical, physical)
-}
-
-fn check_plan_file(topic: &str) {
-    let path = plans_dir().join(format!("{topic}.yaml"));
-    let body = std::fs::read_to_string(&path).expect("the plans file is readable");
-    let suite: Suite = serde_norway::from_str(&body).expect("the plans file parses");
-    assert!(!suite.tests.is_empty(), "{} has no cases", path.display());
-
-    // Every case is reported, not just the first: one planner change
-    // usually moves several shapes, and seeing all of them is what makes
-    // the update a single reviewable edit.
-    let mut failures = Vec::new();
-    for case in &suite.tests {
-        let (logical, physical) = plan_of(case, suite.defaults);
-        let pairs = [
-            ("plan", Some(case.plan.as_str()), Some(logical)),
-            ("physical", case.physical.as_deref(), physical),
-        ];
-        for (block, expected, actual) in pairs {
-            let (Some(expected), Some(actual)) = (expected, actual) else {
-                continue;
-            };
-            let expected = expected.trim_end();
-            let actual = actual.trim_end();
-            if actual != expected {
-                failures.push(format!(
-                    "case {:?}, {block}:\n  query:    {}\n  expected: {}\n  actual:   {}",
-                    case.name,
-                    case.query.trim_end(),
-                    expected.replace('\n', "\n            "),
-                    actual.replace('\n', "\n            "),
-                ));
-            }
-        }
     }
-    assert!(
-        failures.is_empty(),
-        "{} of {} plans changed in {}\n\n{}",
-        failures.len(),
-        suite.tests.len(),
-        path.display(),
-        failures.join("\n\n"),
-    );
 }
 
-macro_rules! plan_files {
-    ($($topic:ident),* $(,)?) => {
-        $(
-            #[test]
-            fn $topic() {
-                check_plan_file(stringify!($topic));
-            }
-        )*
-
-        #[test]
-        fn every_plan_file_has_a_test() {
-            let listed = [$(stringify!($topic)),*];
-            let unlisted: Vec<_> = std::fs::read_dir(plans_dir())
-                .expect("the plans directory is readable")
-                .map(|e| e.expect("a directory entry").path())
-                .filter(|p| p.extension().is_some_and(|e| e == "yaml"))
-                .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
-                .filter(|stem| !listed.contains(&stem.as_str()))
-                .collect();
-            assert!(
-                unlisted.is_empty(),
-                "plan files never run, add them to plan_files!: {unlisted:?}"
-            );
-        }
-    };
+/// Every gate is open: a pin is about the plan a query gets, and the
+/// corpus spans the experimental surface (fill in `operators`, and
+/// whatever the next topic adds). Whether stock options refuse that
+/// syntax is `tests/feature_flags.rs`'s question.
+///
+/// Not `Engine::blocking`: an engine that owns a runtime cannot be
+/// dropped from inside one, and the cases drive [`runtime`]'s.
+fn engine() -> Engine {
+    Engine::with_options(EngineOptions {
+        parser: promql_parser::ParserOptions::all(),
+    })
 }
 
-plan_files!(
-    aggregators,
-    at_modifier,
-    functions,
-    operators,
-    range_queries,
-    selectors
-);
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+}
 
 // Source ID contiguity is not a native hash or label-ordering guarantee.
 fn series_evaluations(plan: &Arc<dyn ExecutionPlan>) -> Vec<&Arc<dyn ExecutionPlan>> {

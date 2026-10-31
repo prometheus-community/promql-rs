@@ -1,0 +1,21 @@
+---
+source: promql-engine/tests/plan/operators.rs
+expression: (requests > 100) + errors
+---
+Projection: __pairs__.labels, __pairs__.samples, TimestampMillisecond(-9223372036854775808, None), TimestampMillisecond(9223372036854775807, None)
+  Unnest: lists[] structs[__pairs__]
+    Unnest: lists[__pairs__|depth=1] structs[]
+      Aggregate: groupBy=[[labels.job AS __group__job, labels.pod AS __group__pod]], aggr=[[promql_binary(samples, __rhs, labels, Utf8("+"), Utf8(""), Int64(600000), Int64(1200000), Int64(30000)) AS __pairs__]]
+        Union
+          Projection: binary_1.labels{__name__, job, pod} AS labels, binary_1.samples, Boolean(false) AS __rhs
+            SubqueryAlias: binary_1
+              Projection: binary_0.labels{__name__, job, pod}, promql_elementwise(binary_0.samples, Utf8(">"), Float64(100), Float64(NULL))
+                SubqueryAlias: binary_0
+                  Projection: labels, samples, block_start, block_end
+                    SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+                      TableScan: selector_0 requests
+          Projection: binary_2.labels{__name__, job, pod} AS labels, binary_2.samples, Boolean(true) AS __rhs
+            SubqueryAlias: binary_2
+              Projection: labels, samples, block_start, block_end
+                SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+                  TableScan: selector_1 errors

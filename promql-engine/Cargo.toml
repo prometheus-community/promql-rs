@@ -34,10 +34,10 @@ heap-profile = ["dep:jemalloc_pprof", "dep:tikv-jemallocator"]
 [dev-dependencies]
 criterion = { workspace = true }
 futures = { workspace = true }
+insta = { workspace = true }
 pprof = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_norway = { workspace = true }
 
 # pprof's default unwinder, run in its signal handler, returns an empty stack
 # for most samples on macOS; frame pointers are always kept there, so walk them.

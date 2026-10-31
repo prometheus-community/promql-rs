@@ -1,0 +1,10 @@
+---
+source: promql-engine/tests/plan/functions.rs
+expression: "sort(absent(temperature{city=\"oslo\"}))"
+---
+Sort: isnan(get_field(array_element(samples, Int64(-1)), Utf8("value"))) ASC NULLS LAST, array_element(samples, Int64(-1)).value ASC NULLS LAST
+  Projection: labels{city: Utf8("oslo")}, TimestampMillisecond(-9223372036854775808, None), TimestampMillisecond(9223372036854775807, None)
+    Aggregate: absent(samples, 1200000..1200000 step 30s) over the whole range
+      Projection: labels, samples, block_start, block_end
+        SeriesEval: vector_selector(samples, 1200000..1200000 step 30s, lookback 5m) per series per block
+          TableScan: temperature{city="oslo"}
