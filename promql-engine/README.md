@@ -132,7 +132,7 @@ Evaluated results keep `labels`, `samples`, `block_start`, and `block_end`.
 ## Implementation references
 
 The [engine design](../docs/engine.md) describes evaluation and memory
-ownership. [Plan fixtures](tests/testdata/plans) record planner output for
+ownership. [Plan snapshots](tests/plan/snapshots) record planner output for
 representative expressions. The
 [crate root](src/lib.rs) lists public exports and internal modules.
 
@@ -162,7 +162,8 @@ The error variants distinguish query failures from store and execution failures:
 ## Tests and benchmarks
 
 The integration tests in `tests/` exercise the public API.
-`tests/plan.rs` compares planner output with `tests/testdata/plans/*.yaml`.
+`tests/plan.rs` compares planner output with insta snapshots in
+`tests/plan/snapshots/`, with one module per topic under `tests/plan/`.
 The [engine feature checks](../AGENTS.md) require a separate commit explaining
 any changed plan pin.
 
