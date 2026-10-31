@@ -285,6 +285,40 @@ fn query(c: &mut Criterion) {
     g.finish();
 }
 
+/// The pinned five-minute window must be refit at every step because
+/// Prometheus anchors the regression intercept on evaluation time.
+fn linear_regression_queries(c: &mut Criterion) {
+    let engine = Engine::blocking().unwrap();
+    let shape = &SHAPES[1];
+    let source = synthetic(shape);
+    let end = shape.end_ms();
+    let range = RangeQuery::new(end - HOUR_MS, end, STEP_MS);
+    let pinned = format!(
+        "predict_linear(http_requests_total[5m] @ {}, 3600)",
+        end / 1000
+    );
+    let queries = [
+        ("deriv_5m", "deriv(http_requests_total[5m])"),
+        (
+            "predict_linear_5m",
+            "predict_linear(http_requests_total[5m], 3600)",
+        ),
+        ("predict_linear_5m_at_pinned", pinned.as_str()),
+    ];
+    let mut g = c.benchmark_group("engine/linear_regression");
+    g.throughput(Throughput::Elements(shape.elements()));
+    for (name, query) in queries {
+        g.bench_function(BenchmarkId::new(name, shape.id()), |b| {
+            b.iter(|| {
+                engine
+                    .range_query(source.as_ref(), black_box(query), &range)
+                    .unwrap()
+            })
+        });
+    }
+    g.finish();
+}
+
 /// The elementwise operator's own cost, over the last hour at 30s.
 ///
 /// Each case is a function wrapped round a query `engine/query` already
@@ -622,6 +656,6 @@ criterion_group! {
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3))
         .sample_size(20);
-    targets = query, elementwise, binary, plan, contiguous, execute_preplanned, focused
+    targets = query, linear_regression_queries, elementwise, binary, plan, contiguous, execute_preplanned, focused
 }
 criterion_main!(benches);
