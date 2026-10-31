@@ -11,6 +11,15 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # The cached target/ is what CI stores and restores, so shrink it. Line
+  # tables keep file:line in test backtraces (RUST_BACKTRACE is on) without
+  # full variable info. Incremental state is rebuilt per commit and the cache
+  # action prunes it anyway. No bench-profile override: `build --benches`
+  # compiles benches in the dev profile, so `[profile.bench] debug = true`
+  # never reaches CI.
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
   ci:
@@ -30,16 +39,14 @@ jobs:
         with:
           version: "2026.10.11"
 
+      # Restores Cargo's pruned target/ and registry from the newest entry,
+      # and saves a new one only for a successful push to main. Pull requests
+      # restore and never save: a PR-scoped entry would only be visible to
+      # that PR and its several GB would evict main's baseline from the 10 GB
+      # repository quota. The tool step above comes first because the cache
+      # key hashes the `rustc -vV` of the compiler on PATH.
       - name: Cache Rust builds
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cache/mbx
-          key: ${{ runner.os }}-mbx-${{ hashFiles('rust-toolchain.toml', 'mise.lock', 'Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-mbx-
+        uses: jdx/mr-boxington-action@88acf2bb50552c7c508cbac13e5f8c576b95b1de # v1.7.3
 
       - name: Check formatting
         run: mise run fmt-check
