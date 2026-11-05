@@ -127,7 +127,7 @@ test-binary or benchmark flags need two separators:
 ```sh
 mise run test -p promql-parser
 mise run test -p promql-parser -- -- --nocapture
-mise run bench -- -- --output-format bencher
+mise run bench -- -- -benchtime 1s -count 6 -cpu 2 -benchmem | tee bench.txt
 ```
 
 The [CI workflow](.github/workflows/ci.yml) defines the full checks and their

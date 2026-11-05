@@ -35,8 +35,8 @@ AFTER_TARGET="$AFTER/target"
 2. Choose an ID present on both revisions. Check the fixture definitions and
    [measurement boundaries](README.md#measurement-boundaries) before comparing.
    To measure kernels instead, use `--bench kernels` throughout this procedure.
-3. Set `BENCH_ID` to the chosen ID. Use an exact match to avoid measuring
-   unrelated cases.
+3. Set `BENCH_ID` to a filter matching the chosen benchmark (for example
+   `EngineQuery/query=rate_5m/range=range_1h/shape=1000x1000`).
 4. Check the fixture and accounting helpers on both revisions:
 
 ```sh
@@ -44,35 +44,31 @@ AFTER_TARGET="$AFTER/target"
 (cd "$AFTER" && CARGO_TARGET_DIR="$AFTER_TARGET" cargo test -p promql-engine --test benchmark_helpers)
 ```
 
-## Compare execution time
+## Compare execution time and allocations
 
-1. Save a baseline on the base revision:
+1. Run the selected benchmark on the base revision and save `benchfmt` output:
 
 ```sh
 (cd "$BEFORE" && CARGO_TARGET_DIR="$BEFORE_TARGET" cargo bench -p promql-engine --bench engine -- \
-	"$BENCH_ID" --exact --save-baseline before)
+	-bench "$BENCH_ID" -benchtime 1s -count 6 -cpu 2 -benchmem) | tee /tmp/before.txt
 ```
 
-2. Copy only Criterion data to the feature worktree. Do not share compiled
-   artifacts between worktrees:
-
-```sh
-mkdir -p "$AFTER_TARGET/criterion"
-cp -a "$BEFORE_TARGET/criterion/." "$AFTER_TARGET/criterion/"
-```
-
-3. Compare the feature revision with the saved baseline:
+2. Run the same benchmark on the feature revision:
 
 ```sh
 (cd "$AFTER" && CARGO_TARGET_DIR="$AFTER_TARGET" cargo bench -p promql-engine --bench engine -- \
-	"$BENCH_ID" --exact --baseline before)
+	-bench "$BENCH_ID" -benchtime 1s -count 6 -cpu 2 -benchmem) | tee /tmp/after.txt
+```
+
+3. Compare both runs with [`benchstat`](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat):
+
+```sh
+benchstat /tmp/before.txt /tmp/after.txt
 ```
 
 4. Repeat suspicious results in alternating revision order on an otherwise idle
-   machine. Keep the estimates and confidence intervals.
-
-Criterion can run untimed setup in other benchmark functions despite a filter.
-A short screening run does not establish a regression near the noise floor.
+   machine. Paste raw `benchstat` output and exact `before` and `after` commit
+   links when reporting results.
 
 ## Compare heap use
 
@@ -91,23 +87,24 @@ A short screening run does not establish a regression near the noise floor.
 
 ## Inspect profiles
 
-1. Profile the selected timing benchmark:
+1. Collect CPU and sampled allocation profiles on the selected timing benchmark:
 
 ```sh
 (cd "$AFTER" && CARGO_TARGET_DIR="$AFTER_TARGET" cargo bench -p promql-engine --bench engine -- \
-	"$BENCH_ID" --exact --profile-time 15)
-find "$AFTER_TARGET/criterion" -name profile.pb -print
+	-bench "$BENCH_ID" -benchtime 10s -count 1 -cpu 2 -benchmem \
+	-cpuprofile /tmp/cpu.pb.gz -memprofile /tmp/mem.pb.gz)
 ```
 
-2. Inspect the matching profile with Go's pprof:
+2. Inspect the CPU and allocation profiles with Go's pprof:
 
 ```sh
-go tool pprof -top -cum -nodecount=40 <path-to-profile.pb>
+go tool pprof -top -cum -nodecount=40 /tmp/cpu.pb.gz
+go tool pprof -sample_index=alloc_space -top -cum -nodecount=40 /tmp/mem.pb.gz
 ```
 
 3. Check which functions account for the measured change. Distinguish source
    construction from evaluation and result processing. If the relevant function
-   has too few samples, increase `--profile-time`.
+   has too few samples, increase `-benchtime` or lower `-memprofilerate`.
 4. For a heap profile, run one memory case per process:
 
 ```sh

@@ -38,13 +38,23 @@ draft.
    re-bless it with `cargo insta review` (`INSTA_UPDATE=always cargo test` without
    cargo-insta) in its own commit whose message says why the shape moved. Green: every
    changed pin is explained in that commit.
-4. **Benchmarks.** `promql-engine/benches` (`kernels`, `engine`, `memory`); each file's
-   doc comment says how to take a baseline on the base branch and compare. Green: no
-   move beyond the five percent noise floor in the wrong direction, and the feature has
+4. **Benchmarks.** Timing suites (`promql-common`, `promql-parser`, and `promql-engine`'s
+   `kernels` and `engine`) plus peak-heap accounting (`promql-engine/benches/memory.rs`);
+   see `promql-engine/benches/compare.md` for baseline comparison with `benchstat`. Green:
+   no move beyond the five percent noise floor in the wrong direction, and the feature has
    a bench at realistic size.
-5. **Profile.** Run the feature's bench with `--profile-time`
+5. **Profile.** Run the feature's bench with `-cpuprofile` and `-memprofile`
    (`promql-engine/benches/README.md`) and read the profile. Green: the hot path is the
    one `docs/engine.md` predicts. Anything else is a finding to fix or to write down.
+
+## Performance and benchmarks
+
+- Write all timing benchmarks with [`benchfmt.rs`](https://github.com/bwplotka/benchfmt.rs) using `benchfmt::Suite` and `benchfmt::CountingAlloc` (or `ProcessAlloc` wrapping `CountingAlloc` when Tokio worker threads allocate) in `harness = false` `[[bench]]` targets so every benchmark emits Go [Benchmark Data Format](https://go.googlesource.com/proposal/+/master/design/14313-benchmark-format.md) lines with `ns/op`, `MB/s`, `B/op`, and `allocs/op` for [`benchstat`](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat). Do not use Criterion or custom timing output formats. Keep `promql-engine/benches/memory.rs` for single-pass peak-heap and retained-Arrow-buffer accounting.
+- Name benchmarks with `/key=value` sub-benchmark dimensions such as `EngineQuery/query=rate_5m/range=range_1h/shape=1000x1000`, call `b.report_allocs()` and `while b.keep_running()`, and include a `Recommended CLI invocation:` doc comment at the top of each benchmark file.
+- Performance improvements and hot-path changes require running benchmarks before and after the change, for example `cargo bench -p promql-engine --bench engine -- -bench '^BenchmarkEngine' -benchtime 1s -count 6 -cpu 2 -benchmem | tee ${bench}.txt`, and comparing with `benchstat before.txt after.txt`.
+- Always output benchmark results in raw `benchstat` format in the PR body and review comments, and always include links to the exact `before` and `after` commits that the benchmark refers to. Rerun benchmarks and update the commit links whenever addressing review comments that touch benchmarked code or benchmarks.
+- If a subset of benchmark results shows a regression, address it or explain in the PR body why that case is not important.
+- Reuse allocations in hot paths where possible, such as `Vec::clear`, scratch buffers, and reusable Arrow builders. When reusing buffers exposed through APIs or traits, document lifetime and copy requirements on the trait or type definition.
 
 ## Engine design
 
