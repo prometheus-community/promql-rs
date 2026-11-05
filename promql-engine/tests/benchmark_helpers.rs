@@ -1,5 +1,5 @@
 //! Small invariants for benchmark accounting and adversarial source fixtures.
-//! These are not performance assertions and do not depend on Criterion.
+//! These are not performance assertions and do not depend on `benchfmt`.
 
 use std::sync::Arc;
 

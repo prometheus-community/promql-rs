@@ -7,8 +7,8 @@ license.workspace = true
 publish = false
 
 [lib]
-# This crate has no criterion target, but `cargo bench --workspace` would
-# still hand libtest's the criterion flags and fail.
+# This crate has no benchfmt target, and `cargo bench --workspace` would
+# otherwise pass benchfmt flags to libtest and fail.
 bench = false
 
 [dependencies]

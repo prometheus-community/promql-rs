@@ -8,7 +8,7 @@ description = "PromQL parser, structural hand-port of prometheus/prometheus prom
 
 [lib]
 path = "src/lib.rs"
-# `cargo bench` runs only the criterion target below, not libtest's.
+# `cargo bench` runs only the benchfmt target below, not libtest's.
 bench = false
 
 [dependencies]
@@ -24,7 +24,7 @@ lrlex = { workspace = true }
 cfgrammar = { workspace = true }
 
 [dev-dependencies]
-criterion = { workspace = true }
+benchfmt = { workspace = true }
 insta = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -527,9 +527,57 @@ fn mib(n: usize) -> String {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    // The bench workflow runs every bench for the tracker's timings, which
-    // this one has none of, and its "bencher" would read as a filter.
-    if args.iter().any(|a| a == "--output-format") {
+    // Skip when workspace-wide `cargo bench` passes benchfmt timing or listing
+    // flags: this target prints a single-pass heap accounting table rather than
+    // timed `Benchmark*` lines, and flag values like `1s` would otherwise be
+    // parsed as case-name filters.
+    if args.iter().any(|a| {
+        matches!(
+            a.as_str(),
+            "--output-format"
+                | "--list"
+                | "-bench"
+                | "--filter"
+                | "-test.bench"
+                | "-benchtime"
+                | "--benchtime"
+                | "-test.benchtime"
+                | "-count"
+                | "--count"
+                | "-test.count"
+                | "-cpu"
+                | "--cpu"
+                | "-test.cpu"
+                | "-benchmem"
+                | "--benchmem"
+                | "-test.benchmem"
+                | "-cpuprofile"
+                | "--cpuprofile"
+                | "-test.cpuprofile"
+                | "-memprofile"
+                | "--memprofile"
+                | "-test.memprofile"
+        ) || [
+            "-bench=",
+            "--filter=",
+            "-test.bench=",
+            "-benchtime=",
+            "--benchtime=",
+            "-test.benchtime=",
+            "-count=",
+            "--count=",
+            "-test.count=",
+            "-cpu=",
+            "--cpu=",
+            "-test.cpu=",
+            "-cpuprofile=",
+            "--cpuprofile=",
+            "-memprofile=",
+            "--memprofile=",
+        ]
+        .iter()
+        .any(|prefix| a.starts_with(prefix))
+    }) {
         return;
     }
     let filters: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();

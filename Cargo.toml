@@ -22,12 +22,8 @@ cfgrammar = "0.13"
 # `iana-time-zone`) stays off. 0.4.41 is where `num_days_in_month` landed.
 chrono = { version = "0.4.41", default-features = false, features = ["std"] }
 clap = { version = "4.5", features = ["derive"] }
-# The same harness great lakes uses. Its `bencher` output format is what
-# the benchmark trackers ingest, so the benches can be tracked later
-# without changing them.
-criterion = { version = "0.7", features = ["html_reports"] }
-# CPU profiles of the benches in pprof format, see promql-engine/benches/README.md.
-pprof = { version = "0.15", features = ["protobuf-codec"] }
+# Go benchfmt/benchstat harness, allocation counter, and pprof (-cpuprofile / -memprofile) collector.
+benchfmt = { git = "https://github.com/bwplotka/benchfmt.rs", features = ["pprof"] }
 # Heap profiles of the memory bench in pprof format, behind promql-engine's
 # `heap-profile` feature. `symbolize` names frames in process: off Linux it
 # cannot read the mappings `go tool pprof` would symbolize against.
