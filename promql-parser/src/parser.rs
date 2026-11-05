@@ -44,7 +44,10 @@
 //! `stale` literally and any other word is a lex error rather than a
 //! parse error. Both reject; only the message differs.
 
-use lrpar::{LexError, Lexeme, NonStreamingLexer};
+use std::sync::LazyLock;
+
+use lrlex::{LRNonStreamingLexer, LRNonStreamingLexerDef};
+use lrpar::{LexError, Lexeme, Lexer, NonStreamingLexer};
 
 use crate::actions::ParseResult;
 use crate::ast::{Expr, LabelMatcher, SeriesDescription};
@@ -60,6 +63,13 @@ mod start_tokens {
 type LexerTypes = lrlex::DefaultLexerTypes<u32>;
 type Lexeme_ = lrlex::DefaultLexeme<u32>;
 
+// Generated `lexerdef()` functions compile every regex rule in `.l` from scratch.
+// Build each lexer table once and reuse it across all parse calls.
+static EXPR_LEXER: LazyLock<LRNonStreamingLexerDef<LexerTypes>> =
+    LazyLock::new(crate::lexer_l::lexerdef);
+static SERIES_LEXER: LazyLock<LRNonStreamingLexerDef<LexerTypes>> =
+    LazyLock::new(crate::series_l::lexerdef);
+
 /// Wraps a lexer so the stream begins with a synthetic `START_*`
 /// lexeme. Mirrors upstream's `parser.InjectItem` / the `p.injecting`
 /// branch of `parser.Lex`, which exist for the same reason: yacc allows
@@ -67,13 +77,13 @@ type Lexeme_ = lrlex::DefaultLexeme<u32>;
 ///
 /// The injected lexeme has a zero-width span at offset 0, so it never
 /// perturbs the position ranges the actions compute.
-struct InjectingLexer<'lexer, 'input> {
-    inner: &'lexer dyn NonStreamingLexer<'input, LexerTypes>,
+struct InjectingLexer<'lexer, 'def, 'input> {
+    inner: &'lexer LRNonStreamingLexer<'def, 'input, LexerTypes>,
     input: &'input str,
     inject: u32,
 }
 
-impl lrpar::Lexer<LexerTypes> for InjectingLexer<'_, '_> {
+impl Lexer<LexerTypes> for InjectingLexer<'_, '_, '_> {
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = Result<Lexeme_, lrlex::LRLexError>> + 'a> {
         let input = self.input;
         Box::new(
@@ -86,7 +96,7 @@ impl lrpar::Lexer<LexerTypes> for InjectingLexer<'_, '_> {
     }
 }
 
-impl<'input> NonStreamingLexer<'input, LexerTypes> for InjectingLexer<'_, 'input> {
+impl<'input> NonStreamingLexer<'input, LexerTypes> for InjectingLexer<'_, '_, 'input> {
     fn span_str(&self, span: cfgrammar::Span) -> &'input str {
         self.inner.span_str(span)
     }
@@ -190,20 +200,14 @@ fn parse_generated(
     mode: ParseMode,
     options: ParserOptions,
 ) -> Result<ParseResult, ParseErrors> {
-    // Declared out here, initialised inside the branches: the boxed
-    // lexer borrows from its `LexerDef`, so the def has to outlive it.
-    // This is a lifetime constraint, not a lazy initialisation.
-    let expr_def;
-    let series_def;
-    let lexer = if mode.uses_series_lexer() {
-        series_def = crate::series_l::lexerdef();
-        Box::new(series_def.lexer(input)) as Box<dyn NonStreamingLexer<'_, LexerTypes>>
+    let def = if mode.uses_series_lexer() {
+        &*SERIES_LEXER
     } else {
-        expr_def = crate::lexer_l::lexerdef();
-        Box::new(expr_def.lexer(input)) as Box<dyn NonStreamingLexer<'_, LexerTypes>>
+        &*EXPR_LEXER
     };
+    let lexer = def.lexer(input);
     let injecting = InjectingLexer {
-        inner: lexer.as_ref(),
+        inner: &lexer,
         input,
         inject: mode.start_token(),
     };
@@ -344,4 +348,27 @@ pub fn parse_series_desc(input: &str) -> Result<SeriesDescription, ParseErrors> 
 /// Upstream's `START_METRIC` mode. See [`Parser::parse_metric`].
 pub fn parse_metric(input: &str) -> Result<Vec<LabelMatcher>, ParseErrors> {
     Parser::default().parse_metric(input)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_parses_share_cached_lexers() {
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    for _ in 0..32 {
+                        let expr = parse_expr(r#"rate(http_requests_total{job="api"}[5m])"#)
+                            .expect("valid expression");
+                        assert!(matches!(expr, Expr::Call(_)));
+                        let sd = parse_series_desc(r#"http_requests_total{job="api"} 1+2x3"#)
+                            .expect("valid series description");
+                        assert_eq!(sd.values.len(), 4);
+                    }
+                });
+            }
+        });
+    }
 }

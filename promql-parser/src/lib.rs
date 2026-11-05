@@ -61,7 +61,18 @@ lrlex_mod!("series.l");
 mod grammar {
     #![allow(clippy::needless_question_mark)]
 
+    use std::any::Any;
+    use std::sync::OnceLock;
+
     use lrpar::lrpar_mod;
+
+    pub(crate) fn cached_tables<T: Send + Sync + 'static>(init: fn() -> T) -> &'static T {
+        static TABLES: OnceLock<Box<dyn Any + Send + Sync>> = OnceLock::new();
+        TABLES
+            .get_or_init(|| Box::new(init()))
+            .downcast_ref::<T>()
+            .expect("grammar tables initialized with matching type")
+    }
 
     lrpar_mod!("grammar.y");
 
