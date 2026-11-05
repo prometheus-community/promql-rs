@@ -14,6 +14,7 @@
 //! ```
 
 use std::hint::black_box;
+use std::num::NonZeroU64;
 use std::sync::{Arc, OnceLock};
 
 use benchfmt::{CountingAlloc, Suite};
@@ -29,7 +30,9 @@ use datafusion::physical_expr::expressions::{Column, Literal};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::execution_plan::reset_plan_states;
 use datafusion::physical_plan::{collect, execute_stream, ExecutionPlan};
+use datafusion::prelude::SessionContext;
 use futures::StreamExt;
+use promql_engine::absent;
 use promql_engine::aggregate::{Grouped, Op};
 use promql_engine::binary::{self, Op as BinOp};
 use promql_engine::elementwise;
@@ -37,7 +40,9 @@ use promql_engine::math::{self, FlagLane, Welford};
 use promql_engine::range::Func;
 use promql_engine::selector::STALE_NAN_BITS;
 use promql_engine::series::{self, Block, Series};
-use promql_engine::{Engine, MemorySeriesSource, Params, RangeQuery};
+use promql_engine::{
+    CompiledMatcher, Engine, MemorySeriesSource, Params, RangeQuery, SelectHints, SeriesSource,
+};
 
 #[global_allocator]
 static ALLOC: CountingAlloc = CountingAlloc::new();
@@ -452,10 +457,18 @@ fn register_range_function<'a>(mut suite: Suite<'a>) -> Suite<'a> {
         let bytes = n as u64 * SAMPLE_BYTES;
         for (name, func, stale) in [
             ("rate", Func::Rate, false),
+            ("irate", Func::Irate, false),
             ("increase", Func::Increase, false),
+            ("delta", Func::Delta, false),
             ("count_over_time", Func::CountOverTime, false),
+            ("sum_over_time", Func::SumOverTime, false),
+            ("avg_over_time", Func::AvgOverTime, false),
             ("max_over_time", Func::MaxOverTime, false),
+            ("last_over_time", Func::LastOverTime, false),
+            ("present_over_time", Func::PresentOverTime, false),
             ("stddev_over_time", Func::StddevOverTime, false),
+            ("changes", Func::Changes, false),
+            ("resets", Func::Resets, false),
             ("deriv", Func::Deriv, false),
             ("rate_stale_every_100", Func::Rate, true),
         ] {
@@ -570,8 +583,12 @@ fn register_aggregate_add_series<'a>(mut suite: Suite<'a>) -> Suite<'a> {
         for (name, op) in [
             ("sum", Op::Sum),
             ("avg", Op::Avg),
-            ("stddev", Op::Stddev),
+            ("count", Op::Count),
+            ("min", Op::Min),
             ("max", Op::Max),
+            ("group", Op::Group),
+            ("stddev", Op::Stddev),
+            ("stdvar", Op::Stdvar),
         ] {
             suite = suite.bench(
                 format!("AggregateAddSeries/op={name}/series={k}"),
@@ -587,6 +604,33 @@ fn register_aggregate_add_series<'a>(mut suite: Suite<'a>) -> Suite<'a> {
                 },
             );
         }
+    }
+    suite
+}
+
+/// Folding 1,000 aligned series round-robin across 64 distinct group IDs so
+/// per-group span growth and group-indexed lane lookup are measured alongside
+/// the single-group case.
+fn register_aggregate_multi_group<'a>(mut suite: Suite<'a>) -> Suite<'a> {
+    let (k, groups_count, steps) = (1_000usize, 64usize, 1_440usize);
+    let end_ms = (steps as i64 - 1) * STEP_MS;
+    let bytes = (k * steps) as u64 * SAMPLE_BYTES;
+    for (name, op) in [("sum", Op::Sum), ("avg", Op::Avg), ("stddev", Op::Stddev)] {
+        suite = suite.bench(
+            format!("AggregateMultiGroup/op={name}/groups={groups_count}/series={k}"),
+            move |b| {
+                let mut fix_opt = None;
+                let (column, groups) = fix_opt.get_or_insert_with(|| {
+                    let groups = (0..k).map(|i| i % groups_count).collect::<Vec<_>>();
+                    (samples_of(&aligned(k, steps)), groups)
+                });
+                b.set_bytes(bytes);
+                b.report_allocs();
+                while b.keep_running() {
+                    black_box(filled(op, black_box(column), groups, end_ms, groups_count));
+                }
+            },
+        );
     }
     suite
 }
@@ -934,8 +978,290 @@ fn register_elementwise_date<'a>(mut suite: Suite<'a>) -> Suite<'a> {
     suite
 }
 
-/// The two edges of the seam: rows into a batch and back, plus clipping
-/// one series to a range.
+/// `elementwise::apply` under unary math, rounding, sign, and clamping
+/// functions. Inputs stay strictly positive (`1.0..=200.0`) so `ln` and `sqrt`
+/// measure finite fast paths rather than NaN short-circuits.
+fn register_elementwise_math<'a>(mut suite: Suite<'a>) -> Suite<'a> {
+    let (rows, samples) = (1_000usize, 1_440usize);
+    let bytes = (rows * samples) as u64 * SAMPLE_BYTES;
+    for (name, arg_a, arg_b) in [
+        ("abs", None, None),
+        ("round", Some(0.5), None),
+        ("exp", None, None),
+        ("ln", None, None),
+        ("sqrt", None, None),
+        ("sin", None, None),
+        ("sgn", None, None),
+        ("clamp", Some(25.0), Some(150.0)),
+    ] {
+        suite = suite.bench(
+            format!("ElementwiseMath/func={name}/shape={rows}x{samples}"),
+            move |b| {
+                let mut col_opt = None;
+                let column = col_opt.get_or_insert_with(|| {
+                    let all: Vec<(Vec<i64>, Vec<f64>)> = (0..rows)
+                        .map(|i| {
+                            let ts = (0..samples).map(|j| j as i64 * 60_000).collect();
+                            let vs = (0..samples)
+                                .map(|j| 1.0 + ((i * 7 + j) % 200) as f64)
+                                .collect();
+                            (ts, vs)
+                        })
+                        .collect();
+                    samples_of(&all)
+                });
+                let list: &ListArray = column.as_list::<i32>();
+                let bound = elementwise::Func::parse(name).unwrap().bind(arg_a, arg_b);
+                b.set_bytes(bytes);
+                b.report_allocs();
+                while b.keep_running() {
+                    black_box(elementwise::apply(black_box(list), bound).unwrap());
+                }
+            },
+        );
+    }
+    suite
+}
+
+/// Reference label-matcher compilation (`CompiledMatcher::compile`) and
+/// per-value evaluation (`CompiledMatcher::matches`).
+fn register_matcher<'a>(mut suite: Suite<'a>) -> Suite<'a> {
+    for (name, selector) in [
+        ("equal", r#"{pod="nginx-42"}"#),
+        (
+            "regex_alternation",
+            r#"{pod=~"nginx-(1|2|3|42|99)-[a-z0-9]+"}"#,
+        ),
+    ] {
+        suite = suite.bench(format!("MatcherCompile/op={name}"), move |b| {
+            let mut m_opt = None;
+            let matcher = m_opt.get_or_insert_with(|| {
+                let mut ms = promql_parser::parse_metric_selector(selector).unwrap();
+                ms.pop().unwrap()
+            });
+            b.report_allocs();
+            while b.keep_running() {
+                black_box(CompiledMatcher::compile(black_box(matcher)).unwrap());
+            }
+        });
+    }
+
+    let rows = 1_000usize;
+    for (name, selector) in [
+        ("equal", r#"{pod="nginx-42-prod"}"#),
+        ("not_equal", r#"{pod!="nginx-42-prod"}"#),
+        ("regex", r#"{pod=~"nginx-[0-9]+-(prod|staging)"}"#),
+        ("not_regex", r#"{pod!~"nginx-9[0-9]+-.*"}"#),
+    ] {
+        suite = suite.bench(format!("MatcherEval/op={name}/rows={rows}"), move |b| {
+            let mut fix_opt = None;
+            let (compiled, values) = fix_opt.get_or_insert_with(|| {
+                let ms = promql_parser::parse_metric_selector(selector).unwrap();
+                let compiled = CompiledMatcher::compile(&ms[0]).unwrap();
+                let values: Vec<String> = (0..rows)
+                    .map(|i| {
+                        let env = if i % 4 == 0 { "staging" } else { "prod" };
+                        format!("nginx-{i}-{env}")
+                    })
+                    .collect();
+                (compiled, values)
+            });
+            b.report_allocs();
+            while b.keep_running() {
+                let mut hits = 0usize;
+                for v in black_box(values.as_slice()) {
+                    hits += usize::from(compiled.matches(v));
+                }
+                black_box(hits);
+            }
+        });
+    }
+    suite
+}
+
+/// Reference store construction (`MemorySeriesSource::try_new` and
+/// `from_descriptions`) and `SeriesSource::select` across matcher shapes and
+/// chunked multi-block layouts.
+fn register_memory_source<'a>(mut suite: Suite<'a>) -> Suite<'a> {
+    let (build_k, build_n) = (1_000usize, 100usize);
+    let build_bytes = (build_k * build_n) as u64 * SAMPLE_BYTES;
+    suite = suite
+        .bench(
+            format!("SourceBuild/mode=try_new/shape={build_k}x{build_n}"),
+            move |b| {
+                let mut rows_opt = None;
+                let rows = rows_opt.get_or_insert_with(|| labelled(build_k, build_n));
+                b.set_bytes(build_bytes);
+                b.report_allocs();
+                while b.keep_running() {
+                    let cloned = black_box(rows.as_slice()).to_vec();
+                    black_box(MemorySeriesSource::try_new(cloned).unwrap());
+                }
+            },
+        )
+        .bench(
+            format!("SourceBuild/mode=from_descriptions/shape={build_k}x{build_n}"),
+            move |b| {
+                let mut descs_opt = None;
+                let descs = descs_opt.get_or_insert_with(|| {
+                    (0..build_k)
+                        .map(|i| {
+                            let line = format!(
+                                r#"http_requests_total{{pod="nginx-{i}", route="/{}", zone="eu-west-{}"}} 0+{}x{}"#,
+                                i % 8,
+                                i % 3,
+                                1 + i % 7,
+                                build_n - 1
+                            );
+                            promql_parser::parse_series_desc(&line).unwrap()
+                        })
+                        .collect::<Vec<_>>()
+                });
+                b.set_bytes(build_bytes);
+                b.report_allocs();
+                while b.keep_running() {
+                    black_box(MemorySeriesSource::from_descriptions(
+                        black_box(descs.as_slice()),
+                        15.0,
+                    ));
+                }
+            },
+        );
+
+    let (sel_k, sel_n) = (1_000usize, 300usize);
+    let end_ms = (sel_n as i64 - 1) * SCRAPE_MS;
+    for (case, selector, chunked_blocks) in [
+        ("equal", r#"http_requests_total{code="200"}"#, false),
+        (
+            "regex",
+            r#"http_requests_total{pod=~"nginx-1[0-9]+"}"#,
+            false,
+        ),
+        (
+            "narrow_then_regex",
+            r#"http_requests_total{code="500", pod=~"nginx-[0-9]+"}"#,
+            false,
+        ),
+        ("chunked_blocks", r#"http_requests_total{code="200"}"#, true),
+    ] {
+        suite = suite.bench(
+            format!("SourceSelect/case={case}/shape={sel_k}x{sel_n}"),
+            move |b| {
+                let rt = runtime();
+                let mut fix_opt = None;
+                let (source, state, matchers, hints) = fix_opt.get_or_insert_with(|| {
+                    let mut source = MemorySeriesSource::try_new(labelled(sel_k, sel_n)).unwrap();
+                    if chunked_blocks {
+                        source = source
+                            .chunked(60_000)
+                            .blocks(NonZeroU64::new(300_000).unwrap());
+                    }
+                    let state = SessionContext::new().state();
+                    let matchers = promql_parser::parse_metric_selector(selector).unwrap();
+                    let hints = SelectHints::range(0, end_ms).with_window_ms(FIVE_MINUTES_MS);
+                    (source, state, matchers, hints)
+                });
+                b.report_allocs();
+                while b.keep_running() {
+                    black_box(
+                        rt.block_on(source.select(
+                            state,
+                            black_box(matchers.as_slice()),
+                            hints.clone(),
+                        ))
+                        .unwrap(),
+                    );
+                }
+            },
+        );
+    }
+    suite
+}
+
+/// `absent::labels_for` label extraction and the `promql_absent` UDAF
+/// accumulator on both empty and partially populated grids.
+fn register_absent<'a>(mut suite: Suite<'a>) -> Suite<'a> {
+    suite = suite.bench("AbsentLabelsFor/case=mixed_matchers", move |b| {
+        let mut expr_opt = None;
+        let expr = expr_opt.get_or_insert_with(|| {
+            promql_parser::parse_expr(
+                r#"http_requests_total{job="api", instance=~"10\\..*", env="prod", region="eu", region="us"}"#,
+            )
+            .unwrap()
+        });
+        b.report_allocs();
+        while b.keep_running() {
+            black_box(absent::labels_for(black_box(expr)));
+        }
+    });
+
+    let steps = 1_440usize;
+    let end_ms = (steps as i64 - 1) * STEP_MS;
+    for (case, populate) in [("empty", false), ("half_present", true)] {
+        suite = suite.bench(
+            format!("AbsentAccumulator/case={case}/steps={steps}"),
+            move |b| {
+                let mut fix_opt = None;
+                let (udaf, schema, exprs, fields, return_field, column) = fix_opt
+                    .get_or_insert_with(|| {
+                        let udaf = absent::udaf();
+                        let schema = Schema::new(vec![Field::new(
+                            series::SAMPLES,
+                            series::samples_type(),
+                            false,
+                        )]);
+                        let exprs: Vec<Arc<dyn PhysicalExpr>> = vec![
+                            Arc::new(Column::new(series::SAMPLES, 0)),
+                            Arc::new(Literal::new(ScalarValue::Int64(Some(0)))),
+                            Arc::new(Literal::new(ScalarValue::Int64(Some(end_ms)))),
+                            Arc::new(Literal::new(ScalarValue::Int64(Some(STEP_MS)))),
+                        ];
+                        let fields: Vec<FieldRef> = exprs
+                            .iter()
+                            .map(|e| e.return_field(&schema).unwrap())
+                            .collect();
+                        let return_field =
+                            Arc::new(Field::new("out", series::samples_type(), false));
+                        let rows: Vec<(Vec<i64>, Vec<f64>)> = (0..10)
+                            .map(|_| {
+                                let ts =
+                                    (0..steps).step_by(2).map(|j| j as i64 * STEP_MS).collect();
+                                let vs = vec![1.0; steps / 2];
+                                (ts, vs)
+                            })
+                            .collect();
+                        let column = samples_of(&rows);
+                        (udaf, schema, exprs, fields, return_field, column)
+                    });
+                b.report_allocs();
+                while b.keep_running() {
+                    let args = AccumulatorArgs {
+                        return_field: Arc::clone(return_field),
+                        schema,
+                        ignore_nulls: false,
+                        order_bys: &[],
+                        is_reversed: false,
+                        name: udaf.name(),
+                        is_distinct: false,
+                        exprs,
+                        expr_fields: fields,
+                    };
+                    let mut acc = udaf.accumulator(args).unwrap();
+                    if populate {
+                        acc.update_batch(std::slice::from_ref(black_box(column)))
+                            .unwrap();
+                    }
+                    black_box(acc.evaluate().unwrap());
+                }
+            },
+        );
+    }
+    suite
+}
+
+/// Canonical Arrow batch operations across `series`: encode, decode, clip,
+/// schema validation, empty-row pruning, unused-label pruning, and multi-span
+/// coalescing.
 fn register_series_encode_decode<'a>(suite: Suite<'a>) -> Suite<'a> {
     let (k, n) = (1_000usize, 1_000usize);
     let bytes = (k * n) as u64 * SAMPLE_BYTES;
@@ -980,6 +1306,86 @@ fn register_series_encode_decode<'a>(suite: Suite<'a>) -> Suite<'a> {
                 black_box(series::clip(black_box(batch), lo, hi).unwrap());
             }
         })
+        .bench(format!("Series/op=validate/shape={k}x{n}"), move |b| {
+            let mut schema_opt = None;
+            let schema = schema_opt.get_or_insert_with(|| {
+                let all = labelled(k, n);
+                let names = series::label_names_of(&all);
+                series::encode(&names, &all, WHOLE).unwrap().schema()
+            });
+            b.report_allocs();
+            while b.keep_running() {
+                series::validate(black_box(schema.as_ref())).unwrap();
+            }
+        })
+        .bench(format!("Series/op=drop_empty/shape={k}x{n}"), move |b| {
+            let mut batch_opt = None;
+            let batch = batch_opt.get_or_insert_with(|| {
+                let all: Vec<Series> = (0..k)
+                    .map(|i| {
+                        let pod = format!("nginx-{i}");
+                        let labels = [("__name__", "http_requests_total"), ("pod", pod.as_str())];
+                        let (ts, vs) = if i % 2 == 0 {
+                            counter(n)
+                        } else {
+                            (Vec::new(), Vec::new())
+                        };
+                        Series::new(&labels, ts, vs).unwrap()
+                    })
+                    .collect();
+                let names = series::label_names_of(&all);
+                series::encode(&names, &all, WHOLE).unwrap()
+            });
+            b.report_allocs();
+            while b.keep_running() {
+                black_box(series::drop_empty(black_box(batch)));
+            }
+        })
+        .bench(
+            format!("Series/op=drop_unused_labels/shape={k}x{n}"),
+            move |b| {
+                let mut batch_opt = None;
+                let batch = batch_opt.get_or_insert_with(|| {
+                    let all = labelled(k, n);
+                    let mut names = series::label_names_of(&all);
+                    names.extend(
+                        ["unused_a", "unused_b", "unused_c"]
+                            .into_iter()
+                            .map(str::to_owned),
+                    );
+                    series::encode(&names, &all, WHOLE).unwrap()
+                });
+                b.report_allocs();
+                while b.keep_running() {
+                    black_box(series::drop_unused_labels(black_box(batch)).unwrap());
+                }
+            },
+        )
+        .bench(format!("Series/op=coalesce/shape={k}x{n}"), move |b| {
+            let mut spans_opt = None;
+            let spans = spans_opt.get_or_insert_with(|| {
+                let half = n / 2;
+                let mut out = Vec::with_capacity(k * 2);
+                for i in 0..k {
+                    let pod = format!("nginx-{i}");
+                    let labels = [("__name__", "http_requests_total"), ("pod", pod.as_str())];
+                    let (ts, vs) = counter(n);
+                    out.push(
+                        Series::new(&labels, ts[..half].to_vec(), vs[..half].to_vec()).unwrap(),
+                    );
+                    out.push(
+                        Series::new(&labels, ts[half..].to_vec(), vs[half..].to_vec()).unwrap(),
+                    );
+                }
+                out
+            });
+            b.set_bytes(bytes);
+            b.report_allocs();
+            while b.keep_running() {
+                let cloned = black_box(spans.as_slice()).to_vec();
+                black_box(series::coalesce(cloned).unwrap());
+            }
+        })
 }
 
 fn main() {
@@ -992,11 +1398,16 @@ fn main() {
     suite = register_predict_linear_series(suite);
     suite = register_range_apply(suite);
     suite = register_aggregate_add_series(suite);
+    suite = register_aggregate_multi_group(suite);
     suite = register_aggregate_singleton_spans(suite);
     suite = register_aggregate_state_merge(suite);
     suite = register_binary_pairing(suite);
     suite = register_elementwise_binary(suite);
+    suite = register_elementwise_math(suite);
     suite = register_elementwise_date(suite);
+    suite = register_matcher(suite);
+    suite = register_memory_source(suite);
+    suite = register_absent(suite);
     suite = register_series_encode_decode(suite);
     suite.run();
 }
