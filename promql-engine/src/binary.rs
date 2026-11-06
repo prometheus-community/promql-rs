@@ -3573,8 +3573,23 @@ mod tests {
             ]
         };
 
+        let make_acc = || {
+            GroupedBinary::from_pairing(pairing(
+                Op::Add,
+                false,
+                Matching {
+                    card: Card::ManyToOne,
+                    on: true,
+                    labels: names(&["pod"]),
+                    include: names(&["zone"]),
+                    ..Matching::default()
+                },
+            ))
+        };
+
         // Group 0: plain 1:1 match. Group 1: LHS-only unmatched group. Group 2:
-        // two non-overlapping RHS series exercising `one.rows` materialization,
+        // two non-overlapping RHS series in the same partial exercising `one.rows`
+        // materialization, serialization, and `group_left(zone)` label selection,
         // plus one filtered-out duplicate row that `opt_filter` drops.
         let part1 = make_batch(&[
             (
@@ -3589,7 +3604,18 @@ mod tests {
                 &[9.0],
                 false,
             ),
-            (&[(METRIC_NAME, "err_a"), ("pod", "c")], &[0], &[10.0], true),
+            (
+                &[(METRIC_NAME, "err_a"), ("pod", "c"), ("zone", "eu")],
+                &[0],
+                &[10.0],
+                true,
+            ),
+            (
+                &[(METRIC_NAME, "err_b"), ("pod", "c"), ("zone", "us")],
+                &[10_000],
+                &[20.0],
+                true,
+            ),
             (
                 &[(METRIC_NAME, "filtered_dup"), ("pod", "a")],
                 &[0],
@@ -3597,11 +3623,11 @@ mod tests {
                 true,
             ),
         ]);
-        let filter1 = BooleanArray::from(vec![true, true, true, false]);
+        let filter1 = BooleanArray::from(vec![true, true, true, true, false]);
 
         let part2 = make_batch(&[
             (
-                &[(METRIC_NAME, "err"), ("pod", "a")],
+                &[(METRIC_NAME, "err"), ("pod", "a"), ("zone", "eu")],
                 &[0, 10_000],
                 &[5.0, 7.0],
                 true,
@@ -3612,28 +3638,23 @@ mod tests {
                 &[1.0, 2.0],
                 false,
             ),
-            (
-                &[(METRIC_NAME, "err_b"), ("pod", "c")],
-                &[10_000],
-                &[20.0],
-                true,
-            ),
         ]);
 
-        let mut p1 = GroupedBinary::from_pairing(plain(Op::Add));
+        let mut p1 = make_acc();
         let base_size = p1.size();
-        p1.update_batch(&part1, &[0, 1, 2, 0], Some(&filter1), 3)
+        p1.update_batch(&part1, &[0, 1, 2, 2, 0], Some(&filter1), 3)
             .unwrap();
+        assert!(p1.groups[2].one.as_ref().unwrap().rows.is_some());
         assert!(p1.size() > base_size);
         let s1_first = p1.state(EmitTo::First(1)).unwrap();
         let s1_rest = p1.state(EmitTo::All).unwrap();
         assert_eq!(p1.heap_size, 0);
 
-        let mut p2 = GroupedBinary::from_pairing(plain(Op::Add));
-        p2.update_batch(&part2, &[0, 1, 1], None, 2).unwrap();
+        let mut p2 = make_acc();
+        p2.update_batch(&part2, &[0, 1], None, 2).unwrap();
         let s2_all = p2.state(EmitTo::All).unwrap();
 
-        let mut final_acc = GroupedBinary::from_pairing(plain(Op::Add));
+        let mut final_acc = make_acc();
         final_acc.merge_batch(&s1_first, &[0], 3).unwrap();
         final_acc.merge_batch(&s1_rest, &[1, 2], 3).unwrap();
         final_acc.merge_batch(&s2_all, &[0, 2], 3).unwrap();
@@ -3641,33 +3662,41 @@ mod tests {
         let first_out = final_acc.evaluate(EmitTo::First(1)).unwrap();
         assert_eq!(
             pairs_at(&first_out, 0),
-            [(lset("", "", "a", ""), vec![(0, 7.0), (10_000, 10.0)])]
+            [(lset("", "", "a", "eu"), vec![(0, 7.0), (10_000, 10.0)])]
         );
         let rest_out = final_acc.evaluate(EmitTo::All).unwrap();
         assert!(pairs_at(&rest_out, 0).is_empty());
         assert_eq!(
             pairs_at(&rest_out, 1),
-            [(lset("", "", "c", ""), vec![(0, 11.0), (10_000, 22.0)])]
+            [
+                (lset("", "", "c", "eu"), vec![(0, 11.0)]),
+                (lset("", "", "c", "us"), vec![(10_000, 22.0)]),
+            ]
         );
         assert_eq!(final_acc.heap_size, 0);
 
         // Also verify DataFusion's high-cardinality partial bypass via
         // `convert_to_state` reaches the exact same merged answer.
-        let converter = GroupedBinary::from_pairing(plain(Op::Add));
+        let converter = make_acc();
         let bypass1 = converter.convert_to_state(&part1, Some(&filter1)).unwrap();
         let bypass2 = converter.convert_to_state(&part2, None).unwrap();
-        let mut from_bypass = GroupedBinary::from_pairing(plain(Op::Add));
-        from_bypass.merge_batch(&bypass1, &[0, 1, 2, 0], 3).unwrap();
-        from_bypass.merge_batch(&bypass2, &[0, 2, 2], 3).unwrap();
+        let mut from_bypass = make_acc();
+        from_bypass
+            .merge_batch(&bypass1, &[0, 1, 2, 2, 0], 3)
+            .unwrap();
+        from_bypass.merge_batch(&bypass2, &[0, 2], 3).unwrap();
         let bypass_out = from_bypass.evaluate(EmitTo::All).unwrap();
         assert_eq!(
             pairs_at(&bypass_out, 0),
-            [(lset("", "", "a", ""), vec![(0, 7.0), (10_000, 10.0)])]
+            [(lset("", "", "a", "eu"), vec![(0, 7.0), (10_000, 10.0)])]
         );
         assert!(pairs_at(&bypass_out, 1).is_empty());
         assert_eq!(
             pairs_at(&bypass_out, 2),
-            [(lset("", "", "c", ""), vec![(0, 11.0), (10_000, 22.0)])]
+            [
+                (lset("", "", "c", "eu"), vec![(0, 11.0)]),
+                (lset("", "", "c", "us"), vec![(10_000, 22.0)]),
+            ]
         );
     }
 
