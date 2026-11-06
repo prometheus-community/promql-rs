@@ -35,8 +35,9 @@ AFTER_TARGET="$AFTER/target"
 2. Choose an ID present on both revisions. Check the fixture definitions and
    [measurement boundaries](README.md#measurement-boundaries) before comparing.
    To measure kernels instead, use `--bench kernels` throughout this procedure.
-3. Set `BENCH_ID` to a filter matching the chosen benchmark (for example
-   `EngineQuery/query=rate_5m/range=range_1h/shape=1000x1000`).
+3. Set `BENCH_ID` to the chosen ID, such as
+   `EngineQuery/query=rate_5m/range=range_1h/shape=1000x1000`. Pass `--exact` so
+   substring matches do not run or profile unrelated cases.
 4. Check the fixture and accounting helpers on both revisions:
 
 ```sh
@@ -50,14 +51,14 @@ AFTER_TARGET="$AFTER/target"
 
 ```sh
 (cd "$BEFORE" && CARGO_TARGET_DIR="$BEFORE_TARGET" cargo bench -p promql-engine --bench engine -- \
-	-bench "$BENCH_ID" -benchtime 1s -count 6 -cpu 2 -benchmem) | tee /tmp/before.txt
+	-bench "$BENCH_ID" --exact -benchtime 1s -count 6 -cpu 2 -benchmem) | tee /tmp/before.txt
 ```
 
 2. Run the same benchmark on the feature revision:
 
 ```sh
 (cd "$AFTER" && CARGO_TARGET_DIR="$AFTER_TARGET" cargo bench -p promql-engine --bench engine -- \
-	-bench "$BENCH_ID" -benchtime 1s -count 6 -cpu 2 -benchmem) | tee /tmp/after.txt
+	-bench "$BENCH_ID" --exact -benchtime 1s -count 6 -cpu 2 -benchmem) | tee /tmp/after.txt
 ```
 
 3. Compare both runs with [`benchstat`](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat):
@@ -91,7 +92,7 @@ benchstat /tmp/before.txt /tmp/after.txt
 
 ```sh
 (cd "$AFTER" && CARGO_TARGET_DIR="$AFTER_TARGET" cargo bench -p promql-engine --bench engine -- \
-	-bench "$BENCH_ID" -benchtime 10s -count 1 -cpu 2 -benchmem \
+	-bench "$BENCH_ID" --exact -benchtime 10s -count 1 -cpu 2 -benchmem \
 	-cpuprofile /tmp/cpu.pb.gz -memprofile /tmp/mem.pb.gz)
 ```
 
