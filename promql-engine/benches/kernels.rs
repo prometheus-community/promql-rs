@@ -1320,7 +1320,7 @@ fn register_absent<'a>(mut suite: Suite<'a>) -> Suite<'a> {
 
 /// Sample-touching ops set `bytes` for `MB/s` comparison; metadata-only schema
 /// validation and empty-row or unused-column pruning touch headers only.
-fn register_series_encode_decode<'a>(suite: Suite<'a>) -> Suite<'a> {
+fn register_series_encode_decode<'a>(mut suite: Suite<'a>) -> Suite<'a> {
     let (k, n) = (1_000usize, 1_000usize);
     let bytes = (k * n) as u64 * SAMPLE_BYTES;
     let (lo, hi) = (n as i64 * SCRAPE_MS / 4, n as i64 * SCRAPE_MS / 2);
@@ -1330,8 +1330,7 @@ fn register_series_encode_decode<'a>(suite: Suite<'a>) -> Suite<'a> {
     let mut schema_opt = None;
     let mut empty_batch_opt = None;
     let mut unused_batch_opt = None;
-    let mut spans_opt = None;
-    suite
+    suite = suite
         .bench(format!("Series/op=encode/shape={k}x{n}"), move |b| {
             let (all, names) = encode_fix_opt.get_or_insert_with(|| {
                 let all = labelled(k, n);
@@ -1368,11 +1367,12 @@ fn register_series_encode_decode<'a>(suite: Suite<'a>) -> Suite<'a> {
                 black_box(series::clip(black_box(batch), lo, hi).unwrap());
             }
         })
-        .bench(format!("Series/op=validate/shape={k}x{n}"), move |b| {
+        .bench("Series/op=validate/labels=5", move |b| {
             let schema = schema_opt.get_or_insert_with(|| {
-                let all = labelled(k, n);
-                let names = series::label_names_of(&all);
-                series::encode(&names, &all, WHOLE).unwrap().schema()
+                let names = ["__name__", "code", "pod", "route", "zone"].map(str::to_owned);
+                let schema = series::schema(&names);
+                series::validate(schema.as_ref()).unwrap();
+                schema
             });
             b.report_allocs();
             while b.keep_running() {
@@ -1384,7 +1384,16 @@ fn register_series_encode_decode<'a>(suite: Suite<'a>) -> Suite<'a> {
                 let all: Vec<Series> = (0..k)
                     .map(|i| {
                         let pod = format!("nginx-{i}");
-                        let labels = [("__name__", "http_requests_total"), ("pod", pod.as_str())];
+                        let route = format!("/{}", i % 8);
+                        let zone = format!("eu-west-{}", i % 3);
+                        let code = if i % 16 == 0 { "500" } else { "200" };
+                        let labels = [
+                            ("__name__", "http_requests_total"),
+                            ("code", code),
+                            ("pod", pod.as_str()),
+                            ("route", route.as_str()),
+                            ("zone", zone.as_str()),
+                        ];
                         let (ts, vs) = if i % 2 == 0 {
                             counter(n)
                         } else {
@@ -1394,7 +1403,9 @@ fn register_series_encode_decode<'a>(suite: Suite<'a>) -> Suite<'a> {
                     })
                     .collect();
                 let names = series::label_names_of(&all);
-                series::encode(&names, &all, WHOLE).unwrap()
+                let batch = series::encode(&names, &all, WHOLE).unwrap();
+                assert_eq!(series::drop_empty(&batch).num_rows(), k / 2);
+                batch
             });
             b.report_allocs();
             while b.keep_running() {
@@ -1412,38 +1423,64 @@ fn register_series_encode_decode<'a>(suite: Suite<'a>) -> Suite<'a> {
                             .into_iter()
                             .map(str::to_owned),
                     );
-                    series::encode(&names, &all, WHOLE).unwrap()
+                    let batch = series::encode(&names, &all, WHOLE).unwrap();
+                    let pruned = series::drop_unused_labels(&batch).unwrap();
+                    assert_eq!(series::label_names(pruned.schema().as_ref()).len(), 5);
+                    batch
                 });
                 b.report_allocs();
                 while b.keep_running() {
                     black_box(series::drop_unused_labels(black_box(batch)).unwrap());
                 }
             },
-        )
-        .bench(format!("Series/op=coalesce/shape={k}x{n}"), move |b| {
-            let spans = spans_opt.get_or_insert_with(|| {
-                let half = n / 2;
-                let mut out = Vec::with_capacity(k * 2);
-                for i in 0..k {
-                    let pod = format!("nginx-{i}");
-                    let labels = [("__name__", "http_requests_total"), ("pod", pod.as_str())];
-                    let (ts, vs) = counter(n);
-                    out.push(
-                        Series::new(&labels, ts[..half].to_vec(), vs[..half].to_vec()).unwrap(),
-                    );
-                    out.push(
-                        Series::new(&labels, ts[half..].to_vec(), vs[half..].to_vec()).unwrap(),
-                    );
+        );
+
+    for (order, interleaved) in [("chronological", false), ("interleaved", true)] {
+        let mut spans_opt = None;
+        suite = suite.bench(
+            format!("Series/op=coalesce/order={order}/shape={k}x{n}"),
+            move |b| {
+                let spans = spans_opt.get_or_insert_with(|| {
+                    let half = n / 2;
+                    let mut out = Vec::with_capacity(k * 2);
+                    for i in 0..k {
+                        let pod = format!("nginx-{i}");
+                        let labels = [("__name__", "http_requests_total"), ("pod", pod.as_str())];
+                        let (ts, vs) = counter(n);
+                        if interleaved {
+                            let (ts_a, vs_a): (Vec<_>, Vec<_>) =
+                                (0..n).step_by(2).map(|j| (ts[j], vs[j])).unzip();
+                            let (ts_b, vs_b): (Vec<_>, Vec<_>) =
+                                (1..n).step_by(2).map(|j| (ts[j], vs[j])).unzip();
+                            out.push(Series::new(&labels, ts_a, vs_a).unwrap());
+                            out.push(Series::new(&labels, ts_b, vs_b).unwrap());
+                        } else {
+                            out.push(
+                                Series::new(&labels, ts[..half].to_vec(), vs[..half].to_vec())
+                                    .unwrap(),
+                            );
+                            out.push(
+                                Series::new(&labels, ts[half..].to_vec(), vs[half..].to_vec())
+                                    .unwrap(),
+                            );
+                        }
+                    }
+                    let merged = series::coalesce(out.clone()).unwrap();
+                    assert_eq!(merged.len(), k);
+                    assert_eq!(merged[0].timestamps().len(), n);
+                    out
+                });
+                let mut inputs: Vec<Vec<Series>> =
+                    (0..b.iterations()).map(|_| spans.clone()).collect();
+                b.set_bytes(bytes);
+                b.report_allocs();
+                while b.keep_running() {
+                    black_box(series::coalesce(black_box(inputs.pop().unwrap())).unwrap());
                 }
-                out
-            });
-            b.set_bytes(bytes);
-            b.report_allocs();
-            while b.keep_running() {
-                let cloned = black_box(spans.as_slice()).to_vec();
-                black_box(series::coalesce(cloned).unwrap());
-            }
-        })
+            },
+        );
+    }
+    suite
 }
 
 fn main() {
