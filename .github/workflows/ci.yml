@@ -38,6 +38,12 @@ jobs:
         uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3.6.3
         with:
           version: "2026.10.11"
+          # `mise-action` already exports `mise env`'s direct `.mise-bins` PATH.
+          # Prepending `~/.local/share/mise/shims` via `GITHUB_PATH` makes
+          # `mr-boxington-action` hydrate `.mbx-build-script-shims` with a mise
+          # shim instead of the real `mbx` binary, which fails when Cargo runs
+          # cached build scripts from `~/.cargo/registry`.
+          add_shims_to_path: false
 
       # Restores Cargo's pruned target/ and registry from the newest entry,
       # and saves a new one only for a successful push to main. Pull requests
