@@ -465,6 +465,7 @@ fn register_range_queries<'a>(mut suite: Suite<'a>) -> Suite<'a> {
         let rq = RangeQuery::new(start_ms, end_ms, RANGE_INTERVAL_MS);
         let expr_whole = case.expr.clone();
         let expr_prep = case.expr.clone();
+        let mut prep_opt: Option<PreparedQuery> = None;
 
         suite = suite
             .bench(
@@ -487,7 +488,6 @@ fn register_range_queries<'a>(mut suite: Suite<'a>) -> Suite<'a> {
                 move |b| {
                     let engine = async_engine();
                     let rt = multi_thread_rt();
-                    let mut prep_opt: Option<PreparedQuery> = None;
                     let prepared = prep_opt.get_or_insert_with(|| {
                         let source = range_source();
                         let p = rt
@@ -516,6 +516,7 @@ fn register_join_queries<'a>(mut suite: Suite<'a>) -> Suite<'a> {
 
     for expr in JOIN_CASES {
         let mut warmed = false;
+        let mut prep_opt: Option<PreparedQuery> = None;
         suite = suite
             .bench(
                 format!("JoinQuery/expr={expr}/steps={JOIN_STEPS}"),
@@ -537,7 +538,6 @@ fn register_join_queries<'a>(mut suite: Suite<'a>) -> Suite<'a> {
                 move |b| {
                     let engine = async_engine();
                     let rt = multi_thread_rt();
-                    let mut prep_opt: Option<PreparedQuery> = None;
                     let prepared = prep_opt.get_or_insert_with(|| {
                         let source = join_source();
                         let p = rt
@@ -562,10 +562,10 @@ fn register_join_queries<'a>(mut suite: Suite<'a>) -> Suite<'a> {
 fn register_info_group_left<'a>(mut suite: Suite<'a>) -> Suite<'a> {
     let rq = RangeQuery::new(0, 2 * 3_600_000, 30_000);
     for (name, query) in INFO_GROUP_LEFT_CASES {
+        let mut prep_opt: Option<PreparedQuery> = None;
         suite = suite.bench(format!("InfoFunction/{name}"), move |b| {
             let engine = async_engine();
             let rt = multi_thread_rt();
-            let mut prep_opt: Option<PreparedQuery> = None;
             let prepared = prep_opt.get_or_insert_with(|| {
                 let source = info_source();
                 let p = rt
@@ -618,6 +618,7 @@ fn register_high_card_queries<'a>(mut suite: Suite<'a>) -> Suite<'a> {
         let rq = RangeQuery::new(start_ms, end_ms, HIGH_CARD_INTERVAL_MS);
         let expr_whole = case.expr.clone();
         let expr_prep = case.expr.clone();
+        let mut prep_opt: Option<PreparedQuery> = None;
 
         suite = suite
             .bench(
@@ -640,7 +641,6 @@ fn register_high_card_queries<'a>(mut suite: Suite<'a>) -> Suite<'a> {
                 move |b| {
                     let engine = async_engine();
                     let rt = multi_thread_rt();
-                    let mut prep_opt: Option<PreparedQuery> = None;
                     let prepared = prep_opt.get_or_insert_with(|| {
                         let source = high_card_source();
                         let p = rt
