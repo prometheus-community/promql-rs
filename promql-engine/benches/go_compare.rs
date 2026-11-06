@@ -7,15 +7,16 @@
 //! `promql.Engine` (backed by in-memory `teststorage.TestStorage` with head
 //! compaction) against `promql_engine::Engine` (backed by `MemorySeriesSource`).
 //!
-//! Two boundaries are exposed for `RangeQuery` and `JoinQuery`:
-//! - `BenchmarkRangeQuery/...` and `BenchmarkJoinQuery/...` time whole-query
-//!   `Engine::range_query` (parse + `MemorySeriesSource::select` + DataFusion
-//!   logical/physical planning + execution + result finalization), matching Go's
-//!   `NewRangeQuery` + `Exec` loop.
-//! - `BenchmarkPreparedRange/...` and `BenchmarkPreparedJoin/...` time
-//!   `Engine::execute_async` on pre-prepared queries to isolate vectorized
-//!   DataFusion execution and PromQL finalization from `MemorySeriesSource`'s
-//!   per-query batch copy and planning overhead.
+//! Two boundaries are exposed for `RangeQuery`, `HighCardQuery`, and `JoinQuery`:
+//! - `BenchmarkRangeQuery/...`, `BenchmarkHighCardQuery/...`, and
+//!   `BenchmarkJoinQuery/...` time whole-query `Engine::range_query` (parse +
+//!   `MemorySeriesSource::select` + DataFusion logical/physical planning +
+//!   execution + result finalization), matching Go's `NewRangeQuery` + `Exec`
+//!   loop.
+//! - `BenchmarkPreparedRange/...`, `BenchmarkPreparedHighCard/...`, and
+//!   `BenchmarkPreparedJoin/...` time `Engine::execute_async` on pre-prepared
+//!   queries to isolate vectorized DataFusion execution and PromQL finalization
+//!   from `MemorySeriesSource`'s per-query batch copy and planning overhead.
 //! - `BenchmarkInfoFunction/...` times `Engine::execute_async` on pre-prepared
 //!   queries, matching Go's `BenchmarkInfoFunction` which wraps `NewRangeQuery`
 //!   in `b.StopTimer()` / `b.StartTimer()` and times `qry.Exec` alone.
@@ -57,6 +58,9 @@ const JOIN_NUM_INSTANCES: usize = 1_000;
 const INFO_SERIES_NUM: usize = 100;
 const INFO_INTERVAL_MS: i64 = 2_000;
 const INFO_NUM_INTERVALS: usize = 3_600;
+
+const HIGH_CARD_INTERVAL_MS: i64 = 10_000;
+const HIGH_CARD_NUM_INTERVALS: usize = 65;
 
 /// Build the exact series dataset of `setupRangeQueryTestData` in
 /// `promql/bench_test.go:41-100`:
@@ -284,6 +288,54 @@ fn join_source() -> &'static MemorySeriesSource {
 fn info_source() -> &'static MemorySeriesSource {
     static SRC: OnceLock<MemorySeriesSource> = OnceLock::new();
     SRC.get_or_init(build_info_query_source)
+}
+
+/// Build high-cardinality series scaling across `1k`, `10k`, and `100k` series
+/// per metric (`a_1k`/`b_1k`, `a_10k`/`b_10k`, `a_100k`/`b_100k`) with `l="0"..`
+/// and `k="0".."99"` (100 aggregation groups) over 65 ten-second intervals so
+/// `[5m]` rate and 30-step range queries fit comfortably in memory.
+fn build_high_card_query_source() -> MemorySeriesSource {
+    let tiers = [
+        ("1k", 1_000usize),
+        ("10k", 10_000usize),
+        ("100k", 100_000usize),
+    ];
+    let total_metrics: usize = tiers.iter().map(|&(_, n)| n * 2).sum();
+    assert_eq!(total_metrics, 222_000);
+    let denom = total_metrics as f64;
+    let timestamps: Vec<i64> = (0..HIGH_CARD_NUM_INTERVALS)
+        .map(|s| s as i64 * HIGH_CARD_INTERVAL_MS)
+        .collect();
+
+    let mut all_series = Vec::with_capacity(total_metrics);
+    let mut metric_idx = 0usize;
+    for (suffix, count) in tiers {
+        let a_name = format!("a_{suffix}");
+        let b_name = format!("b_{suffix}");
+        for i in 0..count {
+            let l_val = i.to_string();
+            let k_val = (i % 100).to_string();
+            for metric_name in [a_name.as_str(), b_name.as_str()] {
+                let offset = (metric_idx as f64) / denom;
+                metric_idx += 1;
+                let values: Vec<f64> = (0..HIGH_CARD_NUM_INTERVALS)
+                    .map(|s| s as f64 + offset)
+                    .collect();
+                let labels = [
+                    ("__name__", metric_name),
+                    ("k", k_val.as_str()),
+                    ("l", l_val.as_str()),
+                ];
+                all_series.push(Series::new(&labels, timestamps.clone(), values).unwrap());
+            }
+        }
+    }
+    MemorySeriesSource::try_new(all_series).unwrap()
+}
+
+fn high_card_source() -> &'static MemorySeriesSource {
+    static SRC: OnceLock<MemorySeriesSource> = OnceLock::new();
+    SRC.get_or_init(build_high_card_query_source)
 }
 
 fn blocking_engine() -> &'static Engine {
@@ -539,9 +591,86 @@ fn register_info_group_left<'a>(mut suite: Suite<'a>) -> Suite<'a> {
     suite
 }
 
+fn high_card_query_cases() -> Vec<BenchCase> {
+    let raw: &[(&str, usize)] = &[
+        ("a_X", 1),
+        ("a_X", 30),
+        ("sum(a_X)", 1),
+        ("sum(a_X)", 30),
+        ("sum by (k)(a_X)", 30),
+        ("rate(a_X[5m])", 1),
+        ("rate(a_X[5m])", 30),
+        ("sum by (k)(rate(a_X[5m]))", 30),
+        ("a_X - b_X", 1),
+        ("a_X - b_X", 30),
+    ];
+    let mut out = Vec::with_capacity(raw.len() * 3);
+    for &(expr, steps) in raw {
+        for sz in ["1k", "10k", "100k"] {
+            out.push(BenchCase {
+                expr: expr.replace('X', sz),
+                steps,
+            });
+        }
+    }
+    out
+}
+
+fn register_high_card_queries<'a>(mut suite: Suite<'a>) -> Suite<'a> {
+    for case in high_card_query_cases() {
+        let start_ms = ((HIGH_CARD_NUM_INTERVALS - case.steps) as i64) * HIGH_CARD_INTERVAL_MS;
+        let end_ms = (HIGH_CARD_NUM_INTERVALS as i64) * HIGH_CARD_INTERVAL_MS;
+        let rq = RangeQuery::new(start_ms, end_ms, HIGH_CARD_INTERVAL_MS);
+        let expr_whole = case.expr.clone();
+        let expr_prep = case.expr.clone();
+
+        suite = suite
+            .bench(
+                format!("HighCardQuery/expr={},steps={}", case.expr, case.steps),
+                move |b| {
+                    let engine = blocking_engine();
+                    let source = high_card_source();
+                    b.report_allocs();
+                    while b.keep_running() {
+                        black_box(
+                            engine
+                                .range_query(source, black_box(expr_whole.as_str()), &rq)
+                                .unwrap(),
+                        );
+                    }
+                },
+            )
+            .bench(
+                format!("PreparedHighCard/expr={},steps={}", case.expr, case.steps),
+                move |b| {
+                    let engine = async_engine();
+                    let rt = multi_thread_rt();
+                    let mut prep_opt: Option<PreparedQuery> = None;
+                    let prepared = prep_opt.get_or_insert_with(|| {
+                        let source = high_card_source();
+                        let p = rt
+                            .block_on(engine.prepare_async(source, expr_prep.as_str(), &rq))
+                            .unwrap();
+                        black_box(rt.block_on(engine.execute_async(&p)).unwrap());
+                        p
+                    });
+                    b.report_allocs();
+                    while b.keep_running() {
+                        black_box(
+                            rt.block_on(engine.execute_async(black_box(prepared)))
+                                .unwrap(),
+                        );
+                    }
+                },
+            );
+    }
+    suite
+}
+
 fn main() {
     let mut suite = Suite::from_env("github.com/prometheus/prometheus/promql").with_alloc(&ALLOC);
     suite = register_range_queries(suite);
+    suite = register_high_card_queries(suite);
     suite = register_join_queries(suite);
     suite = register_info_group_left(suite);
     suite.run();

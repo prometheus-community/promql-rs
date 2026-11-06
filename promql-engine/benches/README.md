@@ -7,10 +7,11 @@ The benchmark targets measure different parts of query evaluation:
 - [`engine.rs`](engine.rs) times whole queries and preplanned DataFusion execution.
 - [`go_compare.rs`](go_compare.rs) mirrors upstream Prometheus's
   `promql/bench_test.go` (`BenchmarkRangeQuery`, `BenchmarkJoinQuery`, and the
-  `group_left` cases of `BenchmarkInfoFunction` at `83962c35`) with matching
-  `benchfmt` names and `pkg` header so `benchstat go.txt rust.txt` compares
-  both engines side-by-side (`promql-parser/benches/go_compare.rs` does the
-  same for `BenchmarkParser`).
+  `group_left` cases of `BenchmarkInfoFunction` at `83962c35`), plus high-series
+  scaling (`BenchmarkHighCardQuery` across `1k`, `10k`, and `100k` series per
+  metric), with matching `benchfmt` names and `pkg` header so
+  `benchstat go.txt rust.txt` compares both engines side-by-side
+  (`promql-parser/benches/go_compare.rs` does the same for `BenchmarkParser`).
 - [`memory.rs`](memory.rs) measures heap use for individual queries, not
   execution time.
 
