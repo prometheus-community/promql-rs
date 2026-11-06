@@ -955,10 +955,19 @@ impl Pairing {
 
         // Resolve each series to its output bucket once up front so the step
         // loop indexes into `buckets` without hashing label vectors per step.
-        let mut buckets: Vec<Bucket> = Vec::with_capacity(self.many.len());
-        let mut by_labels: HashMap<&[String], usize> = HashMap::with_capacity(self.many.len());
+        let bucket_cap = if self.op == Op::Or {
+            self.many.len()
+        } else {
+            lhs_count
+        };
+        let mut buckets: Vec<Bucket> = Vec::with_capacity(bucket_cap);
+        let mut by_labels: HashMap<&[String], usize> = HashMap::with_capacity(bucket_cap);
         let mut series_bucket: Vec<usize> = Vec::with_capacity(self.many.len());
         for series in &self.many {
+            if self.op != Op::Or && series.side == RHS {
+                series_bucket.push(usize::MAX);
+                continue;
+            }
             let cap = series.counts.iter().filter(|&&c| c > 0).count();
             let idx = *by_labels
                 .entry(series.labels.as_slice())
