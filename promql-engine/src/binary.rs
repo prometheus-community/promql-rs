@@ -3818,4 +3818,197 @@ mod tests {
         assert!(err.contains("err_second"), "{err}");
         assert!(!err.contains("filtered_rhs"), "{err}");
     }
+
+    #[test]
+    fn fast_path_handles_group_right_same_series_duplicates_and_disjoint_steps() {
+        // 1:1 fast path with `group_right` (`one_is_lhs = true`) on a
+        // non-commutative operator (`Op::Sub`: lhs - rhs = 10 - 3 = 7).
+        let mut gr = pairing(
+            Op::Sub,
+            false,
+            Matching {
+                card: Card::OneToMany,
+                on: true,
+                labels: names(&["pod"]),
+                include: names(&["zone"]),
+                ..Matching::default()
+            },
+        );
+        gr.absorb(LHS, &lset("total", "", "a", "eu"), &[0], &[10.0])
+            .unwrap();
+        gr.absorb(RHS, &lset("errors", "/x", "a", ""), &[0], &[3.0])
+            .unwrap();
+        assert!(gr.one.as_ref().unwrap().rows.is_none());
+        assert_eq!(
+            pairs_of(gr.evaluate().unwrap()),
+            [(lset("", "/x", "a", "eu"), vec![(0, 7.0)])]
+        );
+
+        // 1:1 fast path with `one.rows.is_none()` and `oc > 1` (same RHS series
+        // absorbed twice at the same step).
+        let mut dup = plain(Op::Add);
+        dup.absorb(LHS, &lset("req", "", "a", ""), &[0], &[1.0])
+            .unwrap();
+        dup.absorb(RHS, &lset("err", "", "a", ""), &[0], &[2.0])
+            .unwrap();
+        dup.absorb(RHS, &lset("err", "", "a", ""), &[0], &[3.0])
+            .unwrap();
+        assert!(dup.one.as_ref().unwrap().rows.is_none());
+        assert!(dup
+            .evaluate()
+            .unwrap_err()
+            .to_string()
+            .contains(DUPLICATE_SERIES));
+
+        // 1:1 fast path with disjoint steps (`paired == 0`).
+        let mut disjoint = plain(Op::Add);
+        disjoint
+            .absorb(LHS, &lset("req", "", "a", ""), &[0], &[1.0])
+            .unwrap();
+        disjoint
+            .absorb(RHS, &lset("err", "", "a", ""), &[10_000], &[2.0])
+            .unwrap();
+        assert!(pairs_of(disjoint.evaluate().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn u8_sample_counts_saturate_across_absorb_and_merge() {
+        let lhs = lset("req", "", "a", "");
+        let rhs_a = lset("err_a", "", "a", "");
+        let rhs_b = lset("err_b", "", "a", "");
+
+        // 256 and 257 samples at the same step must saturate at 255 rather than
+        // wrapping to 0 or 1.
+        for total in [256usize, 257] {
+            let mut p1 = plain(Op::Add);
+            p1.absorb(LHS, &lhs, &[0], &[1.0]).unwrap();
+            p1.absorb(RHS, &rhs_a, &[0], &[2.0]).unwrap();
+            for _ in 1..200 {
+                p1.absorb(RHS, &rhs_b, &[0], &[3.0]).unwrap();
+            }
+            let mut p2 = plain(Op::Add);
+            for _ in 200..total {
+                p2.absorb(RHS, &rhs_b, &[0], &[3.0]).unwrap();
+            }
+            let mut merged = plain(Op::Add);
+            for mut part in [p1, p2] {
+                let arrays: Vec<ArrayRef> = part
+                    .state()
+                    .unwrap()
+                    .iter()
+                    .map(|s| s.to_array().unwrap())
+                    .collect();
+                merged.merge_batch(&arrays).unwrap();
+            }
+            assert_eq!(merged.one.as_ref().unwrap().counts[0], u8::MAX);
+            assert!(merged
+                .evaluate()
+                .unwrap_err()
+                .to_string()
+                .contains(DUPLICATE_SERIES));
+        }
+    }
+
+    #[test]
+    fn single_sided_groups_with_fill_values_emit_or_short_circuit() {
+        let lhs = lset("req", "/x", "a", "");
+        let rhs = lset("err", "", "a", "eu");
+
+        // LHS-only (`one` is `None`) with `fill_rhs` emits filled samples.
+        let mut fill_r = pairing(
+            Op::Add,
+            false,
+            Matching {
+                fill_rhs: Some(5.0),
+                ..Matching::default()
+            },
+        );
+        fill_r.absorb(LHS, &lhs, &[0], &[2.0]).unwrap();
+        assert!(fill_r.one.is_none());
+        assert_eq!(
+            pairs_of(fill_r.evaluate().unwrap()),
+            [(lset("", "/x", "a", ""), vec![(0, 7.0)])]
+        );
+
+        // LHS-only (`one` is `None`) with only `fill_lhs` short-circuits to empty.
+        let mut fill_l_only = pairing(
+            Op::Add,
+            false,
+            Matching {
+                fill_lhs: Some(5.0),
+                ..Matching::default()
+            },
+        );
+        fill_l_only.absorb(LHS, &lhs, &[0], &[2.0]).unwrap();
+        assert!(pairs_of(fill_l_only.evaluate().unwrap()).is_empty());
+
+        // RHS-only (`many` is empty) with `fill_lhs` emits filled samples.
+        let mut fill_l = pairing(
+            Op::Add,
+            false,
+            Matching {
+                fill_lhs: Some(10.0),
+                ..Matching::default()
+            },
+        );
+        fill_l.absorb(RHS, &rhs, &[0], &[3.0]).unwrap();
+        assert!(fill_l.many.is_empty());
+        assert_eq!(
+            pairs_of(fill_l.evaluate().unwrap()),
+            [(lset("", "", "a", "eu"), vec![(0, 13.0)])]
+        );
+    }
+
+    #[test]
+    fn corrupt_partial_states_are_rejected_in_merge_row() {
+        let mut base = plain(Op::Add);
+        base.absorb(RHS, &lset("err", "", "a", ""), &[0], &[1.0])
+            .unwrap();
+        let valid: Vec<ArrayRef> = base
+            .state()
+            .unwrap()
+            .iter()
+            .map(|s| s.to_array().unwrap())
+            .collect();
+
+        // Empty `one_pool` with non-zero `one_counts` must fail even when
+        // `one_rows` is empty.
+        let mut empty_pool = valid.clone();
+        empty_pool[3] = Arc::new(ListArray::new(
+            state_item(STATE_ONE_POOL, DataType::Utf8),
+            OffsetBuffer::new(vec![0, 0].into()),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+            None,
+        ));
+        assert!(plain(Op::Add).merge_batch(&empty_pool).is_err());
+
+        // Negative `one_rows` entry at a step with `one_counts > 0` must fail.
+        let mut neg_rows = valid.clone();
+        neg_rows[2] = Arc::new(ListArray::new(
+            state_item(STATE_ONE_ROWS, DataType::Int32),
+            OffsetBuffer::new(vec![0, 4].into()),
+            Arc::new(Int32Array::from(vec![-1, -1, -1, -1])),
+            None,
+        ));
+        assert!(plain(Op::Add).merge_batch(&neg_rows).is_err());
+
+        // Mismatched `many_labels` row count must fail in `rectangle_slice`.
+        let mut many_base = plain(Op::Add);
+        many_base
+            .absorb(LHS, &lset("req", "", "a", ""), &[0], &[1.0])
+            .unwrap();
+        let mut bad_many: Vec<ArrayRef> = many_base
+            .state()
+            .unwrap()
+            .iter()
+            .map(|s| s.to_array().unwrap())
+            .collect();
+        bad_many[5] = Arc::new(ListArray::new(
+            state_item(STATE_MANY_LABELS, DataType::Utf8),
+            OffsetBuffer::new(vec![0, 0].into()),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+            None,
+        ));
+        assert!(plain(Op::Add).merge_batch(&bad_many).is_err());
+    }
 }
