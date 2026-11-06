@@ -1304,11 +1304,11 @@ impl Pairing {
                 for step in 0..steps {
                     let c = counts[step];
                     if c > 0 {
+                        let dst = mapped
+                            .ok_or_else(|| corrupt("a one-side sample with an empty pool"))?;
                         one.counts[step] = one.counts[step].saturating_add(c);
                         one.values[step] = values[step];
                         if let Some(dst_rows) = &mut one.rows {
-                            let dst = mapped
-                                .ok_or_else(|| corrupt("a one-side sample with an empty pool"))?;
                             dst_rows[step] = dst;
                         }
                     }
@@ -1318,14 +1318,13 @@ impl Pairing {
                 for step in 0..steps {
                     let c = counts[step];
                     if c > 0 {
+                        let dst = usize::try_from(rows[step])
+                            .ok()
+                            .and_then(|i| seen.get(i).copied())
+                            .ok_or_else(|| corrupt("a one-side row out of its pool"))?;
                         one.counts[step] = one.counts[step].saturating_add(c);
                         one.values[step] = values[step];
-                        let held = rows[step];
-                        if held >= 0 {
-                            dst_rows[step] = *seen
-                                .get(held as usize)
-                                .ok_or_else(|| corrupt("a one-side row out of its pool"))?;
-                        }
+                        dst_rows[step] = dst;
                     }
                 }
             }
