@@ -619,10 +619,10 @@ fn register_aggregate_multi_group<'a>(mut suite: Suite<'a>) -> Suite<'a> {
     let end_ms = (steps as i64 - 1) * STEP_MS;
     let bytes = (k * steps) as u64 * SAMPLE_BYTES;
     for (name, op) in [("sum", Op::Sum), ("avg", Op::Avg), ("stddev", Op::Stddev)] {
+        let mut fix_opt = None;
         suite = suite.bench(
             format!("AggregateMultiGroup/op={name}/groups={groups_count}/series={k}"),
             move |b| {
-                let mut fix_opt = None;
                 let (column, groups) = fix_opt.get_or_insert_with(|| {
                     let groups = (0..k).map(|i| i % groups_count).collect::<Vec<_>>();
                     (samples_of(&aligned(k, steps)), groups)
@@ -997,10 +997,10 @@ fn register_elementwise_math<'a>(mut suite: Suite<'a>) -> Suite<'a> {
         ("sgn", None, None),
         ("clamp", Some(25.0), Some(150.0)),
     ] {
+        let mut col_opt = None;
         suite = suite.bench(
             format!("ElementwiseMath/func={name}/shape={rows}x{samples}"),
             move |b| {
-                let mut col_opt = None;
                 let column = col_opt.get_or_insert_with(|| {
                     let all: Vec<(Vec<i64>, Vec<f64>)> = (0..rows)
                         .map(|i| {
@@ -1036,8 +1036,8 @@ fn register_matcher<'a>(mut suite: Suite<'a>) -> Suite<'a> {
             r#"{pod=~"nginx-(1|2|3|42|99)-[a-z0-9]+"}"#,
         ),
     ] {
+        let mut m_opt = None;
         suite = suite.bench(format!("MatcherCompile/op={name}"), move |b| {
-            let mut m_opt = None;
             let matcher = m_opt.get_or_insert_with(|| {
                 let mut ms = promql_parser::parse_metric_selector(selector).unwrap();
                 ms.pop().unwrap()
@@ -1056,8 +1056,8 @@ fn register_matcher<'a>(mut suite: Suite<'a>) -> Suite<'a> {
         ("regex", r#"{pod=~"nginx-[0-9]+-(prod|staging)"}"#),
         ("not_regex", r#"{pod!~"nginx-9[0-9]+-.*"}"#),
     ] {
+        let mut fix_opt = None;
         suite = suite.bench(format!("MatcherEval/op={name}/rows={rows}"), move |b| {
-            let mut fix_opt = None;
             let (compiled, values) = fix_opt.get_or_insert_with(|| {
                 let ms = promql_parser::parse_metric_selector(selector).unwrap();
                 let compiled = CompiledMatcher::compile(&ms[0]).unwrap();
@@ -1088,11 +1088,12 @@ fn register_matcher<'a>(mut suite: Suite<'a>) -> Suite<'a> {
 fn register_memory_source<'a>(mut suite: Suite<'a>) -> Suite<'a> {
     let (build_k, build_n) = (1_000usize, 100usize);
     let build_bytes = (build_k * build_n) as u64 * SAMPLE_BYTES;
+    let mut rows_opt = None;
+    let mut descs_opt = None;
     suite = suite
         .bench(
             format!("SourceBuild/mode=try_new/shape={build_k}x{build_n}"),
             move |b| {
-                let mut rows_opt = None;
                 let rows = rows_opt.get_or_insert_with(|| labelled(build_k, build_n));
                 b.set_bytes(build_bytes);
                 b.report_allocs();
@@ -1105,7 +1106,6 @@ fn register_memory_source<'a>(mut suite: Suite<'a>) -> Suite<'a> {
         .bench(
             format!("SourceBuild/mode=from_descriptions/shape={build_k}x{build_n}"),
             move |b| {
-                let mut descs_opt = None;
                 let descs = descs_opt.get_or_insert_with(|| {
                     (0..build_k)
                         .map(|i| {
@@ -1147,11 +1147,11 @@ fn register_memory_source<'a>(mut suite: Suite<'a>) -> Suite<'a> {
         ),
         ("chunked_blocks", r#"http_requests_total{code="200"}"#, true),
     ] {
+        let mut fix_opt = None;
         suite = suite.bench(
             format!("SourceSelect/case={case}/shape={sel_k}x{sel_n}"),
             move |b| {
                 let rt = runtime();
-                let mut fix_opt = None;
                 let (source, state, matchers, hints) = fix_opt.get_or_insert_with(|| {
                     let mut source = MemorySeriesSource::try_new(labelled(sel_k, sel_n)).unwrap();
                     if chunked_blocks {
@@ -1184,8 +1184,8 @@ fn register_memory_source<'a>(mut suite: Suite<'a>) -> Suite<'a> {
 /// `absent::labels_for` label extraction and the `promql_absent` UDAF
 /// accumulator on both empty and partially populated grids.
 fn register_absent<'a>(mut suite: Suite<'a>) -> Suite<'a> {
+    let mut expr_opt = None;
     suite = suite.bench("AbsentLabelsFor/case=mixed_matchers", move |b| {
-        let mut expr_opt = None;
         let expr = expr_opt.get_or_insert_with(|| {
             promql_parser::parse_expr(
                 r#"http_requests_total{job="api", instance=~"10\\..*", env="prod", region="eu", region="us"}"#,
@@ -1201,10 +1201,10 @@ fn register_absent<'a>(mut suite: Suite<'a>) -> Suite<'a> {
     let steps = 1_440usize;
     let end_ms = (steps as i64 - 1) * STEP_MS;
     for (case, populate) in [("empty", false), ("half_present", true)] {
+        let mut fix_opt = None;
         suite = suite.bench(
             format!("AbsentAccumulator/case={case}/steps={steps}"),
             move |b| {
-                let mut fix_opt = None;
                 let (udaf, schema, exprs, fields, return_field, column) = fix_opt
                     .get_or_insert_with(|| {
                         let udaf = absent::udaf();
@@ -1269,10 +1269,16 @@ fn register_series_encode_decode<'a>(suite: Suite<'a>) -> Suite<'a> {
     let (k, n) = (1_000usize, 1_000usize);
     let bytes = (k * n) as u64 * SAMPLE_BYTES;
     let (lo, hi) = (n as i64 * SCRAPE_MS / 4, n as i64 * SCRAPE_MS / 2);
+    let mut encode_fix_opt = None;
+    let mut decode_batch_opt = None;
+    let mut clip_batch_opt = None;
+    let mut schema_opt = None;
+    let mut empty_batch_opt = None;
+    let mut unused_batch_opt = None;
+    let mut spans_opt = None;
     suite
         .bench(format!("Series/op=encode/shape={k}x{n}"), move |b| {
-            let mut fix_opt = None;
-            let (all, names) = fix_opt.get_or_insert_with(|| {
+            let (all, names) = encode_fix_opt.get_or_insert_with(|| {
                 let all = labelled(k, n);
                 let names = series::label_names_of(&all);
                 (all, names)
@@ -1284,8 +1290,7 @@ fn register_series_encode_decode<'a>(suite: Suite<'a>) -> Suite<'a> {
             }
         })
         .bench(format!("Series/op=decode/shape={k}x{n}"), move |b| {
-            let mut batch_opt = None;
-            let batch = batch_opt.get_or_insert_with(|| {
+            let batch = decode_batch_opt.get_or_insert_with(|| {
                 let all = labelled(k, n);
                 let names = series::label_names_of(&all);
                 series::encode(&names, &all, WHOLE).unwrap()
@@ -1297,8 +1302,7 @@ fn register_series_encode_decode<'a>(suite: Suite<'a>) -> Suite<'a> {
             }
         })
         .bench(format!("Series/op=clip/shape={k}x{n}"), move |b| {
-            let mut batch_opt = None;
-            let batch = batch_opt.get_or_insert_with(|| {
+            let batch = clip_batch_opt.get_or_insert_with(|| {
                 let all = labelled(k, n);
                 let names = series::label_names_of(&all);
                 series::encode(&names, &all, WHOLE).unwrap()
@@ -1310,7 +1314,6 @@ fn register_series_encode_decode<'a>(suite: Suite<'a>) -> Suite<'a> {
             }
         })
         .bench(format!("Series/op=validate/shape={k}x{n}"), move |b| {
-            let mut schema_opt = None;
             let schema = schema_opt.get_or_insert_with(|| {
                 let all = labelled(k, n);
                 let names = series::label_names_of(&all);
@@ -1322,8 +1325,7 @@ fn register_series_encode_decode<'a>(suite: Suite<'a>) -> Suite<'a> {
             }
         })
         .bench(format!("Series/op=drop_empty/shape={k}x{n}"), move |b| {
-            let mut batch_opt = None;
-            let batch = batch_opt.get_or_insert_with(|| {
+            let batch = empty_batch_opt.get_or_insert_with(|| {
                 let all: Vec<Series> = (0..k)
                     .map(|i| {
                         let pod = format!("nginx-{i}");
@@ -1347,8 +1349,7 @@ fn register_series_encode_decode<'a>(suite: Suite<'a>) -> Suite<'a> {
         .bench(
             format!("Series/op=drop_unused_labels/shape={k}x{n}"),
             move |b| {
-                let mut batch_opt = None;
-                let batch = batch_opt.get_or_insert_with(|| {
+                let batch = unused_batch_opt.get_or_insert_with(|| {
                     let all = labelled(k, n);
                     let mut names = series::label_names_of(&all);
                     names.extend(
@@ -1365,7 +1366,6 @@ fn register_series_encode_decode<'a>(suite: Suite<'a>) -> Suite<'a> {
             },
         )
         .bench(format!("Series/op=coalesce/shape={k}x{n}"), move |b| {
-            let mut spans_opt = None;
             let spans = spans_opt.get_or_insert_with(|| {
                 let half = n / 2;
                 let mut out = Vec::with_capacity(k * 2);
