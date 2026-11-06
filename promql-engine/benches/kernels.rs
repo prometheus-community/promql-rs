@@ -2,11 +2,13 @@
 //!
 //! `SeriesEval*` includes DataFusion stream creation, the real executor, Arrow
 //! output construction/draining, and execution-state reset, while excluding
-//! source selection and planning. Other groups drive public kernels and
-//! accumulators directly. `AggregateSingletonSpans` isolates legal descending
-//! span growth. Fixtures are deterministic and constructed lazily outside the
-//! timed `keep_running` window so filtered runs do not pay setup costs for
-//! non-matching cases.
+//! source selection and planning. `SourceBuild` times reference store
+//! encoding and indexing from prebuilt inputs, and `SourceSelect` stops at
+//! `SeriesSource::select` plan construction without draining batches. Other
+//! groups drive public kernels and accumulators directly.
+//! `AggregateSingletonSpans` isolates legal descending span growth. Fixtures
+//! are deterministic and constructed lazily outside the timed `keep_running`
+//! window so filtered runs do not pay setup costs for non-matching cases.
 //!
 //! Recommended CLI invocation:
 //! ```sh
@@ -1026,8 +1028,8 @@ fn register_elementwise_math<'a>(mut suite: Suite<'a>) -> Suite<'a> {
     suite
 }
 
-/// Reference label-matcher compilation (`CompiledMatcher::compile`) and
-/// per-value evaluation (`CompiledMatcher::matches`).
+/// Regex anchoring and compilation happen once per selector at plan time,
+/// while `matches` runs per distinct label value during `select`.
 fn register_matcher<'a>(mut suite: Suite<'a>) -> Suite<'a> {
     for (name, selector) in [
         ("equal", r#"{pod="nginx-42"}"#),
@@ -1082,9 +1084,8 @@ fn register_matcher<'a>(mut suite: Suite<'a>) -> Suite<'a> {
     suite
 }
 
-/// Reference store construction (`MemorySeriesSource::try_new` and
-/// `from_descriptions`) and `SeriesSource::select` across matcher shapes and
-/// chunked multi-block layouts.
+/// `SourceSelect` stops at `ExecutionPlan` construction so matcher pruning and
+/// block slicing are isolated from stream execution.
 fn register_memory_source<'a>(mut suite: Suite<'a>) -> Suite<'a> {
     let (build_k, build_n) = (1_000usize, 100usize);
     let build_bytes = (build_k * build_n) as u64 * SAMPLE_BYTES;
@@ -1181,8 +1182,9 @@ fn register_memory_source<'a>(mut suite: Suite<'a>) -> Suite<'a> {
     suite
 }
 
-/// `absent::labels_for` label extraction and the `promql_absent` UDAF
-/// accumulator on both empty and partially populated grids.
+/// `labels_for` includes duplicate equality matchers (`region="eu",
+/// region="us"`) so Prometheus's drop-on-revisit rule runs; the accumulator
+/// bench builds a fresh state per iteration as no-grouping `AggregateExec` does.
 fn register_absent<'a>(mut suite: Suite<'a>) -> Suite<'a> {
     let mut expr_opt = None;
     suite = suite.bench("AbsentLabelsFor/case=mixed_matchers", move |b| {
@@ -1262,9 +1264,8 @@ fn register_absent<'a>(mut suite: Suite<'a>) -> Suite<'a> {
     suite
 }
 
-/// Canonical Arrow batch operations across `series`: encode, decode, clip,
-/// schema validation, empty-row pruning, unused-label pruning, and multi-span
-/// coalescing.
+/// Sample-touching ops set `bytes` for `MB/s` comparison; metadata-only schema
+/// validation and empty-row or unused-column pruning touch headers only.
 fn register_series_encode_decode<'a>(suite: Suite<'a>) -> Suite<'a> {
     let (k, n) = (1_000usize, 1_000usize);
     let bytes = (k * n) as u64 * SAMPLE_BYTES;

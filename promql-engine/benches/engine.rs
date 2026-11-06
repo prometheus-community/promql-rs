@@ -3,12 +3,15 @@
 //!
 //! Engines and per-shape sources are initialized lazily outside the timed
 //! `keep_running` window so filtered runs do not construct unused datasets.
-//! `EnginePlan` isolates parsing and logical planning (including the store's
-//! `select`) from execution. `EngineExecutePreplanned` resets physical
-//! templates over preconstructed selected batches and drains DataFusion
-//! outputs without planning or API result collection. `EngineFocused*` covers
-//! adverse scaling shapes (see `benches/README.md`). All raw executions reset
-//! plan state before each run.
+//! `EngineInstantQuery` times full `instant_query` dispatch and `InstantResult`
+//! finalization across all four result arms. `EnginePlan` isolates parsing and
+//! logical planning (including the store's `select`) from execution, while
+//! `EngineExplain` formats prebuilt logical and physical plans without
+//! planning. `EngineExecutePreplanned` resets physical templates over
+//! preconstructed selected batches and drains DataFusion outputs without
+//! planning or API result collection. `EngineFocused*` covers adverse scaling
+//! shapes (see `benches/README.md`). All raw executions reset plan state
+//! before each run.
 //!
 //! Recommended CLI invocation:
 //! ```sh
