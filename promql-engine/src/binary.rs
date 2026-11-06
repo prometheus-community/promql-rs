@@ -1507,7 +1507,7 @@ impl GroupedBinary {
     fn release(&mut self, emit_to: EmitTo) {
         match emit_to {
             EmitTo::All => {
-                self.groups.clear();
+                self.groups = Vec::new();
                 self.heap_size = 0;
             }
             EmitTo::First(n) => {
