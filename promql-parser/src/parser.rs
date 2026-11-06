@@ -356,19 +356,68 @@ mod tests {
 
     #[test]
     fn concurrent_parses_share_cached_lexers() {
+        let expr_lexer = &*EXPR_LEXER;
+        let series_lexer = &*SERIES_LEXER;
         std::thread::scope(|s| {
             for _ in 0..4 {
                 s.spawn(|| {
+                    assert!(std::ptr::eq(&*EXPR_LEXER, expr_lexer));
+                    assert!(std::ptr::eq(&*SERIES_LEXER, series_lexer));
                     for _ in 0..32 {
-                        let expr = parse_expr(r#"rate(http_requests_total{job="api"}[5m])"#)
-                            .expect("valid expression");
-                        assert!(matches!(expr, Expr::Call(_)));
+                        // Fail mid-`<BRACES>` in both lexers before parsing keyword-bearing
+                        // inputs to verify start-condition state does not leak across calls.
+                        parse_expr(r#"up{by="a""#).expect_err("unclosed expr brace");
+                        parse_metric(r#"{by="a""#).expect_err("unclosed metric brace");
+
+                        let expr = parse_expr(
+                            r#"sum by (job) (rate(http_requests_total{job="api"}[5m]))"#,
+                        )
+                        .expect("valid expression");
+                        assert!(matches!(expr, Expr::Aggregate(_)));
+
+                        let sel = parse_metric_selector(r#"http_requests_total{job="api"}"#)
+                            .expect("valid metric selector");
+                        assert_eq!(sel.len(), 2);
+
                         let sd = parse_series_desc(r#"http_requests_total{job="api"} 1+2x3"#)
                             .expect("valid series description");
                         assert_eq!(sd.values.len(), 4);
+
+                        let m = parse_metric(r#"http_requests_total{job="api"}"#)
+                            .expect("valid metric");
+                        assert_eq!(m.len(), 2);
                     }
                 });
             }
         });
+    }
+
+    #[test]
+    fn stops_at_first_syntax_error_while_preserving_prior_gate_errors() {
+        let errs: Vec<_> = parse_expr("foo + * + bar + *")
+            .expect_err("syntax error")
+            .into_iter()
+            .collect();
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].range, PositionRange::new(6, 7));
+        assert_eq!(errs[0].gate, None);
+
+        let errs: Vec<_> = parse_expr("mad_over_time(x[5m]) +")
+            .expect_err("gate and syntax errors")
+            .into_iter()
+            .collect();
+        assert_eq!(errs.len(), 2);
+        assert_eq!(errs[0].range, PositionRange::new(0, 13));
+        assert_eq!(errs[0].gate, Some("promql-experimental-functions"));
+        assert_eq!(errs[1].range, PositionRange::new(22, 22));
+        assert_eq!(errs[1].gate, None);
+
+        let errs: Vec<_> = parse_expr("* mad_over_time(x[5m])")
+            .expect_err("leading syntax error")
+            .into_iter()
+            .collect();
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].range, PositionRange::new(0, 1));
+        assert_eq!(errs[0].gate, None);
     }
 }
