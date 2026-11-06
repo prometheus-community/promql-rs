@@ -98,10 +98,12 @@ capacity tests, allocation attribution, and scheduler integration tests.
 
 Timing benchmarks link `benchfmt` with the `pprof` feature. Passing
 `-cpuprofile <path>` writes a gzipped pprof CPU profile sampled during the
-timed `keep_running` window, and passing `-memprofile <path>` (with optional
-`-memprofilerate <bytes>`, defaulting to 512 KiB) writes a sampled allocation
-profile (`alloc_objects` and `alloc_space`) without skewing `ns/op`, `B/op`, or
-`allocs/op`. Multi-threaded benchmarks (`engine.rs`) wrap `CountingAlloc` in
+timed `keep_running` window. Passing `-memprofile <path>`, with optional
+`-memprofilerate <bytes>` defaulting to 524288, writes a sampled allocation
+profile of `alloc_objects` and `alloc_space` without skewing `B/op` or
+`allocs/op`. Collect profiles separately from `benchstat` timing baselines
+because in-window sampling and stack unwinding still add overhead to `ns/op`.
+Multi-threaded benchmarks (`engine.rs`) wrap `CountingAlloc` in
 [`support/process_alloc.rs`](support/process_alloc.rs) so `B/op` and `allocs/op`
 include Tokio worker threads.
 
