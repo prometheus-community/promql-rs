@@ -2148,7 +2148,7 @@ fn rectangle_slice(
         // caller counted.
         return Ok(vec![Vec::new(); if rows == NO_ROWS { 1 } else { rows }]);
     }
-    if !len.is_multiple_of(width) {
+    if !len.is_multiple_of(width) || (rows != NO_ROWS && len / width != rows) {
         return Err(DataFusionError::Internal(format!(
             "{NAME}: {len} label values are not a multiple of the {width} columns"
         )));
