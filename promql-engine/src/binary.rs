@@ -3647,23 +3647,40 @@ mod tests {
         assert!(p1.groups[2].one.as_ref().unwrap().rows.is_some());
         assert!(p1.size() > base_size);
         let s1_first = p1.state(EmitTo::First(1)).unwrap();
+        assert_eq!(
+            p1.heap_size,
+            p1.groups.iter().map(Pairing::heap_size).sum::<usize>()
+        );
+        assert!(p1.heap_size > 0);
         let s1_rest = p1.state(EmitTo::All).unwrap();
         assert_eq!(p1.heap_size, 0);
+        assert_eq!(p1.size(), base_size);
 
         let mut p2 = make_acc();
         p2.update_batch(&part2, &[0, 1], None, 2).unwrap();
-        let s2_all = p2.state(EmitTo::All).unwrap();
+        let s2_first = p2.state(EmitTo::First(1)).unwrap();
+        let s2_rest = p2.state(EmitTo::All).unwrap();
 
         let mut final_acc = make_acc();
         final_acc.merge_batch(&s1_first, &[0], 3).unwrap();
         final_acc.merge_batch(&s1_rest, &[1, 2], 3).unwrap();
-        final_acc.merge_batch(&s2_all, &[0, 2], 3).unwrap();
+        final_acc.merge_batch(&s2_first, &[0], 3).unwrap();
 
         let first_out = final_acc.evaluate(EmitTo::First(1)).unwrap();
         assert_eq!(
             pairs_at(&first_out, 0),
             [(lset("", "", "a", "eu"), vec![(0, 7.0), (10_000, 10.0)])]
         );
+        assert_eq!(
+            final_acc.heap_size,
+            final_acc
+                .groups
+                .iter()
+                .map(Pairing::heap_size)
+                .sum::<usize>()
+        );
+        // Merge into the shifted group index after `EmitTo::First(1)`.
+        final_acc.merge_batch(&s2_rest, &[1], 2).unwrap();
         let rest_out = final_acc.evaluate(EmitTo::All).unwrap();
         assert!(pairs_at(&rest_out, 0).is_empty());
         assert_eq!(
@@ -3674,6 +3691,25 @@ mod tests {
             ]
         );
         assert_eq!(final_acc.heap_size, 0);
+        assert_eq!(final_acc.size(), base_size);
+
+        // Verify `STATE_ONE_METRICS` and `STATE_GROUP` survive `state` + `merge_batch`
+        // when two partials collide on the one side at the same step.
+        let dup_batch = make_batch(&[
+            (&[(METRIC_NAME, "req"), ("pod", "d")], &[0], &[1.0], false),
+            (&[(METRIC_NAME, "rhs_1"), ("pod", "d")], &[0], &[2.0], true),
+            (&[(METRIC_NAME, "rhs_2"), ("pod", "d")], &[0], &[3.0], true),
+        ]);
+        let dup_states = make_acc().convert_to_state(&dup_batch, None).unwrap();
+        let mut dup_acc = make_acc();
+        dup_acc.merge_batch(&dup_states, &[0, 0, 0], 1).unwrap();
+        let dup_err = dup_acc.evaluate(EmitTo::All).unwrap_err().to_string();
+        assert!(
+            dup_err.contains("found duplicate series for the match group {pod=\"d\"}"),
+            "{dup_err}"
+        );
+        assert!(dup_err.contains("rhs_1"), "{dup_err}");
+        assert!(dup_err.contains("rhs_2"), "{dup_err}");
 
         // Also verify DataFusion's high-cardinality partial bypass via
         // `convert_to_state` reaches the exact same merged answer.
