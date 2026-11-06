@@ -729,9 +729,10 @@ fn register_focused<'a>(mut suite: Suite<'a>) -> Suite<'a> {
     suite
 }
 
-/// End-to-end `instant_query` coverage across the `InstantResult` arms that
-/// `range_query` does not exercise directly: vector, raw matrix selector,
-/// scalar extraction, `absent` (hit and miss), and root instant sorts.
+/// End-to-end `instant_query` coverage across all four `InstantResult` arms
+/// that `range_query` does not exercise directly: vector, raw matrix selector,
+/// scalar extraction, string literal, `absent` (hit and miss), and root
+/// instant sorts.
 fn register_instant_query<'a>(mut suite: Suite<'a>) -> Suite<'a> {
     let idx = 1usize;
     let shape = SHAPES[idx];
@@ -740,6 +741,7 @@ fn register_instant_query<'a>(mut suite: Suite<'a>) -> Suite<'a> {
         ("vector_selector", "http_requests_total"),
         ("matrix_5m", "http_requests_total[5m]"),
         ("scalar_sum", "scalar(sum(http_requests_total))"),
+        ("string_literal", r#""promql-rs""#),
         ("absent_hit", r#"absent(nonexistent_metric{job="api"})"#),
         ("absent_miss", r#"absent(http_requests_total{code="200"})"#),
         ("sort_desc", "sort_desc(http_requests_total)"),
@@ -748,11 +750,40 @@ fn register_instant_query<'a>(mut suite: Suite<'a>) -> Suite<'a> {
             r#"sort_by_label_desc(http_requests_total, "route", "pod")"#,
         ),
     ] {
+        let mut checked = false;
         suite = suite.bench(
             format!("EngineInstantQuery/kind={kind}/shape={}", shape.id()),
             move |b| {
                 let engine = blocking_engine();
                 let source = shared_source(idx);
+                if !checked {
+                    match (
+                        kind,
+                        engine.instant_query(source.as_ref(), query, at_ms).unwrap(),
+                    ) {
+                        (
+                            "vector_selector" | "sort_desc" | "sort_by_label_desc",
+                            InstantResult::Vector(batches),
+                        ) => assert_eq!(points(&batches), shape.series),
+                        ("matrix_5m", InstantResult::Matrix(batches)) => {
+                            assert!(points(&batches) > shape.series);
+                        }
+                        ("scalar_sum", InstantResult::Scalar(v)) => {
+                            assert!(v.is_finite() && v > 0.0);
+                        }
+                        ("string_literal", InstantResult::String(s)) => {
+                            assert_eq!(s, "promql-rs");
+                        }
+                        ("absent_hit", InstantResult::Vector(batches)) => {
+                            assert_eq!(points(&batches), 1);
+                        }
+                        ("absent_miss", InstantResult::Vector(batches)) => {
+                            assert_eq!(points(&batches), 0);
+                        }
+                        (_, other) => panic!("unexpected result for {kind}: {other:?}"),
+                    }
+                    checked = true;
+                }
                 b.report_allocs();
                 while b.keep_running() {
                     let res: InstantResult = engine
