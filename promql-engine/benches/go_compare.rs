@@ -19,7 +19,10 @@
 //!   from `MemorySeriesSource`'s per-query batch copy and planning overhead.
 //! - `BenchmarkInfoFunction/...` times `Engine::execute_async` on pre-prepared
 //!   queries, matching Go's `BenchmarkInfoFunction` which wraps `NewRangeQuery`
-//!   in `b.StopTimer()` / `b.StartTimer()` and times `qry.Exec` alone.
+//!   in `b.StopTimer()` / `b.StartTimer()` to exclude query parsing (while Go's
+//!   `qry.Exec` still runs storage `Select`, `Engine::prepare_async` couples
+//!   parsing, `MemorySeriesSource::select`, and DataFusion planning;
+//!   `BenchmarkWholeInfo/...` times end-to-end `Engine::range_query`).
 //!
 //! Upstream `rangeQueryCases()` expressions that exercise features listed in
 //! `promql-conformance/testdata/prometheus/UNSUPPORTED.md` (`smoothed`,
@@ -602,27 +605,42 @@ fn register_join_queries<'a>(mut suite: Suite<'a>) -> Suite<'a> {
 fn register_info_group_left<'a>(mut suite: Suite<'a>) -> Suite<'a> {
     let rq = RangeQuery::new(0, 2 * 3_600_000, 30_000);
     for (name, query) in INFO_GROUP_LEFT_CASES {
+        let mut checked = false;
         let mut prep_opt: Option<PreparedQuery> = None;
-        suite = suite.bench(format!("InfoFunction/{name}"), move |b| {
-            let engine = async_engine();
-            let rt = multi_thread_rt();
-            let prepared = prep_opt.get_or_insert_with(|| {
+        suite = suite
+            .bench(format!("InfoFunction/{name}"), move |b| {
+                let engine = async_engine();
+                let rt = multi_thread_rt();
+                let prepared = prep_opt.get_or_insert_with(|| {
+                    let source = info_source();
+                    let p = rt
+                        .block_on(engine.prepare_async(source, query, &rq))
+                        .unwrap();
+                    let out = rt.block_on(engine.execute_async(&p)).unwrap();
+                    assert!(points(&out) > 0, "{name}");
+                    p
+                });
+                b.report_allocs();
+                while b.keep_running() {
+                    black_box(
+                        rt.block_on(engine.execute_async(black_box(prepared)))
+                            .unwrap(),
+                    );
+                }
+            })
+            .bench(format!("WholeInfo/{name}"), move |b| {
+                let engine = blocking_engine();
                 let source = info_source();
-                let p = rt
-                    .block_on(engine.prepare_async(source, query, &rq))
-                    .unwrap();
-                let out = rt.block_on(engine.execute_async(&p)).unwrap();
-                assert!(points(&out) > 0, "{name}");
-                p
+                if !checked {
+                    let out = engine.range_query(source, query, &rq).unwrap();
+                    assert!(points(&out) > 0, "{name}");
+                    checked = true;
+                }
+                b.report_allocs();
+                while b.keep_running() {
+                    black_box(engine.range_query(source, black_box(query), &rq).unwrap());
+                }
             });
-            b.report_allocs();
-            while b.keep_running() {
-                black_box(
-                    rt.block_on(engine.execute_async(black_box(prepared)))
-                        .unwrap(),
-                );
-            }
-        });
     }
     suite
 }
