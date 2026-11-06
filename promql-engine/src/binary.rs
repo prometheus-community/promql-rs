@@ -736,6 +736,12 @@ impl Pairing {
         timestamps: &[i64],
         values: &[f64],
     ) -> Result<()> {
+        // A filtering comparison upstream of a binary operator can leave a
+        // series row with zero samples; ignore it so it does not allocate dead
+        // lanes or appear in duplicate-series diagnostics.
+        if timestamps.is_empty() {
+            return Ok(());
+        }
         let grid = self.grid;
         if !self.op.is_set() && side == self.matching.one_side() {
             self.remember(labels);
@@ -3714,5 +3720,29 @@ mod tests {
             assert_eq!(pairs_at(&out, 1), want_g1, "{}", op.as_str());
             assert_eq!(pairs_at(&out, 2), want_g2, "{}", op.as_str());
         }
+    }
+
+    #[test]
+    fn empty_sample_rows_do_not_allocate_lanes_or_pollute_duplicates() {
+        let mut p = plain(Op::Add);
+        p.absorb(LHS, &lset("filtered_lhs", "", "a", ""), &[], &[])
+            .unwrap();
+        p.absorb(RHS, &lset("filtered_rhs", "", "a", ""), &[], &[])
+            .unwrap();
+        assert!(p.one.is_none());
+        assert!(p.one_pool.is_empty());
+        assert!(p.one_metrics.is_empty());
+        assert!(p.many.is_empty());
+
+        p.absorb(LHS, &lset("req", "", "a", ""), &[0], &[1.0])
+            .unwrap();
+        p.absorb(RHS, &lset("err_first", "", "a", ""), &[0], &[2.0])
+            .unwrap();
+        p.absorb(RHS, &lset("err_second", "", "a", ""), &[0], &[3.0])
+            .unwrap();
+        let err = p.evaluate().unwrap_err().to_string();
+        assert!(err.contains("err_first"), "{err}");
+        assert!(err.contains("err_second"), "{err}");
+        assert!(!err.contains("filtered_rhs"), "{err}");
     }
 }
