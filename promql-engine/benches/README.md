@@ -12,6 +12,11 @@ The benchmark targets measure different parts of query evaluation:
   metric), with matching `benchfmt` names and `pkg` header so
   `benchstat go.txt rust.txt` compares both engines side-by-side
   (`promql-parser/benches/go_compare.rs` does the same for `BenchmarkParser`).
+- [`thanos_compare.rs`](thanos_compare.rs) mirrors `thanos-io/promql-engine`'s
+  `engine/bench_test.go` (`BenchmarkSingleQuery`, `BenchmarkRangeQuery`,
+  `BenchmarkInstantQuery`, and `BenchmarkMergeSelectorsOptimizer` at `89d6517e`)
+  with matching `benchfmt` names and `pkg` header so `benchstat thanos.txt rust.txt`
+  compares both engines side-by-side.
 - [`memory.rs`](memory.rs) measures heap use for individual queries, not
   execution time.
 

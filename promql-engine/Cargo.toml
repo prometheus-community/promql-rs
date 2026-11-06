@@ -51,5 +51,9 @@ name = "go_compare"
 harness = false
 
 [[bench]]
+name = "thanos_compare"
+harness = false
+
+[[bench]]
 name = "memory"
 harness = false
