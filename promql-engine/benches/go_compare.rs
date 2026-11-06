@@ -35,14 +35,9 @@
 use std::hint::black_box;
 use std::sync::OnceLock;
 
-use benchfmt::Suite;
+use benchfmt::{ProcessAlloc, Suite};
 use promql_engine::{Engine, EngineOptions, MemorySeriesSource, PreparedQuery, RangeQuery, Series};
 use promql_parser::ParserOptions;
-
-#[path = "support/process_alloc.rs"]
-mod process_alloc;
-
-use process_alloc::ProcessAlloc;
 
 #[global_allocator]
 static ALLOC: ProcessAlloc = ProcessAlloc::new();
