@@ -156,7 +156,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 // `lrpar` emits `_reconstitute(__GRM_DATA, __STABLE_DATA)` and a heap `vec![...]`
 // of 248 action wrappers inside `parse()`, deserializing ~94 KiB of bincode tables
-// on every parse call. Cache the deserialized tables once via `super::cached_tables`
+// on every parse call. Cache the deserialized tables once via `crate::grammar::cached_tables`
 // and borrow the action wrappers from a stack slice.
 fn patch_generated_grammar(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let generated = std::fs::read_to_string(path)?;
