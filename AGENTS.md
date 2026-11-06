@@ -49,12 +49,31 @@ draft.
 
 ## Performance and benchmarks
 
-- Write all timing benchmarks with [`benchfmt.rs`](https://github.com/bwplotka/benchfmt.rs) using `benchfmt::Suite` and `benchfmt::CountingAlloc` (or `ProcessAlloc` wrapping `CountingAlloc` when Tokio worker threads allocate) in `harness = false` `[[bench]]` targets so every benchmark emits Go [Benchmark Data Format](https://go.googlesource.com/proposal/+/master/design/14313-benchmark-format.md) lines with `ns/op`, `MB/s`, `B/op`, and `allocs/op` for [`benchstat`](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat). Do not use Criterion or custom timing output formats. Keep `promql-engine/benches/memory.rs` for single-pass peak-heap and retained-Arrow-buffer accounting.
-- Name benchmarks with `/key=value` sub-benchmark dimensions such as `EngineQuery/query=rate_5m/range=range_1h/shape=1000x1000`, call `b.report_allocs()` and `while b.keep_running()`, and include a `Recommended CLI invocation:` doc comment at the top of each benchmark file.
-- Performance improvements and hot-path changes require running benchmarks before and after the change, for example `cargo bench -p promql-engine --bench engine -- -bench '^BenchmarkEngine' -benchtime 1s -count 6 -cpu 2 -benchmem | tee ${bench}.txt`, and comparing with `benchstat before.txt after.txt`.
-- Always output benchmark results in raw `benchstat` format in the PR body and review comments, and always include links to the exact `before` and `after` commits that the benchmark refers to. Rerun benchmarks and update the commit links whenever addressing review comments that touch benchmarked code or benchmarks.
-- If a subset of benchmark results shows a regression, address it or explain in the PR body why that case is not important.
-- Reuse allocations in hot paths where possible, such as `Vec::clear`, scratch buffers, and reusable Arrow builders. When reusing buffers exposed through APIs or traits, document lifetime and copy requirements on the trait or type definition.
+- Write all timing benchmarks with [`benchfmt.rs`](https://github.com/bwplotka/benchfmt.rs)
+  using `benchfmt::Suite` and `benchfmt::CountingAlloc`, or `benchfmt::ProcessAlloc`
+  when Tokio worker threads allocate, in `harness = false` `[[bench]]` targets with
+  `bench = false` on `[lib]` and `[[bin]]` targets. Benchmarks emit Go
+  [Benchmark Data Format](https://go.googlesource.com/proposal/+/master/design/14313-benchmark-format.md)
+  lines with `ns/op`, `B/op`, and `allocs/op`, plus `MB/s` when `b.set_bytes` is set,
+  for [`benchstat`](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat). Do not use
+  Criterion or custom timing output formats. Keep `promql-engine/benches/memory.rs` for
+  single-pass peak-heap and retained-Arrow-buffer accounting.
+- Name benchmarks with `/key=value` sub-benchmark dimensions such as
+  `EngineQuery/query=rate_5m/range=range_1h/shape=1000x1000`, call `b.report_allocs()`
+  and `while b.keep_running()`, and include a `Recommended CLI invocation:` doc comment
+  at the top of each benchmark file.
+- Performance improvements and hot-path changes require running benchmarks before and
+  after the change, for example `cargo bench -p promql-engine --bench engine -- -bench '^BenchmarkEngine' -benchtime 1s -count 6 -cpu 2 -benchmem | tee ${bench}.txt`,
+  and comparing with `benchstat before.txt after.txt`.
+- Always output benchmark results in raw `benchstat` format in the PR body and review
+  comments, and always include links to the exact `before` and `after` commits that the
+  benchmark refers to. Rerun benchmarks and update the commit links whenever addressing
+  review comments that touch benchmarked code or benchmarks.
+- If a subset of benchmark results shows a regression, address it or explain in the PR
+  body why that case is not important.
+- Reuse allocations in hot paths where possible, such as `Vec::clear`, scratch buffers,
+  and reusable Arrow builders. When reusing buffers exposed through APIs or traits,
+  document lifetime and copy requirements on the trait or type definition.
 
 ## Engine design
 
