@@ -5,13 +5,16 @@
 //! match Go's `testing.B` output so `benchstat go_parser.txt rust_parser.txt`
 //! pairs every expression directly without renaming.
 //!
-//! NOTE: Two upstream differences apply under default `ParserOptions` (`parser.Options{}`):
+//! NOTE: Three upstream differences apply under default `ParserOptions` (`parser.Options{}`):
 //! 1. `sort_by_label(metric, "foo", "bar")` is gated by `enable_experimental_functions`,
 //!    so both Go's `testParser.ParseExpr` and `promql_parser::parse_expr` return a
 //!    gate error and discard it.
 //! 2. Go's `ParseExpr` runs post-parse semantic validation (`checkAST`), whereas
 //!    `promql-rs` performs type and vector-matching checks during `promql-engine`
 //!    planning; only syntactic errors fail inside `promql_parser::parse_expr`.
+//! 3. Upstream `BenchmarkParser`'s `preprocess <expr>` sub-benchmarks
+//!    (`promql.PreprocessExpr`) are omitted because `promql-rs` resolves `@` and
+//!    `start()`/`end()` modifiers during `promql-engine` planning.
 //!
 //! Recommended CLI invocation:
 //! ```sh
@@ -55,7 +58,13 @@ fn main() {
     let mut suite = Suite::from_env("github.com/prometheus/prometheus/promql").with_alloc(&ALLOC);
 
     for expr in CASES {
+        let mut checked = false;
         suite = suite.bench(format!("Parser/{expr}"), move |b| {
+            if !checked {
+                let expect_ok = expr != r#"sort_by_label(metric, "foo", "bar")"#;
+                assert_eq!(promql_parser::parse_expr(expr).is_ok(), expect_ok, "{expr}");
+                checked = true;
+            }
             b.report_allocs();
             while b.keep_running() {
                 let _ = black_box(promql_parser::parse_expr(black_box(expr)));
@@ -64,7 +73,17 @@ fn main() {
     }
 
     for expr in ERR_CASES {
+        let mut checked = false;
         suite = suite.bench(format!("Parser/{expr} (should fail)"), move |b| {
+            if !checked {
+                let expect_err = matches!(expr, "(" | "}");
+                assert_eq!(
+                    promql_parser::parse_expr(expr).is_err(),
+                    expect_err,
+                    "{expr}"
+                );
+                checked = true;
+            }
             b.report_allocs();
             while b.keep_running() {
                 let _ = black_box(promql_parser::parse_expr(black_box(expr)));
