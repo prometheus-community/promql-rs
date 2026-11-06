@@ -627,7 +627,13 @@ fn register_aggregate_multi_group<'a>(mut suite: Suite<'a>) -> Suite<'a> {
             move |b| {
                 let (column, groups) = fix_opt.get_or_insert_with(|| {
                     let groups = (0..k).map(|i| i % groups_count).collect::<Vec<_>>();
-                    (samples_of(&aligned(k, steps)), groups)
+                    let column = samples_of(&aligned(k, steps));
+                    let mut probe = filled(op, &column, &groups, end_ms, groups_count);
+                    let result = probe.evaluate(EmitTo::All).unwrap();
+                    let list = result.as_list::<i32>();
+                    assert_eq!(list.len(), groups_count);
+                    assert_eq!(list.value(0).len(), steps);
+                    (column, groups)
                 });
                 b.set_bytes(bytes);
                 b.report_allocs();
@@ -1055,7 +1061,7 @@ fn register_matcher<'a>(mut suite: Suite<'a>) -> Suite<'a> {
     for (name, selector) in [
         ("equal", r#"{pod="nginx-42-prod"}"#),
         ("not_equal", r#"{pod!="nginx-42-prod"}"#),
-        ("regex", r#"{pod=~"nginx-[0-9]+-(prod|staging)"}"#),
+        ("regex", r#"{pod=~"nginx-[1-3][0-9]*-(prod|staging)"}"#),
         ("not_regex", r#"{pod!~"nginx-9[0-9]+-.*"}"#),
     ] {
         let mut fix_opt = None;
@@ -1069,6 +1075,8 @@ fn register_matcher<'a>(mut suite: Suite<'a>) -> Suite<'a> {
                         format!("nginx-{i}-{env}")
                     })
                     .collect();
+                let hits = values.iter().filter(|v| compiled.matches(v)).count();
+                assert!(hits > 0 && hits < rows, "{name}: unexpected hits {hits}");
                 (compiled, values)
             });
             b.report_allocs();
@@ -1163,6 +1171,16 @@ fn register_memory_source<'a>(mut suite: Suite<'a>) -> Suite<'a> {
                     let state = SessionContext::new().state();
                     let matchers = promql_parser::parse_metric_selector(selector).unwrap();
                     let hints = SelectHints::range(0, end_ms).with_window_ms(FIVE_MINUTES_MS);
+                    let plan = rt
+                        .block_on(source.select(&state, &matchers, hints.clone()))
+                        .unwrap();
+                    let batches = rt.block_on(collect(plan, task_ctx().clone())).unwrap();
+                    let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+                    if chunked_blocks {
+                        assert!(total_rows > sel_k);
+                    } else {
+                        assert!(total_rows > 0 && total_rows < sel_k);
+                    }
                     (source, state, matchers, hints)
                 });
                 b.report_allocs();
@@ -1189,10 +1207,18 @@ fn register_absent<'a>(mut suite: Suite<'a>) -> Suite<'a> {
     let mut expr_opt = None;
     suite = suite.bench("AbsentLabelsFor/case=mixed_matchers", move |b| {
         let expr = expr_opt.get_or_insert_with(|| {
-            promql_parser::parse_expr(
+            let expr = promql_parser::parse_expr(
                 r#"http_requests_total{job="api", instance=~"10\\..*", env="prod", region="eu", region="us"}"#,
             )
-            .unwrap()
+            .unwrap();
+            assert_eq!(
+                absent::labels_for(&expr),
+                vec![
+                    ("env".to_owned(), "prod".to_owned()),
+                    ("job".to_owned(), "api".to_owned()),
+                ]
+            );
+            expr
         });
         b.report_allocs();
         while b.keep_running() {
@@ -1227,15 +1253,38 @@ fn register_absent<'a>(mut suite: Suite<'a>) -> Suite<'a> {
                             .collect();
                         let return_field =
                             Arc::new(Field::new("out", series::samples_type(), false));
-                        let rows: Vec<(Vec<i64>, Vec<f64>)> = (0..10)
-                            .map(|_| {
-                                let ts =
-                                    (0..steps).step_by(2).map(|j| j as i64 * STEP_MS).collect();
-                                let vs = vec![1.0; steps / 2];
-                                (ts, vs)
+                        let column = populate.then(|| {
+                            let rows: Vec<(Vec<i64>, Vec<f64>)> = (0..10)
+                                .map(|_| {
+                                    let ts =
+                                        (0..steps).step_by(2).map(|j| j as i64 * STEP_MS).collect();
+                                    let vs = vec![1.0; steps / 2];
+                                    (ts, vs)
+                                })
+                                .collect();
+                            samples_of(&rows)
+                        });
+                        let mut probe = udaf
+                            .accumulator(AccumulatorArgs {
+                                return_field: Arc::clone(&return_field),
+                                schema: &schema,
+                                ignore_nulls: false,
+                                order_bys: &[],
+                                is_reversed: false,
+                                name: udaf.name(),
+                                is_distinct: false,
+                                exprs: &exprs,
+                                expr_fields: &fields,
                             })
-                            .collect();
-                        let column = samples_of(&rows);
+                            .unwrap();
+                        if let Some(col) = &column {
+                            probe.update_batch(std::slice::from_ref(col)).unwrap();
+                        }
+                        let ScalarValue::List(out) = probe.evaluate().unwrap() else {
+                            panic!("expected absent samples list");
+                        };
+                        let expected = if populate { steps / 2 } else { steps };
+                        assert_eq!(out.value(0).len(), expected);
                         (udaf, schema, exprs, fields, return_field, column)
                     });
                 b.report_allocs();
@@ -1252,8 +1301,8 @@ fn register_absent<'a>(mut suite: Suite<'a>) -> Suite<'a> {
                         expr_fields: fields,
                     };
                     let mut acc = udaf.accumulator(args).unwrap();
-                    if populate {
-                        acc.update_batch(std::slice::from_ref(black_box(column)))
+                    if let Some(col) = column {
+                        acc.update_batch(std::slice::from_ref(black_box(col)))
                             .unwrap();
                     }
                     black_box(acc.evaluate().unwrap());
