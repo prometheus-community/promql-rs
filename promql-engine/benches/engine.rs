@@ -812,6 +812,8 @@ fn register_explain<'a>(mut suite: Suite<'a>) -> Suite<'a> {
             "http_requests_total / on(route) group_left() sum by (route) (http_requests_total)",
         ),
     ] {
+        let mut plan_opt = None;
+        let mut exec_opt = None;
         suite = suite
             .bench(
                 format!(
@@ -821,11 +823,13 @@ fn register_explain<'a>(mut suite: Suite<'a>) -> Suite<'a> {
                 move |b| {
                     let engine = async_engine();
                     let rt = current_thread_rt();
-                    let mut plan_opt = None;
                     let plan = plan_opt.get_or_insert_with(|| {
                         let source = shared_source(idx);
-                        rt.block_on(engine.plan_async(source.as_ref(), query, &range))
-                            .unwrap()
+                        let plan = rt
+                            .block_on(engine.plan_async(source.as_ref(), query, &range))
+                            .unwrap();
+                        assert!(explain_plan(&plan).contains("SeriesEval:"));
+                        plan
                     });
                     b.report_allocs();
                     while b.keep_running() {
@@ -841,13 +845,19 @@ fn register_explain<'a>(mut suite: Suite<'a>) -> Suite<'a> {
                 move |b| {
                     let engine = async_engine();
                     let rt = current_thread_rt();
-                    let mut exec_opt = None;
                     let exec = exec_opt.get_or_insert_with(|| {
                         let source = shared_source(idx);
-                        rt.block_on(engine.prepare_async(source.as_ref(), query, &range))
+                        let exec = rt
+                            .block_on(engine.prepare_async(source.as_ref(), query, &range))
                             .unwrap()
                             .physical_plan()
-                            .clone()
+                            .clone();
+                        let rendered = explain_physical_plan(exec.as_ref());
+                        assert!(
+                            rendered.contains("SeriesEvalExec:")
+                                && rendered.contains("SeriesSetExec:")
+                        );
+                        exec
                     });
                     b.report_allocs();
                     while b.keep_running() {
