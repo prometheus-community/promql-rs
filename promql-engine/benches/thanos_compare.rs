@@ -43,7 +43,9 @@ use std::hint::black_box;
 use std::sync::OnceLock;
 
 use benchfmt::{ProcessAlloc, Suite};
-use promql_engine::{Engine, EngineOptions, MemorySeriesSource, PreparedQuery, RangeQuery, Series};
+use promql_engine::{
+    Engine, EngineOptions, InstantResult, MemorySeriesSource, PreparedQuery, RangeQuery, Series,
+};
 use promql_parser::ParserOptions;
 
 #[global_allocator]
@@ -519,6 +521,20 @@ const INSTANT_CASES: &[(&str, &str, i64)] = &[
     ),
 ];
 
+fn points(batches: &[datafusion::arrow::array::RecordBatch]) -> usize {
+    use datafusion::arrow::array::AsArray;
+    batches
+        .iter()
+        .map(|batch| {
+            let samples = batch
+                .column_by_name(promql_engine::series::SAMPLES)
+                .unwrap()
+                .as_list::<i32>();
+            (samples.offsets()[batch.num_rows()] - samples.offsets()[0]) as usize
+        })
+        .sum()
+}
+
 fn register_single_query<'a>(suite: Suite<'a>) -> Suite<'a> {
     const QUERY: &str = "sum(rate(http_requests_total[2m]))";
     let rq = RangeQuery::new(0, SIX_HOURS_MS, LOAD_STEP_MS);
@@ -530,7 +546,8 @@ fn register_single_query<'a>(suite: Suite<'a>) -> Suite<'a> {
             let engine = blocking_engine();
             let source = single_query_source();
             if !warmed {
-                black_box(engine.range_query(source, QUERY, &rq).unwrap());
+                let out = engine.range_query(source, QUERY, &rq).unwrap();
+                assert!(points(&out) > 0, "{QUERY}");
                 warmed = true;
             }
             b.report_allocs();
@@ -546,7 +563,8 @@ fn register_single_query<'a>(suite: Suite<'a>) -> Suite<'a> {
                 let p = rt
                     .block_on(engine.prepare_async(source, QUERY, &rq))
                     .unwrap();
-                black_box(rt.block_on(engine.execute_async(&p)).unwrap());
+                let out = rt.block_on(engine.execute_async(&p)).unwrap();
+                assert!(points(&out) > 0, "{QUERY}");
                 p
             });
             b.report_allocs();
@@ -562,11 +580,24 @@ fn register_single_query<'a>(suite: Suite<'a>) -> Suite<'a> {
 fn register_range_queries<'a>(mut suite: Suite<'a>) -> Suite<'a> {
     for &(name, query, step_ms) in RANGE_CASES {
         let rq = RangeQuery::new(0, TWO_HOURS_MS, step_ms);
+        // `absent(http_requests_total)` is empty because the metric exists at
+        // every step, and `[30s]` range windows (`(t - 30s, t]`) over 30s-spaced
+        // samples contain at most one sample so `irate`/`rate` emit no points.
+        let expect_empty = matches!(
+            name,
+            "absent and exists" | "func within func query" | "aggr within func query"
+        );
+        let mut checked = false;
         let mut prep_opt: Option<PreparedQuery> = None;
         suite = suite
             .bench(format!("RangeQuery/{name}/new_engine"), move |b| {
                 let engine = blocking_engine();
                 let source = six_hour_source();
+                if !checked {
+                    let out = engine.range_query(source, query, &rq).unwrap();
+                    assert_eq!(points(&out) == 0, expect_empty, "{name}: {query}");
+                    checked = true;
+                }
                 b.report_allocs();
                 while b.keep_running() {
                     black_box(engine.range_query(source, black_box(query), &rq).unwrap());
@@ -580,7 +611,8 @@ fn register_range_queries<'a>(mut suite: Suite<'a>) -> Suite<'a> {
                     let p = rt
                         .block_on(engine.prepare_async(source, query, &rq))
                         .unwrap();
-                    black_box(rt.block_on(engine.execute_async(&p)).unwrap());
+                    let out = rt.block_on(engine.execute_async(&p)).unwrap();
+                    assert_eq!(points(&out) == 0, expect_empty, "{name}: {query}");
                     p
                 });
                 b.report_allocs();
@@ -601,11 +633,22 @@ fn register_instant_queries<'a>(mut suite: Suite<'a>) -> Suite<'a> {
         // `plan_instant` lowers it onto the one-step grid `RangeQuery::new(at_ms, at_ms, 1)`
         // while preserving explicit root `sort` / `sort_desc` ordering.
         let rq = RangeQuery::new(at_ms, at_ms, 1);
+        let mut checked = false;
         let mut prep_opt: Option<PreparedQuery> = None;
         suite = suite
             .bench(format!("InstantQuery/{name}/new_engine"), move |b| {
                 let engine = blocking_engine();
                 let source = six_hour_source();
+                if !checked {
+                    let out = engine.instant_query(source, query, at_ms).unwrap();
+                    match &out {
+                        InstantResult::Vector(batches) => {
+                            assert!(points(batches) > 0, "{name}: {query}");
+                        }
+                        other => panic!("expected Vector for {name}, got {other:?}"),
+                    }
+                    checked = true;
+                }
                 b.report_allocs();
                 while b.keep_running() {
                     black_box(
@@ -623,7 +666,8 @@ fn register_instant_queries<'a>(mut suite: Suite<'a>) -> Suite<'a> {
                     let p = rt
                         .block_on(engine.prepare_async(source, query, &rq))
                         .unwrap();
-                    black_box(rt.block_on(engine.execute_async(&p)).unwrap());
+                    let out = rt.block_on(engine.execute_async(&p)).unwrap();
+                    assert!(points(&out) > 0, "{name}: {query}");
                     p
                 });
                 b.report_allocs();
@@ -641,12 +685,18 @@ fn register_instant_queries<'a>(mut suite: Suite<'a>) -> Suite<'a> {
 fn register_merge_selectors<'a>(suite: Suite<'a>) -> Suite<'a> {
     const QUERY: &str = r#"sum(http_requests_total{code="200"}) / sum(http_requests_total)"#;
     let rq = RangeQuery::new(0, SIX_HOURS_MS, LOAD_STEP_MS);
+    let mut checked = false;
     let mut prep_opt: Option<PreparedQuery> = None;
 
     suite
         .bench("MergeSelectorsOptimizer/withOptimizers", move |b| {
             let engine = blocking_engine();
             let source = merge_selectors_source();
+            if !checked {
+                let out = engine.range_query(source, QUERY, &rq).unwrap();
+                assert!(points(&out) > 0, "{QUERY}");
+                checked = true;
+            }
             b.report_allocs();
             while b.keep_running() {
                 black_box(engine.range_query(source, black_box(QUERY), &rq).unwrap());
@@ -660,7 +710,8 @@ fn register_merge_selectors<'a>(suite: Suite<'a>) -> Suite<'a> {
                 let p = rt
                     .block_on(engine.prepare_async(source, QUERY, &rq))
                     .unwrap();
-                black_box(rt.block_on(engine.execute_async(&p)).unwrap());
+                let out = rt.block_on(engine.execute_async(&p)).unwrap();
+                assert!(points(&out) > 0, "{QUERY}");
                 p
             });
             b.report_allocs();
