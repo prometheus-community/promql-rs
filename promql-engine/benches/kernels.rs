@@ -1104,11 +1104,15 @@ fn register_memory_source<'a>(mut suite: Suite<'a>) -> Suite<'a> {
             format!("SourceBuild/mode=try_new/shape={build_k}x{build_n}"),
             move |b| {
                 let rows = rows_opt.get_or_insert_with(|| labelled(build_k, build_n));
+                // Pre-clone per-iteration inputs before `keep_running()` starts
+                // the clock and allocator counters so `StructArray` header
+                // clones do not pollute `try_new` measurements.
+                let mut inputs: Vec<Vec<Series>> =
+                    (0..b.iterations()).map(|_| rows.clone()).collect();
                 b.set_bytes(build_bytes);
                 b.report_allocs();
                 while b.keep_running() {
-                    let cloned = black_box(rows.as_slice()).to_vec();
-                    black_box(MemorySeriesSource::try_new(cloned).unwrap());
+                    black_box(MemorySeriesSource::try_new(black_box(inputs.pop().unwrap())).unwrap());
                 }
             },
         )
@@ -1118,8 +1122,9 @@ fn register_memory_source<'a>(mut suite: Suite<'a>) -> Suite<'a> {
                 let descs = descs_opt.get_or_insert_with(|| {
                     (0..build_k)
                         .map(|i| {
+                            let code = if i % 16 == 0 { "500" } else { "200" };
                             let line = format!(
-                                r#"http_requests_total{{pod="nginx-{i}", route="/{}", zone="eu-west-{}"}} 0+{}x{}"#,
+                                r#"http_requests_total{{code="{code}", pod="nginx-{i}", route="/{}", zone="eu-west-{}"}} 0+{}x{}"#,
                                 i % 8,
                                 i % 3,
                                 1 + i % 7,
