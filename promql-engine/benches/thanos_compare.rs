@@ -523,6 +523,7 @@ fn register_single_query<'a>(suite: Suite<'a>) -> Suite<'a> {
     const QUERY: &str = "sum(rate(http_requests_total[2m]))";
     let rq = RangeQuery::new(0, SIX_HOURS_MS, LOAD_STEP_MS);
     let mut warmed = false;
+    let mut prep_opt: Option<PreparedQuery> = None;
 
     suite
         .bench("SingleQuery", move |b| {
@@ -540,7 +541,6 @@ fn register_single_query<'a>(suite: Suite<'a>) -> Suite<'a> {
         .bench("PreparedSingleQuery", move |b| {
             let engine = async_engine();
             let rt = multi_thread_rt();
-            let mut prep_opt: Option<PreparedQuery> = None;
             let prepared = prep_opt.get_or_insert_with(|| {
                 let source = single_query_source();
                 let p = rt
@@ -562,6 +562,7 @@ fn register_single_query<'a>(suite: Suite<'a>) -> Suite<'a> {
 fn register_range_queries<'a>(mut suite: Suite<'a>) -> Suite<'a> {
     for &(name, query, step_ms) in RANGE_CASES {
         let rq = RangeQuery::new(0, TWO_HOURS_MS, step_ms);
+        let mut prep_opt: Option<PreparedQuery> = None;
         suite = suite
             .bench(format!("RangeQuery/{name}/new_engine"), move |b| {
                 let engine = blocking_engine();
@@ -574,7 +575,6 @@ fn register_range_queries<'a>(mut suite: Suite<'a>) -> Suite<'a> {
             .bench(format!("PreparedRange/{name}/new_engine"), move |b| {
                 let engine = async_engine();
                 let rt = multi_thread_rt();
-                let mut prep_opt: Option<PreparedQuery> = None;
                 let prepared = prep_opt.get_or_insert_with(|| {
                     let source = six_hour_source();
                     let p = rt
@@ -601,6 +601,7 @@ fn register_instant_queries<'a>(mut suite: Suite<'a>) -> Suite<'a> {
         // `plan_instant` lowers it onto the one-step grid `RangeQuery::new(at_ms, at_ms, 1)`
         // while preserving explicit root `sort` / `sort_desc` ordering.
         let rq = RangeQuery::new(at_ms, at_ms, 1);
+        let mut prep_opt: Option<PreparedQuery> = None;
         suite = suite
             .bench(format!("InstantQuery/{name}/new_engine"), move |b| {
                 let engine = blocking_engine();
@@ -617,7 +618,6 @@ fn register_instant_queries<'a>(mut suite: Suite<'a>) -> Suite<'a> {
             .bench(format!("PreparedInstant/{name}/new_engine"), move |b| {
                 let engine = async_engine();
                 let rt = multi_thread_rt();
-                let mut prep_opt: Option<PreparedQuery> = None;
                 let prepared = prep_opt.get_or_insert_with(|| {
                     let source = six_hour_source();
                     let p = rt
@@ -641,6 +641,7 @@ fn register_instant_queries<'a>(mut suite: Suite<'a>) -> Suite<'a> {
 fn register_merge_selectors<'a>(suite: Suite<'a>) -> Suite<'a> {
     const QUERY: &str = r#"sum(http_requests_total{code="200"}) / sum(http_requests_total)"#;
     let rq = RangeQuery::new(0, SIX_HOURS_MS, LOAD_STEP_MS);
+    let mut prep_opt: Option<PreparedQuery> = None;
 
     suite
         .bench("MergeSelectorsOptimizer/withOptimizers", move |b| {
@@ -654,7 +655,6 @@ fn register_merge_selectors<'a>(suite: Suite<'a>) -> Suite<'a> {
         .bench("PreparedMergeSelectors/withOptimizers", move |b| {
             let engine = async_engine();
             let rt = multi_thread_rt();
-            let mut prep_opt: Option<PreparedQuery> = None;
             let prepared = prep_opt.get_or_insert_with(|| {
                 let source = merge_selectors_source();
                 let p = rt
