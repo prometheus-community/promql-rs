@@ -19,7 +19,7 @@ use std::hint::black_box;
 use std::num::NonZeroU64;
 use std::sync::{Arc, OnceLock};
 
-use benchfmt::Suite;
+use benchfmt::{ProcessAlloc, Suite};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::execution_plan::reset_plan_states;
 use datafusion::physical_plan::{execute_stream, ExecutionPlan};
@@ -33,10 +33,6 @@ use promql_parser::ParserOptions;
 mod focused;
 #[path = "support/generated.rs"]
 mod generated;
-#[path = "support/process_alloc.rs"]
-mod process_alloc;
-
-use process_alloc::ProcessAlloc;
 
 #[global_allocator]
 static ALLOC: ProcessAlloc = ProcessAlloc::new();

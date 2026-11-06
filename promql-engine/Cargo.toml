@@ -38,11 +38,6 @@ insta = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
-# pprof's default unwinder, run in its signal handler, returns an empty stack
-# for most samples on macOS; frame pointers are always kept there, so walk them.
-[target.'cfg(target_os = "macos")'.dev-dependencies]
-pprof = { version = "0.15", default-features = false, features = ["frame-pointer"] }
-
 [[bench]]
 name = "kernels"
 harness = false
