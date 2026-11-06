@@ -82,10 +82,12 @@ fn main() {
     let mut suite = Suite::from_env("promql_parser").with_alloc(&ALLOC);
 
     for (name, q) in QUERIES {
-        if let Err(e) = promql_parser::parse_expr(q) {
-            panic!("{name}: {e:?}");
-        }
+        let mut checked = false;
         suite = suite.bench(format!("ParseExpr/case={name}"), move |b| {
+            if !checked {
+                promql_parser::parse_expr(q).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+                checked = true;
+            }
             b.set_bytes(q.len() as u64);
             b.report_allocs();
             while b.keep_running() {
@@ -94,13 +96,20 @@ fn main() {
         });
     }
 
-    let all_parser = Parser::new(ParserOptions::all());
     for (name, q) in EXPERIMENTAL_QUERIES {
-        if let Err(e) = all_parser.parse_expr(q) {
-            panic!("{name}: {e:?}");
-        }
+        let parser = Parser::new(ParserOptions::all());
+        let mut checked = false;
         suite = suite.bench(format!("ParseExprExperimental/case={name}"), move |b| {
-            let parser = Parser::new(ParserOptions::all());
+            if !checked {
+                assert!(
+                    promql_parser::parse_expr(q).is_err(),
+                    "{name} should require experimental options"
+                );
+                parser
+                    .parse_expr(q)
+                    .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+                checked = true;
+            }
             b.set_bytes(q.len() as u64);
             b.report_allocs();
             while b.keep_running() {
@@ -110,8 +119,12 @@ fn main() {
     }
 
     for (name, q) in ERROR_QUERIES {
-        assert!(promql_parser::parse_expr(q).is_err(), "{name} should fail");
+        let mut checked = false;
         suite = suite.bench(format!("ParseExprError/case={name}"), move |b| {
+            if !checked {
+                assert!(promql_parser::parse_expr(q).is_err(), "{name} should fail");
+                checked = true;
+            }
             b.set_bytes(q.len() as u64);
             b.report_allocs();
             while b.keep_running() {
@@ -127,8 +140,12 @@ fn main() {
             r#"http_requests_total{job="api", instance=~"10\\.0\\..*:9090", code!="500", method=~"GET|POST"}"#,
         ),
     ] {
-        promql_parser::parse_metric_selector(sel).unwrap();
+        let mut checked = false;
         suite = suite.bench(format!("ParseMetricSelector/case={name}"), move |b| {
+            if !checked {
+                promql_parser::parse_metric_selector(sel).unwrap();
+                checked = true;
+            }
             b.set_bytes(sel.len() as u64);
             b.report_allocs();
             while b.keep_running() {
@@ -138,8 +155,12 @@ fn main() {
     }
 
     let metric_text = r#"http_requests_total{job="api", instance="10.0.0.1:9090", route="/v1/query", code="200"}"#;
-    promql_parser::parse_metric(metric_text).unwrap();
+    let mut metric_checked = false;
     suite = suite.bench("ParseMetric/case=five_labels", move |b| {
+        if !metric_checked {
+            promql_parser::parse_metric(metric_text).unwrap();
+            metric_checked = true;
+        }
         b.set_bytes(metric_text.len() as u64);
         b.report_allocs();
         while b.keep_running() {
@@ -159,8 +180,12 @@ fn main() {
             r#"http_requests_total{pod="nginx-1", route="/api", code="200"} 0+10x250 _x50 100-2x250 stale 5+5x400"#,
         ),
     ] {
-        promql_parser::parse_series_desc(line).unwrap();
+        let mut checked = false;
         suite = suite.bench(format!("ParseSeriesDesc/case={name}"), move |b| {
+            if !checked {
+                promql_parser::parse_series_desc(line).unwrap();
+                checked = true;
+            }
             b.set_bytes(line.len() as u64);
             b.report_allocs();
             while b.keep_running() {
@@ -169,16 +194,19 @@ fn main() {
         });
     }
 
-    suite = suite.bench("AstDisplay/case=label_matcher_escaped", |b| {
-        let Expr::VectorSelector(vs) =
-            promql_parser::parse_expr(QUERIES[1].1).expect("valid selector")
-        else {
-            panic!("expected vector selector");
-        };
-        let matcher = vs.label_matchers[1].clone();
+    let mut matcher_opt = None;
+    suite = suite.bench("AstDisplay/case=label_matcher_escaped", move |b| {
+        let matcher = matcher_opt.get_or_insert_with(|| {
+            let Expr::VectorSelector(vs) =
+                promql_parser::parse_expr(QUERIES[1].1).expect("valid selector")
+            else {
+                panic!("expected vector selector");
+            };
+            vs.label_matchers[1].clone()
+        });
         b.report_allocs();
         while b.keep_running() {
-            black_box(black_box(&matcher).to_string());
+            black_box(black_box(&*matcher).to_string());
         }
     });
 
