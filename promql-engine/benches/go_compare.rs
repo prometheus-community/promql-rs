@@ -370,6 +370,27 @@ fn multi_thread_rt() -> &'static tokio::runtime::Runtime {
     })
 }
 
+fn points(batches: &[datafusion::arrow::array::RecordBatch]) -> usize {
+    use datafusion::arrow::array::AsArray;
+    batches
+        .iter()
+        .map(|batch| {
+            let samples = batch
+                .column_by_name(promql_engine::series::SAMPLES)
+                .unwrap()
+                .as_list::<i32>();
+            (samples.offsets()[batch.num_rows()] - samples.offsets()[0]) as usize
+        })
+        .sum()
+}
+
+fn expects_empty_range_result(expr: &str) -> bool {
+    expr.starts_with("absent_over_time(")
+        || expr.ends_with("{l='notfound'}")
+        || expr == "a_one and b_one{l=~'.*[0-4]$'}"
+        || expr == "a_hundred + on(l) group_right a_one"
+}
+
 #[derive(Clone)]
 struct BenchCase {
     expr: String,
@@ -465,6 +486,7 @@ fn register_range_queries<'a>(mut suite: Suite<'a>) -> Suite<'a> {
         let rq = RangeQuery::new(start_ms, end_ms, RANGE_INTERVAL_MS);
         let expr_whole = case.expr.clone();
         let expr_prep = case.expr.clone();
+        let mut checked = false;
         let mut prep_opt: Option<PreparedQuery> = None;
 
         suite = suite
@@ -473,6 +495,17 @@ fn register_range_queries<'a>(mut suite: Suite<'a>) -> Suite<'a> {
                 move |b| {
                     let engine = blocking_engine();
                     let source = range_source();
+                    if !checked {
+                        let out = engine
+                            .range_query(source, expr_whole.as_str(), &rq)
+                            .unwrap();
+                        assert_eq!(
+                            points(&out) == 0,
+                            expects_empty_range_result(expr_whole.as_str()),
+                            "{expr_whole}"
+                        );
+                        checked = true;
+                    }
                     b.report_allocs();
                     while b.keep_running() {
                         black_box(
@@ -493,7 +526,12 @@ fn register_range_queries<'a>(mut suite: Suite<'a>) -> Suite<'a> {
                         let p = rt
                             .block_on(engine.prepare_async(source, expr_prep.as_str(), &rq))
                             .unwrap();
-                        black_box(rt.block_on(engine.execute_async(&p)).unwrap());
+                        let out = rt.block_on(engine.execute_async(&p)).unwrap();
+                        assert_eq!(
+                            points(&out) == 0,
+                            expects_empty_range_result(expr_prep.as_str()),
+                            "{expr_prep}"
+                        );
                         p
                     });
                     b.report_allocs();
@@ -524,7 +562,8 @@ fn register_join_queries<'a>(mut suite: Suite<'a>) -> Suite<'a> {
                     let engine = blocking_engine();
                     let source = join_source();
                     if !warmed {
-                        black_box(engine.range_query(source, expr, &rq).unwrap());
+                        let out = engine.range_query(source, expr, &rq).unwrap();
+                        assert!(points(&out) > 0, "{expr}");
                         warmed = true;
                     }
                     b.report_allocs();
@@ -543,7 +582,8 @@ fn register_join_queries<'a>(mut suite: Suite<'a>) -> Suite<'a> {
                         let p = rt
                             .block_on(engine.prepare_async(source, expr, &rq))
                             .unwrap();
-                        black_box(rt.block_on(engine.execute_async(&p)).unwrap());
+                        let out = rt.block_on(engine.execute_async(&p)).unwrap();
+                        assert!(points(&out) > 0, "{expr}");
                         p
                     });
                     b.report_allocs();
@@ -571,7 +611,8 @@ fn register_info_group_left<'a>(mut suite: Suite<'a>) -> Suite<'a> {
                 let p = rt
                     .block_on(engine.prepare_async(source, query, &rq))
                     .unwrap();
-                black_box(rt.block_on(engine.execute_async(&p)).unwrap());
+                let out = rt.block_on(engine.execute_async(&p)).unwrap();
+                assert!(points(&out) > 0, "{name}");
                 p
             });
             b.report_allocs();
@@ -618,6 +659,7 @@ fn register_high_card_queries<'a>(mut suite: Suite<'a>) -> Suite<'a> {
         let rq = RangeQuery::new(start_ms, end_ms, HIGH_CARD_INTERVAL_MS);
         let expr_whole = case.expr.clone();
         let expr_prep = case.expr.clone();
+        let mut checked = false;
         let mut prep_opt: Option<PreparedQuery> = None;
 
         suite = suite
@@ -626,6 +668,13 @@ fn register_high_card_queries<'a>(mut suite: Suite<'a>) -> Suite<'a> {
                 move |b| {
                     let engine = blocking_engine();
                     let source = high_card_source();
+                    if !checked {
+                        let out = engine
+                            .range_query(source, expr_whole.as_str(), &rq)
+                            .unwrap();
+                        assert!(points(&out) > 0, "{expr_whole}");
+                        checked = true;
+                    }
                     b.report_allocs();
                     while b.keep_running() {
                         black_box(
@@ -646,7 +695,8 @@ fn register_high_card_queries<'a>(mut suite: Suite<'a>) -> Suite<'a> {
                         let p = rt
                             .block_on(engine.prepare_async(source, expr_prep.as_str(), &rq))
                             .unwrap();
-                        black_box(rt.block_on(engine.execute_async(&p)).unwrap());
+                        let out = rt.block_on(engine.execute_async(&p)).unwrap();
+                        assert!(points(&out) > 0, "{expr_prep}");
                         p
                     });
                     b.report_allocs();
