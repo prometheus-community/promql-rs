@@ -38,9 +38,9 @@ draft.
    re-bless it with `cargo insta review` (`INSTA_UPDATE=always cargo test` without
    cargo-insta) in its own commit whose message says why the shape moved. Green: every
    changed pin is explained in that commit.
-4. **Benchmarks.** Timing suites (`promql-parser` and `promql-engine`'s `kernels` and
-   `engine`) plus peak-heap accounting (`promql-engine/benches/memory.rs`); see
-   `promql-engine/benches/compare.md` for baseline comparison with `benchstat`. Green:
+4. **Benchmarks.** Timing suites (`promql-common`, `promql-parser`, and `promql-engine`'s
+   `kernels` and `engine`) plus peak-heap accounting (`promql-engine/benches/memory.rs`);
+   see `promql-engine/benches/compare.md` for baseline comparison with `benchstat`. Green:
    no move beyond the five percent noise floor in the wrong direction, and the feature has
    a bench at realistic size.
 5. **Profile.** Run the feature's bench with `-cpuprofile` and `-memprofile`
