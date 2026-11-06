@@ -23,20 +23,27 @@ fn main() {
         ("3w2d1h", "3w2d1h"),
         ("289y", "289y"),
     ] {
-        Duration::parse(input).unwrap();
+        let mut checked = false;
         suite = suite.bench(format!("DurationParse/case={name}"), move |b| {
+            if !checked {
+                Duration::parse(input).unwrap();
+                checked = true;
+            }
             b.set_bytes(input.len() as u64);
             b.report_allocs();
             while b.keep_running() {
-                let d = Duration::parse(black_box(input)).unwrap();
-                black_box(d.as_secs_f64());
+                black_box(Duration::parse(black_box(input)).unwrap());
             }
         });
     }
 
     let invalid = "1y1m1d";
-    assert!(Duration::parse(invalid).is_err());
+    let mut invalid_checked = false;
     suite = suite.bench("DurationParse/case=invalid_order", move |b| {
+        if !invalid_checked {
+            assert!(Duration::parse(invalid).is_err());
+            invalid_checked = true;
+        }
         b.set_bytes(invalid.len() as u64);
         b.report_allocs();
         while b.keep_running() {
@@ -45,8 +52,12 @@ fn main() {
     });
 
     let neg_input = "-3w2d1h";
-    Duration::parse_allow_negative(neg_input).unwrap();
+    let mut neg_checked = false;
     suite = suite.bench("DurationParseAllowNegative/case=-3w2d1h", move |b| {
+        if !neg_checked {
+            Duration::parse_allow_negative(neg_input).unwrap();
+            neg_checked = true;
+        }
         b.set_bytes(neg_input.len() as u64);
         b.report_allocs();
         while b.keep_running() {
@@ -55,8 +66,12 @@ fn main() {
     });
 
     for (name, input) in [("1ms500us", "1ms500us"), ("1s1ns", "1s1ns")] {
-        Duration::parse_nanos(input).unwrap();
+        let mut checked = false;
         suite = suite.bench(format!("DurationParseNanos/case={name}"), move |b| {
+            if !checked {
+                Duration::parse_nanos(input).unwrap();
+                checked = true;
+            }
             b.set_bytes(input.len() as u64);
             b.report_allocs();
             while b.keep_running() {
@@ -65,12 +80,10 @@ fn main() {
         });
     }
 
-    for (name, dur) in [
-        ("5m", Duration::parse("5m").unwrap()),
-        ("23d1h", Duration::parse("23d1h").unwrap()),
-        ("1s1ns", Duration::parse_nanos("1s1ns").unwrap()),
-    ] {
+    for (name, input) in [("5m", "5m"), ("23d1h", "23d1h"), ("1s1ns", "1s1ns")] {
+        let mut dur_opt = None;
         suite = suite.bench(format!("DurationDisplay/case={name}"), move |b| {
+            let dur = *dur_opt.get_or_insert_with(|| Duration::parse_nanos(input).unwrap());
             b.report_allocs();
             while b.keep_running() {
                 black_box(black_box(dur).to_string());
@@ -78,7 +91,15 @@ fn main() {
         });
     }
 
+    let mut split_dur_opt = None;
     suite = suite
+        .bench("DurationAsSecsF64/case=1s118ms", move |b| {
+            let dur = *split_dur_opt.get_or_insert_with(|| Duration::parse("1s118ms").unwrap());
+            b.report_allocs();
+            while b.keep_running() {
+                black_box(black_box(dur).as_secs_f64());
+            }
+        })
         .bench("DurationFromMillis/case=300000", |b| {
             b.report_allocs();
             while b.keep_running() {
