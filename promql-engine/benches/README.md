@@ -115,10 +115,10 @@ timed `keep_running` window. Passing `-memprofile <path>`, with optional
 profile of `alloc_objects` and `alloc_space` without skewing `B/op` or
 `allocs/op`. Collect profiles separately from `benchstat` timing baselines
 because in-window sampling and stack unwinding still add overhead to `ns/op`.
-Multi-threaded benchmarks in [`engine.rs`](engine.rs) and
-[`go_compare.rs`](go_compare.rs) use `benchfmt::ProcessAlloc` instead of
-`benchfmt::CountingAlloc` so `B/op` and `allocs/op` include Tokio worker
-threads.
+Multi-threaded benchmarks in [`engine.rs`](engine.rs),
+[`go_compare.rs`](go_compare.rs), and [`thanos_compare.rs`](thanos_compare.rs)
+use `benchfmt::ProcessAlloc` instead of `benchfmt::CountingAlloc` so `B/op`
+and `allocs/op` include Tokio worker threads.
 
 The memory benchmark's `heap-profile` feature adds jemalloc profiling for live
 retained heap (`inuse_space`), and `MEMORY_HEAP_DIR` selects the output
