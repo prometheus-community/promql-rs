@@ -5,6 +5,13 @@ The benchmark targets measure different parts of query evaluation:
 - [`kernels.rs`](kernels.rs) times numerical kernels, accumulators, and
   preplanned series evaluation.
 - [`engine.rs`](engine.rs) times whole queries and preplanned DataFusion execution.
+- [`go_compare.rs`](go_compare.rs) mirrors upstream Prometheus's
+  `promql/bench_test.go` (`BenchmarkRangeQuery`, `BenchmarkJoinQuery`, and the
+  `group_left` cases of `BenchmarkInfoFunction` at `83962c35`), plus high-series
+  scaling (`BenchmarkHighCardQuery` across `1k`, `10k`, and `100k` series per
+  metric), with matching `benchfmt` names and `pkg` header so
+  `benchstat go.txt rust.txt` compares both engines side-by-side
+  (`promql-parser/benches/go_compare.rs` does the same for `BenchmarkParser`).
 - [`memory.rs`](memory.rs) measures heap use for individual queries, not
   execution time.
 
@@ -103,9 +110,10 @@ timed `keep_running` window. Passing `-memprofile <path>`, with optional
 profile of `alloc_objects` and `alloc_space` without skewing `B/op` or
 `allocs/op`. Collect profiles separately from `benchstat` timing baselines
 because in-window sampling and stack unwinding still add overhead to `ns/op`.
-Multi-threaded benchmarks in [`engine.rs`](engine.rs) use
-`benchfmt::ProcessAlloc` instead of `benchfmt::CountingAlloc` so `B/op` and
-`allocs/op` include Tokio worker threads.
+Multi-threaded benchmarks in [`engine.rs`](engine.rs) and
+[`go_compare.rs`](go_compare.rs) use `benchfmt::ProcessAlloc` instead of
+`benchfmt::CountingAlloc` so `B/op` and `allocs/op` include Tokio worker
+threads.
 
 The memory benchmark's `heap-profile` feature adds jemalloc profiling for live
 retained heap (`inuse_space`), and `MEMORY_HEAP_DIR` selects the output
