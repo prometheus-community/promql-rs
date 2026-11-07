@@ -96,13 +96,22 @@ capacity tests, allocation attribution, and scheduler integration tests.
 
 ## CPU and heap profiles
 
-`--profile-time` produces a CPU profile instead of a timing estimate.
-[`support/pprof.rs`](support/pprof.rs) defines the profiler configuration.
+Timing benchmarks link `benchfmt` with the `pprof` feature. Passing
+`-cpuprofile <path>` writes a gzipped pprof CPU profile sampled during the
+timed `keep_running` window. Passing `-memprofile <path>`, with optional
+`-memprofilerate <bytes>` defaulting to 524288, writes a sampled allocation
+profile of `alloc_objects` and `alloc_space` without skewing `B/op` or
+`allocs/op`. Collect profiles separately from `benchstat` timing baselines
+because in-window sampling and stack unwinding still add overhead to `ns/op`.
+Multi-threaded benchmarks in [`engine.rs`](engine.rs) use
+`benchfmt::ProcessAlloc` instead of `benchfmt::CountingAlloc` so `B/op` and
+`allocs/op` include Tokio worker threads.
 
-The memory benchmark's `heap-profile` feature adds jemalloc profiling, and
-`MEMORY_HEAP_DIR` selects the output directory. Resident cases capture the heap
-with the result held. Streamed cases capture the output-batch observation with
-the most live bytes. That observation can miss an earlier peak during evaluation.
+The memory benchmark's `heap-profile` feature adds jemalloc profiling for live
+retained heap (`inuse_space`), and `MEMORY_HEAP_DIR` selects the output
+directory. Resident cases capture the heap with the result held. Streamed cases
+capture the output-batch observation with the most live bytes. That observation
+can miss an earlier peak during evaluation.
 
 Heap symbolization caches debug information after the first dump. Later cases
 in the same process include that memory in their readings. The
