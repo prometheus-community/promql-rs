@@ -244,15 +244,14 @@ impl SeriesSource for CachedExchangeSource {
 }
 
 fn engine() -> Engine {
-    let engine = Engine::new();
+    let mut engine = Engine::new();
     engine
-        .ctx
-        .state_ref()
-        .write()
+        .state
         .config_mut()
         .options_mut()
         .execution
         .target_partitions = 2;
+    engine.task_ctx = engine.state.task_ctx();
     engine
 }
 
@@ -328,9 +327,12 @@ async fn prepared_exchanges_reset_before_first_repeated_and_concurrent_execution
 
     // Deliberately consume the escaped template, not a reset copy. Even the
     // first public execution must not rely on its channels being unused.
-    let raw = physical_plan::collect(prepared.physical_plan().clone(), engine.ctx.task_ctx())
-        .await
-        .unwrap();
+    let raw = physical_plan::collect(
+        prepared.physical_plan().clone(),
+        Arc::clone(&engine.task_ctx),
+    )
+    .await
+    .unwrap();
     let mut raw_answers = answers(&raw);
     raw_answers.sort_by(|a, b| a.0.cmp(&b.0));
     assert_eq!(raw_answers, expected());
@@ -389,10 +391,12 @@ async fn typed_instant_queries_reset_consumed_source_exchanges_for_every_result_
             }
             // Consume the source-owned exchange before the first public instant
             // execution. Replanning upper operators alone cannot repair it.
-            let raw =
-                physical_plan::collect(prepared.physical_plan().clone(), engine.ctx.task_ctx())
-                    .await
-                    .unwrap();
+            let raw = physical_plan::collect(
+                prepared.physical_plan().clone(),
+                Arc::clone(&engine.task_ctx),
+            )
+            .await
+            .unwrap();
             assert!(!raw.is_empty(), "{query}");
             let check = |result: InstantResult| match (kind, result) {
                 (ValueType::Vector, InstantResult::Vector(batches))
