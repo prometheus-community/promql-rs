@@ -44,20 +44,24 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Datum, Float64Array, Int64Array, ListArray,
-    StringArray, StringViewArray, StructArray, TimestampMillisecondArray,
+    Array, ArrayRef, AsArray, BooleanArray, Datum, Float64Array, Int32Array, ListArray,
+    StringArray, StringBuilder, StringViewArray, StringViewBuilder, StructArray,
+    TimestampMillisecondArray, UInt8Array,
 };
 use datafusion::arrow::buffer::{BooleanBuffer, OffsetBuffer};
 use datafusion::arrow::compute::kernels::numeric;
 use datafusion::arrow::compute::{binary, FilterBuilder};
-use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Fields, Float64Type, Int64Type};
+use datafusion::arrow::datatypes::{
+    DataType, Field, FieldRef, Fields, Float64Type, Int32Type, UInt8Type,
+};
 use datafusion::arrow::error::ArrowError;
 use datafusion::common::{plan_err, ScalarValue};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion::logical_expr::utils::format_state_name;
 use datafusion::logical_expr::{
-    lit, Accumulator, AggregateUDF, AggregateUDFImpl, Expr, Signature, Volatility,
+    lit, Accumulator, AggregateUDF, AggregateUDFImpl, EmitTo, Expr, GroupsAccumulator, Signature,
+    Volatility,
 };
 use datafusion::physical_expr::expressions::Literal;
 use promql_parser::token::ItemType;
@@ -614,8 +618,24 @@ pub fn parse_literal(s: &str) -> Option<(Op, bool)> {
 struct Many {
     side: usize,
     labels: Vec<String>,
-    counts: Vec<i64>,
+    /// Saturating sample count per step. PromQL only distinguishes zero,
+    /// one, and more than one, so one byte per step suffices.
+    counts: Vec<u8>,
     values: Vec<f64>,
+}
+
+/// Lanes for the "one" side of a match group, allocated lazily only when a
+/// series actually lands on that side. Set operators and partial groups that
+/// saw only the "many" side never allocate or serialize these lanes.
+#[derive(Debug)]
+struct OneLanes {
+    counts: Vec<u8>,
+    values: Vec<f64>,
+    /// Which of [`Pairing::one_pool`] the "one" side's sample at each
+    /// step came from, `-1` where it put none. Kept `None` while at most
+    /// one series has contributed to the "one" side, in which case every
+    /// populated step belongs to `one_pool[0]`.
+    rows: Option<Vec<i32>>,
 }
 
 /// One output series under construction: the operands it paired at
@@ -639,19 +659,12 @@ struct Bucket {
 struct Pairing {
     op: Op,
     return_bool: bool,
-    matching: Matching,
+    matching: Arc<Matching>,
     grid: Grid,
     /// The label columns, in the order the input struct carries them,
     /// which is the order every label vector here is in.
-    schema: Vec<String>,
-    one_counts: Vec<i64>,
-    one_values: Vec<f64>,
-    /// Which of [`Pairing::one_pool`] the "one" side's sample at each
-    /// step came from, `-1` where it put none. Only the `group_x`
-    /// labels are read off it, but they are read per step: two series
-    /// may hold the "one" side at different steps without being a
-    /// duplicate of each other.
-    one_rows: Vec<i32>,
+    schema: Arc<[String]>,
+    one: Option<OneLanes>,
     one_pool: Vec<Vec<String>>,
     many: Vec<Many>,
     /// The match group's own labels, for the message a duplicate has to
@@ -666,15 +679,23 @@ struct Pairing {
 
 impl Pairing {
     fn new(op: Op, return_bool: bool, matching: Matching, grid: Grid, schema: Vec<String>) -> Self {
+        Self::new_shared(op, return_bool, Arc::new(matching), grid, schema.into())
+    }
+
+    fn new_shared(
+        op: Op,
+        return_bool: bool,
+        matching: Arc<Matching>,
+        grid: Grid,
+        schema: Arc<[String]>,
+    ) -> Self {
         Self {
             op,
             return_bool,
             matching,
             grid,
             schema,
-            one_counts: vec![0; grid.len()],
-            one_values: vec![f64::NAN; grid.len()],
-            one_rows: vec![-1; grid.len()],
+            one: None,
             one_pool: Vec::new(),
             many: Vec::new(),
             group: None,
@@ -715,21 +736,38 @@ impl Pairing {
         timestamps: &[i64],
         values: &[f64],
     ) -> Result<()> {
+        // A filtering comparison upstream of a binary operator can leave a
+        // series row with zero samples; ignore it so it does not allocate dead
+        // lanes or appear in duplicate-series diagnostics.
+        if timestamps.is_empty() {
+            return Ok(());
+        }
         let grid = self.grid;
         if !self.op.is_set() && side == self.matching.one_side() {
             self.remember(labels);
             let row = self.intern_one(labels);
-            let (counts, lanes, rows) = (
-                &mut self.one_counts,
-                &mut self.one_values,
-                &mut self.one_rows,
-            );
+            let steps = grid.len();
+            let one = self.one.get_or_insert_with(|| OneLanes {
+                counts: vec![0; steps],
+                values: vec![f64::NAN; steps],
+                rows: None,
+            });
+            if row != 0 && one.rows.is_none() {
+                one.rows = Some(
+                    one.counts
+                        .iter()
+                        .map(|&c| if c > 0 { 0 } else { -1 })
+                        .collect(),
+                );
+            }
             return grid.runs(timestamps, |index, from, len| {
-                for count in &mut counts[index..index + len] {
-                    *count += 1;
+                for count in &mut one.counts[index..index + len] {
+                    *count = count.saturating_add(1);
                 }
-                lanes[index..index + len].copy_from_slice(&values[from..from + len]);
-                rows[index..index + len].fill(row);
+                one.values[index..index + len].copy_from_slice(&values[from..from + len]);
+                if let Some(rows) = &mut one.rows {
+                    rows[index..index + len].fill(row);
+                }
             });
         }
         let many = self.intern_many(side, labels);
@@ -737,7 +775,7 @@ impl Pairing {
         let (counts, lanes) = (&mut series.counts, &mut series.values);
         grid.runs(timestamps, |index, from, len| {
             for count in &mut counts[index..index + len] {
-                *count += 1;
+                *count = count.saturating_add(1);
             }
             lanes[index..index + len].copy_from_slice(&values[from..from + len]);
         })
@@ -780,7 +818,7 @@ impl Pairing {
     fn signature_of(&self, labels: &[String]) -> Vec<String> {
         labels
             .iter()
-            .zip(&self.schema)
+            .zip(self.schema.iter())
             .map(|(value, name)| match self.in_signature(name) {
                 true => value.clone(),
                 false => String::new(),
@@ -848,6 +886,40 @@ impl Pairing {
         ))
     }
 
+    /// Copy every populated sample from `target_side` directly into sorted
+    /// output buckets when the opposing side of `unless` or `or` is absent
+    /// across the whole match group.
+    fn copy_side_buckets(&self, target_side: usize) -> Vec<Bucket> {
+        let steps = self.grid.len();
+        let mut buckets: Vec<Bucket> = Vec::with_capacity(self.many.len());
+        for series in &self.many {
+            if series.side != target_side {
+                continue;
+            }
+            let kept = series.counts.iter().filter(|&&c| c > 0).count();
+            if kept == 0 {
+                continue;
+            }
+            let mut timestamps = Vec::with_capacity(kept);
+            let mut lhs = Vec::with_capacity(kept);
+            for step in 0..steps {
+                if series.counts[step] > 0 {
+                    timestamps.push(self.grid.timestamp(step));
+                    lhs.push(series.values[step]);
+                }
+            }
+            buckets.push(Bucket {
+                labels: series.labels.clone(),
+                timestamps,
+                lhs,
+                rhs: Vec::new(),
+                claimed: None,
+            });
+        }
+        buckets.sort_by(|a, b| a.labels.cmp(&b.labels));
+        buckets
+    }
+
     /// `and`, `or` and `unless` over the same grid: upstream's
     /// `VectorAnd` / `VectorOr` / `VectorUnless` (`promql/engine.go:2888`
     /// at 83962c35), which ask nothing of a sample but whether the other
@@ -861,8 +933,56 @@ impl Pairing {
     /// same labelset" has no way to happen here, and why merging by
     /// label set is safe.
     fn sets(&self) -> Vec<Bucket> {
-        let mut buckets: Vec<Bucket> = Vec::new();
-        let mut by_labels: HashMap<&Vec<String>, usize> = HashMap::new();
+        let mut lhs_count = 0usize;
+        let mut rhs_count = 0usize;
+        for series in &self.many {
+            if series.side == LHS {
+                lhs_count += 1;
+            } else {
+                rhs_count += 1;
+            }
+        }
+        // Skip the per-step scan when an entire side of the match group is empty.
+        match self.op {
+            Op::And if lhs_count == 0 || rhs_count == 0 => return Vec::new(),
+            Op::Unless if lhs_count == 0 => return Vec::new(),
+            Op::Unless if rhs_count == 0 => return self.copy_side_buckets(LHS),
+            Op::Or if lhs_count == 0 && rhs_count == 0 => return Vec::new(),
+            Op::Or if rhs_count == 0 => return self.copy_side_buckets(LHS),
+            Op::Or if lhs_count == 0 => return self.copy_side_buckets(RHS),
+            _ => {}
+        }
+
+        // Resolve each series to its output bucket once up front so the step
+        // loop indexes into `buckets` without hashing label vectors per step.
+        let bucket_cap = if self.op == Op::Or {
+            self.many.len()
+        } else {
+            lhs_count
+        };
+        let mut buckets: Vec<Bucket> = Vec::with_capacity(bucket_cap);
+        let mut by_labels: HashMap<&[String], usize> = HashMap::with_capacity(bucket_cap);
+        let mut series_bucket: Vec<usize> = Vec::with_capacity(self.many.len());
+        for series in &self.many {
+            if self.op != Op::Or && series.side == RHS {
+                series_bucket.push(usize::MAX);
+                continue;
+            }
+            let cap = series.counts.iter().filter(|&&c| c > 0).count();
+            let idx = *by_labels
+                .entry(series.labels.as_slice())
+                .or_insert_with(|| {
+                    buckets.push(Bucket {
+                        labels: series.labels.clone(),
+                        timestamps: Vec::with_capacity(cap),
+                        lhs: Vec::with_capacity(cap),
+                        rhs: Vec::new(),
+                        claimed: None,
+                    });
+                    buckets.len() - 1
+                });
+            series_bucket.push(idx);
+        }
 
         for step in 0..self.grid.len() {
             let present = |side: usize| {
@@ -871,7 +991,7 @@ impl Pairing {
                     .any(|series| series.side == side && series.counts[step] > 0)
             };
             let (left, right) = (present(LHS), present(RHS));
-            for series in &self.many {
+            for (idx, series) in self.many.iter().enumerate() {
                 if series.counts[step] == 0 {
                     continue;
                 }
@@ -886,21 +1006,13 @@ impl Pairing {
                 if !keep {
                     continue;
                 }
-                let bucket = *by_labels.entry(&series.labels).or_insert_with(|| {
-                    buckets.push(Bucket {
-                        labels: series.labels.clone(),
-                        timestamps: Vec::new(),
-                        lhs: Vec::new(),
-                        rhs: Vec::new(),
-                        claimed: None,
-                    });
-                    buckets.len() - 1
-                });
-                buckets[bucket].timestamps.push(self.grid.timestamp(step));
-                buckets[bucket].lhs.push(series.values[step]);
+                let b = &mut buckets[series_bucket[idx]];
+                b.timestamps.push(self.grid.timestamp(step));
+                b.lhs.push(series.values[step]);
             }
         }
 
+        buckets.retain(|bucket| !bucket.timestamps.is_empty());
         buckets.sort_by(|a, b| a.labels.cmp(&b.labels));
         buckets
     }
@@ -922,27 +1034,93 @@ impl Pairing {
         if self.op.is_set() {
             return Ok(self.sets());
         }
+        let (fill_one, fill_many) = (self.matching.fill_one(), self.matching.fill_many());
+        // Short-circuit match groups where a required side never arrived.
+        if self.many.is_empty() && fill_one.is_none() && fill_many.is_none() {
+            return Ok(Vec::new());
+        }
+        if self.one.is_none() && fill_one.is_none() {
+            return Ok(Vec::new());
+        }
+
+        // Fast path for the common case of one series on each side and no fill
+        // modifiers, avoiding per-step worklists and label hash lookups.
+        if fill_one.is_none() && fill_many.is_none() && self.many.len() == 1 {
+            if let Some(one) = &self.one {
+                if one.rows.is_none() {
+                    if let Some(one_labels) = self.one_pool.first() {
+                        let many = &self.many[0];
+                        let steps = self.grid.len();
+                        let mut paired = 0usize;
+                        for step in 0..steps {
+                            if many.counts[step] > 0 {
+                                let oc = one.counts[step];
+                                if oc > 1 {
+                                    return Err(self.duplicate());
+                                }
+                                if oc == 1 {
+                                    paired += 1;
+                                }
+                            }
+                        }
+                        if paired == 0 {
+                            return Ok(Vec::new());
+                        }
+                        let mut timestamps = Vec::with_capacity(paired);
+                        let mut lhs = Vec::with_capacity(paired);
+                        let mut rhs = Vec::with_capacity(paired);
+                        let one_is_lhs = self.matching.one_side() == LHS;
+                        for step in 0..steps {
+                            if many.counts[step] > 0 && one.counts[step] == 1 {
+                                timestamps.push(self.grid.timestamp(step));
+                                let (mv, ov) = (many.values[step], one.values[step]);
+                                let (l, r) = if one_is_lhs { (ov, mv) } else { (mv, ov) };
+                                lhs.push(l);
+                                rhs.push(r);
+                            }
+                        }
+                        return Ok(vec![Bucket {
+                            labels: self.result_labels(&many.labels, one_labels),
+                            timestamps,
+                            lhs,
+                            rhs,
+                            claimed: None,
+                        }]);
+                    }
+                }
+            }
+        }
+
         let mut buckets: Vec<Bucket> = Vec::new();
         let mut by_labels: HashMap<Vec<String>, usize> = HashMap::new();
         let mut by_pair: HashMap<(Option<usize>, i32), usize> = HashMap::new();
+        // Direct bucket lookup table for `one_row == 0` indexed by `many`.
+        let mut row0_buckets: Vec<usize> = vec![usize::MAX; self.many.len()];
         let one_to_one = self.matching.card == Card::OneToOne;
-        let (fill_one, fill_many) = (self.matching.fill_one(), self.matching.fill_many());
         let nothing: Vec<String> = vec![String::new(); self.schema.len()];
+        // Reuse `todo` across steps instead of allocating a new `Vec` per step.
+        let mut todo: Vec<(Option<usize>, f64, f64)> = Vec::with_capacity(self.many.len().max(1));
 
         for step in 0..self.grid.len() {
-            let total: i64 = self.many.iter().map(|series| series.counts[step]).sum();
-            let one_here = self.one_counts[step] > 0;
-            if total == 0 && fill_one.is_none() && fill_many.is_none() {
+            let any_many = self.many.iter().any(|series| series.counts[step] > 0);
+            let one_count = self.one.as_ref().map_or(0, |o| o.counts[step]);
+            let one_here = one_count > 0;
+            if !any_many && fill_one.is_none() && fill_many.is_none() {
                 continue;
             }
-            if self.one_counts[step] > 1 {
+            if one_count > 1 {
                 return Err(self.duplicate());
             }
 
             // What pairs at this step: the "many" row, or `None` where
             // the fill value stands in for a side with no series here.
-            let mut todo: Vec<(Option<usize>, f64, f64)> = Vec::new();
-            if let Some(one_value) = one_here.then(|| self.one_values[step]).or(fill_one) {
+            todo.clear();
+            let one_step_val = self
+                .one
+                .as_ref()
+                .map(|o| o.values[step])
+                .unwrap_or(f64::NAN);
+            if let Some(one_value) = one_here.then_some(one_step_val).or(fill_one) {
                 for many in 0..self.many.len() {
                     if self.many[many].counts[step] > 0 {
                         todo.push((Some(many), self.many[many].values[step], one_value));
@@ -954,7 +1132,7 @@ impl Pairing {
             // it (`promql/engine.go:3106-3124` at 83962c35).
             if todo.is_empty() && one_here {
                 if let Some(fill) = fill_many {
-                    todo.push((None, fill, self.one_values[step]));
+                    todo.push((None, fill, one_step_val));
                 }
             }
             if todo.is_empty() {
@@ -967,19 +1145,30 @@ impl Pairing {
                 return Err(DataFusionError::Execution(MULTIPLE_MATCHES.into()));
             }
 
-            let one_row = if one_here { self.one_rows[step] } else { -1 };
+            let one_row = if one_here {
+                self.one
+                    .as_ref()
+                    .and_then(|o| o.rows.as_ref().map(|r| r[step]))
+                    .unwrap_or(0)
+            } else {
+                -1
+            };
             let one_labels = match one_row {
                 -1 => &nothing,
                 row => &self.one_pool[row as usize],
             };
-            for (many, many_value, one_value) in todo {
-                let bucket = match by_pair.get(&(many, one_row)) {
-                    Some(bucket) => *bucket,
+            for &(many, many_value, one_value) in &todo {
+                let cached = match (many, one_row) {
+                    (Some(m), 0) if row0_buckets[m] != usize::MAX => Some(row0_buckets[m]),
+                    _ => by_pair.get(&(many, one_row)).copied(),
+                };
+                let bucket = match cached {
+                    Some(bucket) => bucket,
                     None => {
                         // A filled-in side carries the signature and
                         // nothing else, on whichever side it stands in.
                         let base = match many {
-                            Some(many) => self.many[many].labels.clone(),
+                            Some(m) => self.many[m].labels.clone(),
                             None => self.signature_of(one_labels),
                         };
                         let one = match many {
@@ -987,17 +1176,27 @@ impl Pairing {
                             _ => one_labels.clone(),
                         };
                         let labels = self.result_labels(&base, &one);
+                        let cap = match many {
+                            Some(m) if fill_one.is_none() => {
+                                self.many[m].counts.iter().filter(|&&c| c > 0).count()
+                            }
+                            _ => self.grid.len(),
+                        };
                         let bucket = *by_labels.entry(labels.clone()).or_insert_with(|| {
                             buckets.push(Bucket {
                                 labels,
-                                timestamps: Vec::new(),
-                                lhs: Vec::new(),
-                                rhs: Vec::new(),
+                                timestamps: Vec::with_capacity(cap),
+                                lhs: Vec::with_capacity(cap),
+                                rhs: Vec::with_capacity(cap),
                                 claimed: None,
                             });
                             buckets.len() - 1
                         });
-                        by_pair.insert((many, one_row), bucket);
+                        if let (Some(m), 0) = (many, one_row) {
+                            row0_buckets[m] = bucket;
+                        } else {
+                            by_pair.insert((many, one_row), bucket);
+                        }
                         bucket
                     }
                 };
@@ -1028,8 +1227,721 @@ impl Pairing {
     }
 }
 
+fn corrupt(what: &str) -> DataFusionError {
+    DataFusionError::Internal(format!("{NAME}: partial state holds {what}"))
+}
+
+impl Pairing {
+    /// Approximate heap bytes owned uniquely by this group, excluding the
+    /// `Arc`-shared `matching` and `schema` allocations.
+    fn heap_size(&self) -> usize {
+        let one_bytes = match &self.one {
+            Some(one) => {
+                one.counts.capacity() * std::mem::size_of::<u8>()
+                    + one.values.capacity() * std::mem::size_of::<f64>()
+                    + one
+                        .rows
+                        .as_ref()
+                        .map_or(0, |r| r.capacity() * std::mem::size_of::<i32>())
+            }
+            None => 0,
+        };
+        let many_lane = self.grid.len() * (std::mem::size_of::<u8>() + std::mem::size_of::<f64>());
+        one_bytes
+            + self.many.capacity() * std::mem::size_of::<Many>()
+            + self.many.len() * many_lane
+            + (self.many.len() + self.one_pool.capacity())
+                * self.schema.len()
+                * std::mem::size_of::<String>()
+            + self.one_metrics.capacity() * std::mem::size_of::<String>()
+            + self.group.as_ref().map_or(0, String::capacity)
+    }
+
+    /// Merge row `row` of `parsed` partial-state columns into this group.
+    fn merge_row(&mut self, parsed: &ParsedStates<'_>, row: usize) -> Result<()> {
+        let steps = self.grid.len();
+        let width = self.schema.len();
+
+        let (oc_lo, oc_hi) = parsed.one_counts.range(row);
+        let (ov_lo, ov_hi) = parsed.one_values.range(row);
+        let (or_lo, or_hi) = parsed.one_rows.range(row);
+        let counts = &parsed.one_counts.values[oc_lo..oc_hi];
+        let values = &parsed.one_values.values[ov_lo..ov_hi];
+        let rows = &parsed.one_rows.values[or_lo..or_hi];
+
+        if !counts.is_empty() || !values.is_empty() || !rows.is_empty() {
+            if counts.len() != steps
+                || values.len() != steps
+                || (!rows.is_empty() && rows.len() != steps)
+            {
+                return Err(DataFusionError::Internal(format!(
+                    "{NAME}: partial state is {} steps, not the {steps} of this grid",
+                    counts.len()
+                )));
+            }
+            let (op_lo, op_hi) = parsed.one_pool.range(row);
+            let pool = rectangle_slice(parsed.one_pool.values, op_lo, op_hi, width, NO_ROWS)?;
+            let mut seen: Vec<i32> = Vec::with_capacity(pool.len());
+            for labels in &pool {
+                seen.push(self.intern_one(labels));
+            }
+            let one = self.one.get_or_insert_with(|| OneLanes {
+                counts: vec![0; steps],
+                values: vec![f64::NAN; steps],
+                rows: None,
+            });
+            let need_rows = !rows.is_empty() || seen.first().copied().unwrap_or(0) != 0;
+            if need_rows && one.rows.is_none() {
+                one.rows = Some(
+                    one.counts
+                        .iter()
+                        .map(|&c| if c > 0 { 0 } else { -1 })
+                        .collect(),
+                );
+            }
+            if rows.is_empty() {
+                let mapped = seen.first().copied();
+                for step in 0..steps {
+                    let c = counts[step];
+                    if c > 0 {
+                        let dst = mapped
+                            .ok_or_else(|| corrupt("a one-side sample with an empty pool"))?;
+                        one.counts[step] = one.counts[step].saturating_add(c);
+                        one.values[step] = values[step];
+                        if let Some(dst_rows) = &mut one.rows {
+                            dst_rows[step] = dst;
+                        }
+                    }
+                }
+            } else {
+                let dst_rows = one.rows.as_mut().expect("materialized above");
+                for step in 0..steps {
+                    let c = counts[step];
+                    if c > 0 {
+                        let dst = usize::try_from(rows[step])
+                            .ok()
+                            .and_then(|i| seen.get(i).copied())
+                            .ok_or_else(|| corrupt("a one-side row out of its pool"))?;
+                        one.counts[step] = one.counts[step].saturating_add(c);
+                        one.values[step] = values[step];
+                        dst_rows[step] = dst;
+                    }
+                }
+            }
+        }
+
+        let (mc_lo, mc_hi) = parsed.many_counts.range(row);
+        let (mv_lo, mv_hi) = parsed.many_values.range(row);
+        let (ms_lo, ms_hi) = parsed.many_sides.range(row);
+        let m_counts = &parsed.many_counts.values[mc_lo..mc_hi];
+        let m_values = &parsed.many_values.values[mv_lo..mv_hi];
+        let m_sides = &parsed.many_sides.values[ms_lo..ms_hi];
+        let series_rows = m_counts.len() / steps.max(1);
+        if m_counts.len() != series_rows * steps || m_values.len() != m_counts.len() {
+            return Err(corrupt("a many-side rectangle that is not rows by steps"));
+        }
+        if m_sides.len() != series_rows {
+            return Err(corrupt("a side per series that is not one per series"));
+        }
+        if series_rows > 0 {
+            let (ml_lo, ml_hi) = parsed.many_labels.range(row);
+            let labels =
+                rectangle_slice(parsed.many_labels.values, ml_lo, ml_hi, width, series_rows)?;
+            for (index, labels) in labels.iter().enumerate() {
+                let many = self.intern_many(m_sides[index] as usize, labels);
+                let dst = &mut self.many[many];
+                let base = index * steps;
+                for step in 0..steps {
+                    let c = m_counts[base + step];
+                    if c > 0 {
+                        dst.counts[step] = dst.counts[step].saturating_add(c);
+                        dst.values[step] = m_values[base + step];
+                    }
+                }
+            }
+        }
+
+        if let Some(metrics) = &parsed.one_metrics {
+            let (lo, hi) = metrics.range(row);
+            for i in lo..hi {
+                let val = metrics.values.value(i);
+                if self.one_metrics.len() < 2
+                    && self.one_metrics.first().map(String::as_str) != Some(val)
+                {
+                    self.one_metrics.push(val.to_string());
+                }
+            }
+        }
+        if let Some(group) = parsed.group {
+            if self.group.is_none() && group.is_valid(row) {
+                self.group = Some(group.value(row).to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Accumulator for Pairing {
     fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        let inputs = BatchInputs::parse(&self.schema, values)?;
+        let mut row_labels: Vec<String> = Vec::with_capacity(self.schema.len());
+        for row in 0..inputs.list.len() {
+            if inputs.list.is_null(row) {
+                continue;
+            }
+            let which = inputs.side_at(row);
+            inputs.labels.read_into(row, &mut row_labels);
+            let (lo, hi) = inputs.sample_range(row);
+            self.absorb(
+                which,
+                &row_labels,
+                &inputs.timestamps[lo..hi],
+                &inputs.samples[lo..hi],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The operands [`Pairing::pairs`] gathered, computed by one kernel
+    /// call over every bucket end to end rather than once per step. A
+    /// filtering comparison keeps the left operand where it holds, which
+    /// may leave a bucket empty, and an empty bucket is no series.
+    fn evaluate(&mut self) -> Result<ScalarValue> {
+        let out = evaluate_groups(
+            self.op,
+            self.return_bool,
+            &self.schema,
+            std::slice::from_ref(self),
+        )?;
+        Ok(ScalarValue::List(Arc::new(out)))
+    }
+
+    /// Flat lists throughout: the "many" side is a rectangle of rows by
+    /// steps, and the label sets a rectangle of rows by columns, so a
+    /// partial travels as the same handful of primitive lanes whatever
+    /// the query's label schema is.
+    fn state(&mut self) -> Result<Vec<ScalarValue>> {
+        let arrays = emit_groups_state(
+            std::slice::from_ref(self),
+            self.grid.len(),
+            self.schema.len(),
+        )?;
+        let mut scalars = Vec::with_capacity(arrays.len());
+        for array in &arrays[..STATE_LANES.len()] {
+            scalars.push(ScalarValue::List(Arc::new(array.as_list::<i32>().clone())));
+        }
+        scalars.push(ScalarValue::Utf8(self.group.clone()));
+        Ok(scalars)
+    }
+
+    /// Lanes added position by position, as in [`crate::aggregate`]. A
+    /// value is only read where the total count is one, and then exactly
+    /// one partial saw that sample, so any partial that saw something
+    /// carries the value.
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
+        let parsed = ParsedStates::parse(states)?;
+        for row in 0..parsed.num_rows {
+            self.merge_row(&parsed, row)?;
+        }
+        Ok(())
+    }
+
+    fn size(&self) -> usize {
+        std::mem::size_of::<Self>() + self.heap_size()
+    }
+}
+
+/// Batched multi-group accumulator for [`Binary`] so DataFusion processes
+/// input batches, partial state serialization, shuffles, and final evaluation
+/// directly across all match groups without `ScalarValue` round-trips.
+#[derive(Debug)]
+struct GroupedBinary {
+    op: Op,
+    return_bool: bool,
+    matching: Arc<Matching>,
+    grid: Grid,
+    schema: Arc<[String]>,
+    groups: Vec<Pairing>,
+    heap_size: usize,
+}
+
+impl GroupedBinary {
+    fn from_pairing(template: Pairing) -> Self {
+        Self {
+            op: template.op,
+            return_bool: template.return_bool,
+            matching: template.matching,
+            grid: template.grid,
+            schema: template.schema,
+            groups: Vec::new(),
+            heap_size: 0,
+        }
+    }
+
+    fn grow(&mut self, total_num_groups: usize) {
+        if self.groups.len() < total_num_groups {
+            let op = self.op;
+            let return_bool = self.return_bool;
+            let matching = &self.matching;
+            let grid = self.grid;
+            let schema = &self.schema;
+            self.groups.resize_with(total_num_groups, || {
+                Pairing::new_shared(
+                    op,
+                    return_bool,
+                    Arc::clone(matching),
+                    grid,
+                    Arc::clone(schema),
+                )
+            });
+        }
+    }
+
+    fn emitted(&self, emit_to: EmitTo) -> usize {
+        match emit_to {
+            EmitTo::All => self.groups.len(),
+            EmitTo::First(n) => n.min(self.groups.len()),
+        }
+    }
+
+    fn release(&mut self, emit_to: EmitTo) {
+        match emit_to {
+            EmitTo::All => {
+                self.groups = Vec::new();
+                self.heap_size = 0;
+            }
+            EmitTo::First(n) => {
+                let drained = n.min(self.groups.len());
+                for group in self.groups.drain(..drained) {
+                    self.heap_size -= group.heap_size();
+                }
+            }
+        }
+    }
+}
+
+impl GroupsAccumulator for GroupedBinary {
+    fn update_batch(
+        &mut self,
+        values: &[ArrayRef],
+        group_indices: &[usize],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
+        self.grow(total_num_groups);
+        let inputs = BatchInputs::parse(&self.schema, values)?;
+        let mut row_labels: Vec<String> = Vec::with_capacity(self.schema.len());
+
+        for (row, &group_idx) in group_indices.iter().enumerate() {
+            if inputs.list.is_null(row)
+                || opt_filter.is_some_and(|f| f.is_null(row) || !f.value(row))
+            {
+                continue;
+            }
+            let which = inputs.side_at(row);
+            inputs.labels.read_into(row, &mut row_labels);
+            let (lo, hi) = inputs.sample_range(row);
+            let pairing = &mut self.groups[group_idx];
+            let before = pairing.heap_size();
+            let res = pairing.absorb(
+                which,
+                &row_labels,
+                &inputs.timestamps[lo..hi],
+                &inputs.samples[lo..hi],
+            );
+            self.heap_size = self.heap_size - before + pairing.heap_size();
+            res?;
+        }
+        Ok(())
+    }
+
+    fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
+        let n = self.emitted(emit_to);
+        let out = evaluate_groups(self.op, self.return_bool, &self.schema, &self.groups[..n])?;
+        self.release(emit_to);
+        Ok(Arc::new(out))
+    }
+
+    fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
+        let n = self.emitted(emit_to);
+        let out = emit_groups_state(&self.groups[..n], self.grid.len(), self.schema.len())?;
+        self.release(emit_to);
+        Ok(out)
+    }
+
+    fn merge_batch(
+        &mut self,
+        values: &[ArrayRef],
+        group_indices: &[usize],
+        total_num_groups: usize,
+    ) -> Result<()> {
+        self.grow(total_num_groups);
+        let parsed = ParsedStates::parse(values)?;
+        for (row, &group_idx) in group_indices.iter().enumerate() {
+            let pairing = &mut self.groups[group_idx];
+            let before = pairing.heap_size();
+            let res = pairing.merge_row(&parsed, row);
+            self.heap_size = self.heap_size - before + pairing.heap_size();
+            res?;
+        }
+        Ok(())
+    }
+
+    /// Convert each input row directly into a single-row partial state when
+    /// DataFusion bypasses high-cardinality partial aggregation.
+    fn convert_to_state(
+        &self,
+        values: &[ArrayRef],
+        opt_filter: Option<&BooleanArray>,
+    ) -> Result<Vec<ArrayRef>> {
+        let num_rows = values.first().map_or(0, Array::len);
+        let mut temp = GroupedBinary {
+            op: self.op,
+            return_bool: self.return_bool,
+            matching: Arc::clone(&self.matching),
+            grid: self.grid,
+            schema: Arc::clone(&self.schema),
+            groups: Vec::with_capacity(num_rows),
+            heap_size: 0,
+        };
+        let indices: Vec<usize> = (0..num_rows).collect();
+        temp.update_batch(values, &indices, opt_filter, num_rows)?;
+        temp.state(EmitTo::All)
+    }
+
+    fn size(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.groups.capacity() * std::mem::size_of::<Pairing>()
+            + self.heap_size
+    }
+}
+
+fn checked_i32_offset(offset: usize) -> Result<i32> {
+    i32::try_from(offset).map_err(|_| {
+        DataFusionError::Execution(format!("{NAME}: list offset {offset} exceeds i32::MAX"))
+    })
+}
+
+/// Evaluate `groups` in one pass, running [`Op::kernel`] once across all
+/// paired sample lanes and assembling one outer `ListArray` row per group.
+fn evaluate_groups(
+    op: Op,
+    return_bool: bool,
+    schema: &[String],
+    groups: &[Pairing],
+) -> Result<ListArray> {
+    let mut group_buckets: Vec<Vec<Bucket>> = Vec::with_capacity(groups.len());
+    let mut total_buckets = 0usize;
+    let mut total_samples = 0usize;
+    for group in groups {
+        let buckets = group.pairs()?;
+        for b in &buckets {
+            total_samples += b.timestamps.len();
+        }
+        total_buckets += buckets.len();
+        group_buckets.push(buckets);
+    }
+
+    let mut ts_vec: Vec<i64> = Vec::with_capacity(total_samples);
+    let mut lhs_vec: Vec<f64> = Vec::with_capacity(total_samples);
+    for buckets in &group_buckets {
+        for b in buckets {
+            ts_vec.extend_from_slice(&b.timestamps);
+            lhs_vec.extend_from_slice(&b.lhs);
+        }
+    }
+    let timestamps = TimestampMillisecondArray::from(ts_vec);
+    let lhs = Float64Array::from(lhs_vec);
+
+    let computed = if op.is_set() {
+        Computed::Values(lhs.clone())
+    } else {
+        let mut rhs_vec: Vec<f64> = Vec::with_capacity(total_samples);
+        for buckets in &group_buckets {
+            for b in buckets {
+                rhs_vec.extend_from_slice(&b.rhs);
+            }
+        }
+        let rhs = Float64Array::from(rhs_vec);
+        op.kernel(Operand::Lane(&lhs), Operand::Lane(&rhs), return_bool)?
+    };
+
+    let mut kept_buckets: Vec<&Bucket> = Vec::with_capacity(total_buckets);
+    let mut sample_offsets: Vec<i32> = Vec::with_capacity(total_buckets + 1);
+    sample_offsets.push(0);
+    let mut group_offsets: Vec<i32> = Vec::with_capacity(groups.len() + 1);
+    group_offsets.push(0);
+
+    let (timestamps_arr, values_arr): (ArrayRef, ArrayRef) = match computed {
+        Computed::Values(values) => {
+            let mut sample_pos = 0usize;
+            for buckets in &group_buckets {
+                for b in buckets {
+                    let len = b.timestamps.len();
+                    if len > 0 {
+                        kept_buckets.push(b);
+                        sample_pos += len;
+                        sample_offsets.push(checked_i32_offset(sample_pos)?);
+                    }
+                }
+                group_offsets.push(checked_i32_offset(kept_buckets.len())?);
+            }
+            (Arc::new(timestamps), Arc::new(values))
+        }
+        Computed::Holds(holds) => {
+            let mut from = 0usize;
+            let mut sample_pos = 0usize;
+            for buckets in &group_buckets {
+                for b in buckets {
+                    let len = b.timestamps.len();
+                    let kept = holds.slice(from, len).count_set_bits();
+                    from += len;
+                    if kept > 0 {
+                        kept_buckets.push(b);
+                        sample_pos += kept;
+                        sample_offsets.push(checked_i32_offset(sample_pos)?);
+                    }
+                }
+                group_offsets.push(checked_i32_offset(kept_buckets.len())?);
+            }
+            let timestamps_ref: ArrayRef = Arc::new(timestamps);
+            let lhs_ref: ArrayRef = Arc::new(lhs);
+            let predicate = FilterBuilder::new(&BooleanArray::new(holds, None))
+                .optimize()
+                .build();
+            (
+                predicate.filter(&timestamps_ref)?,
+                predicate.filter(&lhs_ref)?,
+            )
+        }
+    };
+
+    let entries = StructArray::new(
+        series::sample_fields(),
+        vec![timestamps_arr, values_arr],
+        None,
+    );
+    let samples = ListArray::new(
+        series::sample_item(),
+        OffsetBuffer::new(sample_offsets.into()),
+        Arc::new(entries),
+        None,
+    );
+
+    // Rebuilt through `series::labels_type` rather than from the
+    // input's own fields, so that the struct this hands back is the
+    // one `promql_labels` would have built for the same names.
+    let DataType::Struct(fields) = series::labels_type(schema) else {
+        unreachable!("a labels type is a struct")
+    };
+    let columns: Vec<ArrayRef> = fields
+        .iter()
+        .map(|field| {
+            let index = schema
+                .iter()
+                .position(|name| name == field.name())
+                .expect("every field of the labels type is a column of the schema");
+            let mut builder = StringViewBuilder::with_capacity(kept_buckets.len());
+            for bucket in &kept_buckets {
+                builder.append_value(bucket.labels[index].as_str());
+            }
+            Arc::new(builder.finish()) as ArrayRef
+        })
+        .collect();
+    let labels = match fields.is_empty() {
+        true => StructArray::new_empty_fields(kept_buckets.len(), None),
+        false => StructArray::new(fields, columns, None),
+    };
+
+    let pairs = StructArray::new(
+        pair_fields(schema),
+        vec![Arc::new(labels), Arc::new(samples)],
+        None,
+    );
+    Ok(ListArray::new(
+        pair_item(schema),
+        OffsetBuffer::new(group_offsets.into()),
+        Arc::new(pairs),
+        None,
+    ))
+}
+
+/// Serialize `groups` into the ten partial-state columns declared by
+/// [`Binary::state_fields`] without intermediate `ScalarValue` wrappers.
+fn emit_groups_state(groups: &[Pairing], steps: usize, width: usize) -> Result<Vec<ArrayRef>> {
+    let n = groups.len();
+    let mut cap_one_steps = 0usize;
+    let mut cap_one_rows = 0usize;
+    let mut cap_one_pool = 0usize;
+    let mut cap_one_metrics = 0usize;
+    let mut cap_many_series = 0usize;
+    for g in groups {
+        if let Some(one) = &g.one {
+            cap_one_steps += steps;
+            if one.rows.is_some() {
+                cap_one_rows += steps;
+            }
+        }
+        cap_one_pool += g.one_pool.len() * width;
+        cap_one_metrics += g.one_metrics.len();
+        cap_many_series += g.many.len();
+    }
+    let cap_many_steps = cap_many_series * steps;
+    let cap_many_labels = cap_many_series * width;
+
+    let mut one_counts_vec: Vec<u8> = Vec::with_capacity(cap_one_steps);
+    let mut one_values_vec: Vec<f64> = Vec::with_capacity(cap_one_steps);
+    let mut one_steps_offsets: Vec<i32> = Vec::with_capacity(n + 1);
+    one_steps_offsets.push(0);
+
+    let mut one_rows_vec: Vec<i32> = Vec::with_capacity(cap_one_rows);
+    let mut one_rows_offsets: Vec<i32> = Vec::with_capacity(n + 1);
+    one_rows_offsets.push(0);
+
+    let mut one_pool_builder = StringBuilder::with_capacity(cap_one_pool, cap_one_pool * 8);
+    let mut one_pool_offsets: Vec<i32> = Vec::with_capacity(n + 1);
+    one_pool_offsets.push(0);
+    let mut one_pool_pos = 0usize;
+
+    let mut one_metrics_builder =
+        StringBuilder::with_capacity(cap_one_metrics, cap_one_metrics * 24);
+    let mut one_metrics_offsets: Vec<i32> = Vec::with_capacity(n + 1);
+    one_metrics_offsets.push(0);
+    let mut one_metrics_pos = 0usize;
+
+    let mut many_labels_builder =
+        StringBuilder::with_capacity(cap_many_labels, cap_many_labels * 8);
+    let mut many_labels_offsets: Vec<i32> = Vec::with_capacity(n + 1);
+    many_labels_offsets.push(0);
+    let mut many_labels_pos = 0usize;
+
+    let mut many_counts_vec: Vec<u8> = Vec::with_capacity(cap_many_steps);
+    let mut many_values_vec: Vec<f64> = Vec::with_capacity(cap_many_steps);
+    let mut many_steps_offsets: Vec<i32> = Vec::with_capacity(n + 1);
+    many_steps_offsets.push(0);
+
+    let mut many_sides_vec: Vec<u8> = Vec::with_capacity(cap_many_series);
+    let mut many_sides_offsets: Vec<i32> = Vec::with_capacity(n + 1);
+    many_sides_offsets.push(0);
+
+    for g in groups {
+        if let Some(one) = &g.one {
+            one_counts_vec.extend_from_slice(&one.counts);
+            one_values_vec.extend_from_slice(&one.values);
+            if let Some(rows) = &one.rows {
+                one_rows_vec.extend_from_slice(rows);
+            }
+        }
+        one_steps_offsets.push(checked_i32_offset(one_counts_vec.len())?);
+        one_rows_offsets.push(checked_i32_offset(one_rows_vec.len())?);
+
+        for labels in &g.one_pool {
+            for label in labels {
+                one_pool_builder.append_value(label.as_str());
+            }
+            one_pool_pos += labels.len();
+        }
+        one_pool_offsets.push(checked_i32_offset(one_pool_pos)?);
+
+        for metric in &g.one_metrics {
+            one_metrics_builder.append_value(metric.as_str());
+        }
+        one_metrics_pos += g.one_metrics.len();
+        one_metrics_offsets.push(checked_i32_offset(one_metrics_pos)?);
+
+        for series in &g.many {
+            for label in &series.labels {
+                many_labels_builder.append_value(label.as_str());
+            }
+            many_labels_pos += series.labels.len();
+            many_counts_vec.extend_from_slice(&series.counts);
+            many_values_vec.extend_from_slice(&series.values);
+            many_sides_vec.push(series.side as u8);
+        }
+        many_labels_offsets.push(checked_i32_offset(many_labels_pos)?);
+        many_steps_offsets.push(checked_i32_offset(many_counts_vec.len())?);
+        many_sides_offsets.push(checked_i32_offset(many_sides_vec.len())?);
+    }
+
+    let one_steps_buf = OffsetBuffer::new(one_steps_offsets.into());
+    let many_steps_buf = OffsetBuffer::new(many_steps_offsets.into());
+    let group_array = StringArray::from_iter(groups.iter().map(|g| g.group.as_deref()));
+
+    let list =
+        |name: &str, dt: DataType, offsets: OffsetBuffer<i32>, values: ArrayRef| -> ArrayRef {
+            Arc::new(ListArray::new(state_item(name, dt), offsets, values, None))
+        };
+
+    Ok(vec![
+        list(
+            STATE_ONE_COUNTS,
+            DataType::UInt8,
+            one_steps_buf.clone(),
+            Arc::new(UInt8Array::from(one_counts_vec)),
+        ),
+        list(
+            STATE_ONE_VALUES,
+            DataType::Float64,
+            one_steps_buf,
+            Arc::new(Float64Array::from(one_values_vec)),
+        ),
+        list(
+            STATE_ONE_ROWS,
+            DataType::Int32,
+            OffsetBuffer::new(one_rows_offsets.into()),
+            Arc::new(Int32Array::from(one_rows_vec)),
+        ),
+        list(
+            STATE_ONE_POOL,
+            DataType::Utf8,
+            OffsetBuffer::new(one_pool_offsets.into()),
+            Arc::new(one_pool_builder.finish()),
+        ),
+        list(
+            STATE_ONE_METRICS,
+            DataType::Utf8,
+            OffsetBuffer::new(one_metrics_offsets.into()),
+            Arc::new(one_metrics_builder.finish()),
+        ),
+        list(
+            STATE_MANY_LABELS,
+            DataType::Utf8,
+            OffsetBuffer::new(many_labels_offsets.into()),
+            Arc::new(many_labels_builder.finish()),
+        ),
+        list(
+            STATE_MANY_COUNTS,
+            DataType::UInt8,
+            many_steps_buf.clone(),
+            Arc::new(UInt8Array::from(many_counts_vec)),
+        ),
+        list(
+            STATE_MANY_VALUES,
+            DataType::Float64,
+            many_steps_buf,
+            Arc::new(Float64Array::from(many_values_vec)),
+        ),
+        list(
+            STATE_MANY_SIDES,
+            DataType::UInt8,
+            OffsetBuffer::new(many_sides_offsets.into()),
+            Arc::new(UInt8Array::from(many_sides_vec)),
+        ),
+        Arc::new(group_array),
+    ])
+}
+
+/// Decoded input columns for one `update_batch` call, bound once per batch.
+struct BatchInputs<'a> {
+    list: &'a ListArray,
+    side: &'a BooleanArray,
+    labels: LabelColumns<'a>,
+    timestamps: &'a [i64],
+    samples: &'a [f64],
+}
+
+impl<'a> BatchInputs<'a> {
+    fn parse(schema: &[String], values: &'a [ArrayRef]) -> Result<Self> {
         let list = values
             .first()
             .and_then(|v| v.as_list_opt::<i32>())
@@ -1042,282 +1954,177 @@ impl Accumulator for Pairing {
             .ok_or_else(|| {
                 DataFusionError::Internal(format!("{NAME}: second argument is not a boolean"))
             })?;
-        let labels = values
+        let labels_struct = values
             .get(2)
             .and_then(|v| v.as_struct_opt())
             .ok_or_else(|| {
                 DataFusionError::Internal(format!("{NAME}: third argument is not a label struct"))
             })?;
-
         let entries = list.values().as_struct();
         let timestamps = child::<TimestampMillisecondArray>(entries, series::TIMESTAMP)?.values();
         let samples = child::<Float64Array>(entries, series::VALUE)?.values();
-        let offsets = list.offsets();
-        for row in 0..list.len() {
-            if list.is_null(row) {
-                continue;
-            }
-            let which = if side.is_valid(row) && side.value(row) {
-                RHS
-            } else {
-                LHS
-            };
-            let labels = read_labels(&self.schema, labels, row);
-            let (lo, hi) = (offsets[row] as usize, offsets[row + 1] as usize);
-            self.absorb(which, &labels, &timestamps[lo..hi], &samples[lo..hi])?;
-        }
-        Ok(())
+        Ok(Self {
+            list,
+            side,
+            labels: LabelColumns::bind(schema, labels_struct),
+            timestamps,
+            samples,
+        })
     }
 
-    /// The operands [`Pairing::pairs`] gathered, computed by one kernel
-    /// call over every bucket end to end rather than once per step. A
-    /// filtering comparison keeps the left operand where it holds, which
-    /// may leave a bucket empty, and an empty bucket is no series.
-    fn evaluate(&mut self) -> Result<ScalarValue> {
-        let buckets = self.pairs()?;
-        let lanes = |lane: fn(&Bucket) -> &Vec<f64>| {
-            Float64Array::from_iter_values(buckets.iter().flat_map(|b| lane(b).iter().copied()))
-        };
-        let (lhs, rhs) = (lanes(|b| &b.lhs), lanes(|b| &b.rhs));
-        let timestamps: ArrayRef = Arc::new(TimestampMillisecondArray::from_iter_values(
-            buckets.iter().flat_map(|b| b.timestamps.iter().copied()),
-        ));
-        let computed = match self.op.is_set() {
-            true => Computed::Values(lhs.clone()),
-            false => self
-                .op
-                .kernel(Operand::Lane(&lhs), Operand::Lane(&rhs), self.return_bool)?,
-        };
-        let (timestamps, values, lengths): (ArrayRef, ArrayRef, Vec<usize>) = match computed {
-            Computed::Values(values) => (
-                timestamps,
-                Arc::new(values),
-                buckets.iter().map(|b| b.timestamps.len()).collect(),
-            ),
-            Computed::Holds(holds) => {
-                let mut from = 0;
-                let lengths = buckets
-                    .iter()
-                    .map(|b| {
-                        let kept = holds.slice(from, b.timestamps.len()).count_set_bits();
-                        from += b.timestamps.len();
-                        kept
-                    })
-                    .collect();
-                let predicate = FilterBuilder::new(&BooleanArray::new(holds, None))
-                    .optimize()
-                    .build();
-                (
-                    predicate.filter(&timestamps)?,
-                    predicate.filter(&lhs)?,
-                    lengths,
-                )
-            }
-        };
-        let (buckets, lengths): (Vec<&Bucket>, Vec<usize>) = buckets
-            .iter()
-            .zip(lengths)
-            .filter(|(_, kept)| *kept > 0)
-            .unzip();
-
-        let entries = StructArray::new(series::sample_fields(), vec![timestamps, values], None);
-        let samples = ListArray::new(
-            series::sample_item(),
-            OffsetBuffer::from_lengths(lengths),
-            Arc::new(entries),
-            None,
-        );
-
-        // Rebuilt through `series::labels_type` rather than from the
-        // input's own fields, so that the struct this hands back is the
-        // one `promql_labels` would have built for the same names.
-        let DataType::Struct(fields) = series::labels_type(&self.schema) else {
-            unreachable!("a labels type is a struct")
-        };
-        let columns: Vec<ArrayRef> = fields
-            .iter()
-            .map(|field| {
-                let index = self
-                    .schema
-                    .iter()
-                    .position(|name| name == field.name())
-                    .expect("every field of the labels type is a column of the schema");
-                let values: Vec<&str> = buckets
-                    .iter()
-                    .map(|bucket| bucket.labels[index].as_str())
-                    .collect();
-                Arc::new(StringViewArray::from(values)) as ArrayRef
-            })
-            .collect();
-        let labels = match fields.is_empty() {
-            true => StructArray::new_empty_fields(buckets.len(), None),
-            false => StructArray::new(fields, columns, None),
-        };
-
-        let pairs = StructArray::new(
-            pair_fields(&self.schema),
-            vec![Arc::new(labels), Arc::new(samples)],
-            None,
-        );
-        Ok(one_row(pair_item(&self.schema), Arc::new(pairs)))
+    fn side_at(&self, row: usize) -> usize {
+        if self.side.is_valid(row) && self.side.value(row) {
+            RHS
+        } else {
+            LHS
+        }
     }
 
-    /// Flat lists throughout: the "many" side is a rectangle of rows by
-    /// steps, and the label sets a rectangle of rows by columns, so a
-    /// partial travels as the same handful of primitive lanes whatever
-    /// the query's label schema is.
-    fn state(&mut self) -> Result<Vec<ScalarValue>> {
-        let width = self.schema.len();
-        let mut many_labels: Vec<&str> = Vec::with_capacity(self.many.len() * width);
-        let mut many_counts: Vec<i64> = Vec::with_capacity(self.many.len() * self.grid.len());
-        let mut many_values: Vec<f64> = Vec::with_capacity(many_counts.capacity());
-        for series in &self.many {
-            many_labels.extend(series.labels.iter().map(String::as_str));
-            many_counts.extend_from_slice(&series.counts);
-            many_values.extend_from_slice(&series.values);
-        }
-        let one_pool: Vec<&str> = self
-            .one_pool
-            .iter()
-            .flat_map(|labels| labels.iter().map(String::as_str))
-            .collect();
-
-        Ok(vec![
-            int_lane(STATE_ONE_COUNTS, self.one_counts.clone()),
-            float_lane(STATE_ONE_VALUES, self.one_values.clone()),
-            int_lane(
-                STATE_ONE_ROWS,
-                self.one_rows.iter().map(|row| *row as i64).collect(),
-            ),
-            text_lane(STATE_ONE_POOL, one_pool),
-            text_lane(
-                STATE_ONE_METRICS,
-                self.one_metrics.iter().map(String::as_str).collect(),
-            ),
-            text_lane(STATE_MANY_LABELS, many_labels),
-            int_lane(STATE_MANY_COUNTS, many_counts),
-            float_lane(STATE_MANY_VALUES, many_values),
-            int_lane(
-                STATE_MANY_SIDES,
-                self.many.iter().map(|s| s.side as i64).collect(),
-            ),
-            ScalarValue::Utf8(self.group.clone()),
-        ])
-    }
-
-    /// Lanes added position by position, as in [`crate::aggregate`]. A
-    /// value is only read where the total count is one, and then exactly
-    /// one partial saw that sample, so any partial that saw something
-    /// carries the value.
-    fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
-        let steps = self.grid.len();
-        let width = self.schema.len();
-
-        let one_counts = lanes::<Int64Type>(states.first(), STATE_ONE_COUNTS)?;
-        let one_values = lanes::<Float64Type>(states.get(1), STATE_ONE_VALUES)?;
-        let one_rows = lanes::<Int64Type>(states.get(2), STATE_ONE_ROWS)?;
-        let one_pool = texts(states.get(3), STATE_ONE_POOL)?;
-        for row in 0..one_counts.len() {
-            let counts = one_counts.value(row);
-            let counts = counts.as_primitive::<Int64Type>();
-            let values = one_values.value(row);
-            let values = values.as_primitive::<Float64Type>();
-            let rows = one_rows.value(row);
-            let rows = rows.as_primitive::<Int64Type>();
-            if counts.len() != steps || values.len() != steps || rows.len() != steps {
-                return Err(DataFusionError::Internal(format!(
-                    "{NAME}: partial state is {} steps, not the {steps} of this grid",
-                    counts.len()
-                )));
-            }
-            let pool = rectangle(&one_pool.value(row), width, NO_ROWS)?;
-            let mut seen: Vec<i32> = Vec::with_capacity(pool.len());
-            for labels in &pool {
-                seen.push(self.intern_one(labels));
-            }
-            for step in 0..steps {
-                if counts.value(step) > 0 {
-                    self.one_counts[step] += counts.value(step);
-                    self.one_values[step] = values.value(step);
-                    let held = rows.value(step);
-                    if held >= 0 {
-                        self.one_rows[step] = *seen
-                            .get(held as usize)
-                            .ok_or_else(|| self.corrupt("a one-side row out of its pool"))?;
-                    }
-                }
-            }
-        }
-
-        let many_labels = texts(states.get(5), STATE_MANY_LABELS)?;
-        let many_counts = lanes::<Int64Type>(states.get(6), STATE_MANY_COUNTS)?;
-        let many_values = lanes::<Float64Type>(states.get(7), STATE_MANY_VALUES)?;
-        let many_sides = lanes::<Int64Type>(states.get(8), STATE_MANY_SIDES)?;
-        for row in 0..many_counts.len() {
-            let counts = many_counts.value(row);
-            let counts = counts.as_primitive::<Int64Type>();
-            let values = many_values.value(row);
-            let values = values.as_primitive::<Float64Type>();
-            let sides = many_sides.value(row);
-            let sides = sides.as_primitive::<Int64Type>();
-            let rows = counts.len() / steps.max(1);
-            if counts.len() != rows * steps || values.len() != counts.len() {
-                return Err(self.corrupt("a many-side rectangle that is not rows by steps"));
-            }
-            if sides.len() != rows {
-                return Err(self.corrupt("a side per series that is not one per series"));
-            }
-            let labels = rectangle(&many_labels.value(row), width, rows)?;
-            for (index, labels) in labels.iter().enumerate() {
-                let many = self.intern_many(sides.value(index) as usize, labels);
-                for step in 0..steps {
-                    let at = index * steps + step;
-                    if counts.value(at) > 0 {
-                        self.many[many].counts[step] += counts.value(at);
-                        self.many[many].values[step] = values.value(at);
-                    }
-                }
-            }
-        }
-
-        if let Some(metrics) = states.get(4).and_then(|s| s.as_list_opt::<i32>()) {
-            for row in 0..metrics.len() {
-                let held = metrics.value(row);
-                let held = held.as_string::<i32>();
-                for i in 0..held.len() {
-                    if self.one_metrics.len() < 2
-                        && self.one_metrics.first().map(String::as_str) != Some(held.value(i))
-                    {
-                        self.one_metrics.push(held.value(i).to_string());
-                    }
-                }
-            }
-        }
-        if let Some(group) = states.get(9).and_then(|s| s.as_string_opt::<i32>()) {
-            for row in 0..group.len() {
-                if self.group.is_none() && group.is_valid(row) {
-                    self.group = Some(group.value(row).to_string());
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn size(&self) -> usize {
-        let lane = self.grid.len() * (std::mem::size_of::<i64>() + std::mem::size_of::<f64>());
-        std::mem::size_of::<Self>()
-            + lane
-            + self.grid.len() * std::mem::size_of::<i32>()
-            + self.many.len() * lane
-            + (self.many.len() + self.one_pool.len())
-                * self.schema.len()
-                * std::mem::size_of::<String>()
+    fn sample_range(&self, row: usize) -> (usize, usize) {
+        let offsets = self.list.offsets();
+        (offsets[row] as usize, offsets[row + 1] as usize)
     }
 }
 
-impl Pairing {
-    fn corrupt(&self, what: &str) -> DataFusionError {
-        DataFusionError::Internal(format!("{NAME}: partial state holds {what}"))
+enum LabelCol<'a> {
+    View(&'a StringViewArray),
+    Utf8(&'a StringArray),
+    Empty,
+}
+
+/// Pre-bound label struct columns in schema order so row loops avoid linear
+/// field-name lookups on every row.
+struct LabelColumns<'a> {
+    cols: Vec<LabelCol<'a>>,
+}
+
+impl<'a> LabelColumns<'a> {
+    fn bind(schema: &[String], labels: &'a StructArray) -> Self {
+        let cols = schema
+            .iter()
+            .map(|name| match labels.column_by_name(name) {
+                Some(column) => match column.data_type() {
+                    DataType::Utf8View => LabelCol::View(column.as_string_view()),
+                    DataType::Utf8 => LabelCol::Utf8(column.as_string::<i32>()),
+                    _ => LabelCol::Empty,
+                },
+                None => LabelCol::Empty,
+            })
+            .collect();
+        Self { cols }
+    }
+
+    fn read_into(&self, row: usize, out: &mut Vec<String>) {
+        if out.len() < self.cols.len() {
+            out.resize_with(self.cols.len(), String::new);
+        } else {
+            out.truncate(self.cols.len());
+        }
+        for (dst, col) in out.iter_mut().zip(&self.cols) {
+            dst.clear();
+            let val = match col {
+                LabelCol::View(a) if a.is_valid(row) => a.value(row),
+                LabelCol::Utf8(a) if a.is_valid(row) => a.value(row),
+                _ => "",
+            };
+            if !val.is_empty() {
+                dst.push_str(val);
+            }
+        }
+    }
+}
+
+struct PrimList<'a, T> {
+    offsets: &'a OffsetBuffer<i32>,
+    values: &'a [T],
+    len: usize,
+}
+
+impl<T> PrimList<'_, T> {
+    fn range(&self, row: usize) -> (usize, usize) {
+        (self.offsets[row] as usize, self.offsets[row + 1] as usize)
+    }
+}
+
+struct TextList<'a> {
+    offsets: &'a OffsetBuffer<i32>,
+    values: &'a StringArray,
+    len: usize,
+}
+
+impl TextList<'_> {
+    fn range(&self, row: usize) -> (usize, usize) {
+        (self.offsets[row] as usize, self.offsets[row + 1] as usize)
+    }
+}
+
+/// Partial-state columns bound once per `merge_batch` call as borrowed slices
+/// so per-row merging never clones sliced `ArrayRef` wrappers.
+struct ParsedStates<'a> {
+    num_rows: usize,
+    one_counts: PrimList<'a, u8>,
+    one_values: PrimList<'a, f64>,
+    one_rows: PrimList<'a, i32>,
+    one_pool: TextList<'a>,
+    one_metrics: Option<TextList<'a>>,
+    many_labels: TextList<'a>,
+    many_counts: PrimList<'a, u8>,
+    many_values: PrimList<'a, f64>,
+    many_sides: PrimList<'a, u8>,
+    group: Option<&'a StringArray>,
+}
+
+impl<'a> ParsedStates<'a> {
+    fn parse(states: &'a [ArrayRef]) -> Result<Self> {
+        let one_counts = prim_list::<UInt8Type>(states.first(), STATE_ONE_COUNTS)?;
+        let one_values = prim_list::<Float64Type>(states.get(1), STATE_ONE_VALUES)?;
+        let one_rows = prim_list::<Int32Type>(states.get(2), STATE_ONE_ROWS)?;
+        let one_pool = text_list(states.get(3), STATE_ONE_POOL)?;
+        let one_metrics = states
+            .get(4)
+            .and_then(|s| s.as_list_opt::<i32>())
+            .and_then(|list| {
+                list.values().as_string_opt::<i32>().map(|values| TextList {
+                    offsets: list.offsets(),
+                    values,
+                    len: list.len(),
+                })
+            });
+        let many_labels = text_list(states.get(5), STATE_MANY_LABELS)?;
+        let many_counts = prim_list::<UInt8Type>(states.get(6), STATE_MANY_COUNTS)?;
+        let many_values = prim_list::<Float64Type>(states.get(7), STATE_MANY_VALUES)?;
+        let many_sides = prim_list::<UInt8Type>(states.get(8), STATE_MANY_SIDES)?;
+        let group = states.get(9).and_then(|s| s.as_string_opt::<i32>());
+
+        let num_rows = one_counts.len;
+        if one_values.len != num_rows
+            || one_rows.len != num_rows
+            || one_pool.len != num_rows
+            || many_labels.len != num_rows
+            || many_counts.len != num_rows
+            || many_values.len != num_rows
+            || many_sides.len != num_rows
+            || one_metrics.as_ref().is_some_and(|m| m.len != num_rows)
+            || group.is_some_and(|g| g.len() != num_rows)
+        {
+            return Err(DataFusionError::Internal(format!(
+                "{NAME}: partial state columns have mismatched row counts"
+            )));
+        }
+
+        Ok(Self {
+            num_rows,
+            one_counts,
+            one_values,
+            one_rows,
+            one_pool,
+            one_metrics,
+            many_labels,
+            many_counts,
+            many_values,
+            many_sides,
+            group,
+        })
     }
 }
 
@@ -1326,44 +2133,33 @@ impl Pairing {
 /// impossible — so the caller says which case it is.
 const NO_ROWS: usize = usize::MAX;
 
-/// A flat run of label values read back as one label set per row.
-fn rectangle(flat: &ArrayRef, width: usize, rows: usize) -> Result<Vec<Vec<String>>> {
-    let flat = flat.as_string::<i32>();
+/// A flat slice of `[lo..hi]` label values read back as one label set per row.
+fn rectangle_slice(
+    flat: &StringArray,
+    lo: usize,
+    hi: usize,
+    width: usize,
+    rows: usize,
+) -> Result<Vec<Vec<String>>> {
+    let len = hi - lo;
     if width == 0 {
         // Every label set is the empty one, so a pool of them holds
         // exactly one entry and a rectangle holds as many as the
         // caller counted.
         return Ok(vec![Vec::new(); if rows == NO_ROWS { 1 } else { rows }]);
     }
-    if !flat.len().is_multiple_of(width) {
+    if !len.is_multiple_of(width) || (rows != NO_ROWS && len / width != rows) {
         return Err(DataFusionError::Internal(format!(
-            "{NAME}: {} label values are not a multiple of the {width} columns",
-            flat.len()
+            "{NAME}: {len} label values are not a multiple of the {width} columns"
         )));
     }
-    Ok((0..flat.len() / width)
+    Ok((0..len / width)
         .map(|row| {
             (0..width)
-                .map(|column| flat.value(row * width + column).to_string())
+                .map(|column| flat.value(lo + row * width + column).to_string())
                 .collect()
         })
         .collect())
-}
-
-/// One row of a label struct as the vector of values this module works
-/// in, in the schema's order.
-fn read_labels(schema: &[String], labels: &StructArray, row: usize) -> Vec<String> {
-    schema
-        .iter()
-        .map(|name| match labels.column_by_name(name) {
-            Some(column) => match column.data_type() {
-                DataType::Utf8View => column.as_string_view().value(row).to_string(),
-                DataType::Utf8 => column.as_string::<i32>().value(row).to_string(),
-                _ => String::new(),
-            },
-            None => String::new(),
-        })
-        .collect()
 }
 
 /// A label set as Prometheus prints one, keeping the names `wanted`
@@ -1401,15 +2197,15 @@ const STATE_GROUP: &str = "group";
 /// Named once so that a rename fails to compile at both ends rather
 /// than mismatching across a partial/final plan boundary.
 const STATE_LANES: [(&str, DataType); 9] = [
-    (STATE_ONE_COUNTS, DataType::Int64),
+    (STATE_ONE_COUNTS, DataType::UInt8),
     (STATE_ONE_VALUES, DataType::Float64),
-    (STATE_ONE_ROWS, DataType::Int64),
+    (STATE_ONE_ROWS, DataType::Int32),
     (STATE_ONE_POOL, DataType::Utf8),
     (STATE_ONE_METRICS, DataType::Utf8),
     (STATE_MANY_LABELS, DataType::Utf8),
-    (STATE_MANY_COUNTS, DataType::Int64),
+    (STATE_MANY_COUNTS, DataType::UInt8),
     (STATE_MANY_VALUES, DataType::Float64),
-    (STATE_MANY_SIDES, DataType::Int64),
+    (STATE_MANY_SIDES, DataType::UInt8),
 ];
 
 fn state_item(name: &str, of: DataType) -> FieldRef {
@@ -1418,39 +2214,6 @@ fn state_item(name: &str, of: DataType) -> FieldRef {
 
 fn state_type(name: &str, of: DataType) -> DataType {
     DataType::List(state_item(name, of))
-}
-
-fn int_lane(name: &str, values: Vec<i64>) -> ScalarValue {
-    one_row(
-        state_item(name, DataType::Int64),
-        Arc::new(Int64Array::from(values)),
-    )
-}
-
-fn float_lane(name: &str, values: Vec<f64>) -> ScalarValue {
-    one_row(
-        state_item(name, DataType::Float64),
-        Arc::new(Float64Array::from(values)),
-    )
-}
-
-fn text_lane(name: &str, values: Vec<&str>) -> ScalarValue {
-    one_row(
-        state_item(name, DataType::Utf8),
-        Arc::new(StringArray::from(values)),
-    )
-}
-
-/// One list value holding `entries` whole: the single row an
-/// [`Accumulator`] hands back.
-fn one_row(item: FieldRef, entries: ArrayRef) -> ScalarValue {
-    let len = entries.len() as i32;
-    ScalarValue::List(Arc::new(ListArray::new(
-        item,
-        OffsetBuffer::new(vec![0, len].into()),
-        entries,
-        None,
-    )))
 }
 
 fn child<'a, T: 'static>(entries: &'a StructArray, name: &str) -> Result<&'a T> {
@@ -1462,39 +2225,41 @@ fn child<'a, T: 'static>(entries: &'a StructArray, name: &str) -> Result<&'a T> 
         })
 }
 
-/// One state column as the list of lanes it must be.
-fn lanes<T: datafusion::arrow::datatypes::ArrowPrimitiveType>(
-    state: Option<&ArrayRef>,
+fn prim_list<'a, T: datafusion::arrow::datatypes::ArrowPrimitiveType>(
+    state: Option<&'a ArrayRef>,
     name: &str,
-) -> Result<ListArray> {
-    let list = list_state(state, name)?;
-    if list.values().as_primitive_opt::<T>().is_none() {
-        return Err(DataFusionError::Internal(format!(
+) -> Result<PrimList<'a, T::Native>> {
+    let list = state.and_then(|s| s.as_list_opt::<i32>()).ok_or_else(|| {
+        DataFusionError::Internal(format!("{NAME}: partial state column {name} is not a list"))
+    })?;
+    let prim = list.values().as_primitive_opt::<T>().ok_or_else(|| {
+        DataFusionError::Internal(format!(
             "{NAME}: partial state column {name} holds {}",
             list.values().data_type()
-        )));
-    }
-    Ok(list)
+        ))
+    })?;
+    Ok(PrimList {
+        offsets: list.offsets(),
+        values: prim.values(),
+        len: list.len(),
+    })
 }
 
-fn texts(state: Option<&ArrayRef>, name: &str) -> Result<ListArray> {
-    let list = list_state(state, name)?;
-    if list.values().as_string_opt::<i32>().is_none() {
-        return Err(DataFusionError::Internal(format!(
+fn text_list<'a>(state: Option<&'a ArrayRef>, name: &str) -> Result<TextList<'a>> {
+    let list = state.and_then(|s| s.as_list_opt::<i32>()).ok_or_else(|| {
+        DataFusionError::Internal(format!("{NAME}: partial state column {name} is not a list"))
+    })?;
+    let values = list.values().as_string_opt::<i32>().ok_or_else(|| {
+        DataFusionError::Internal(format!(
             "{NAME}: partial state column {name} holds {}",
             list.values().data_type()
-        )));
-    }
-    Ok(list)
-}
-
-fn list_state(state: Option<&ArrayRef>, name: &str) -> Result<ListArray> {
-    Ok(state
-        .and_then(|s| s.as_list_opt::<i32>())
-        .ok_or_else(|| {
-            DataFusionError::Internal(format!("{NAME}: partial state column {name} is not a list"))
-        })?
-        .clone())
+        ))
+    })?;
+    Ok(TextList {
+        offsets: list.offsets(),
+        values,
+        len: list.len(),
+    })
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -1645,6 +2410,20 @@ impl AggregateUDFImpl for Binary {
             return plan_err!("{NAME}: DISTINCT is not supported");
         }
         Ok(Box::new(from_args(&args)?))
+    }
+
+    fn groups_accumulator_supported(&self, args: AccumulatorArgs) -> bool {
+        !args.is_distinct
+    }
+
+    fn create_groups_accumulator(
+        &self,
+        args: AccumulatorArgs,
+    ) -> Result<Box<dyn GroupsAccumulator>> {
+        if args.is_distinct {
+            return plan_err!("{NAME}: DISTINCT is not supported");
+        }
+        Ok(Box::new(GroupedBinary::from_pairing(from_args(&args)?)))
     }
 
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
@@ -2754,5 +3533,482 @@ mod tests {
             print(&schema, &labels, |n| n != METRIC_NAME),
             r#"{job="api"}"#
         );
+    }
+
+    fn pairs_at(array: &ArrayRef, row: usize) -> Vec<Out> {
+        let list = array.as_list::<i32>();
+        let single = ListArray::new(
+            pair_item(&names(&SCHEMA)),
+            OffsetBuffer::new(vec![0, list.value(row).len() as i32].into()),
+            list.value(row),
+            None,
+        );
+        pairs_of(ScalarValue::List(Arc::new(single)))
+    }
+
+    #[test]
+    fn grouped_accumulator_merges_prefixes_filters_rows_and_tracks_size() {
+        use crate::Series;
+        type RowSpec<'a> = (&'a [(&'a str, &'a str)], &'a [i64], &'a [f64], bool);
+
+        let make_batch = |rows: &[RowSpec<'_>]| -> [ArrayRef; 3] {
+            let series_vec: Vec<Series> = rows
+                .iter()
+                .map(|(lbls, ts, vs, _)| Series::new(lbls, ts.to_vec(), vs.to_vec()).unwrap())
+                .collect();
+            let batch = series::encode(
+                &names(&SCHEMA),
+                &series_vec,
+                series::Block {
+                    start_ms: 0,
+                    end_ms: 30_001,
+                },
+            )
+            .unwrap();
+            let sides = BooleanArray::from(rows.iter().map(|r| r.3).collect::<Vec<_>>());
+            [
+                Arc::clone(batch.column_by_name(series::SAMPLES).unwrap()),
+                Arc::new(sides),
+                Arc::clone(batch.column_by_name(series::LABELS).unwrap()),
+            ]
+        };
+
+        let make_acc = || {
+            GroupedBinary::from_pairing(pairing(
+                Op::Add,
+                false,
+                Matching {
+                    card: Card::ManyToOne,
+                    on: true,
+                    labels: names(&["pod"]),
+                    include: names(&["zone"]),
+                    ..Matching::default()
+                },
+            ))
+        };
+
+        // Group 0: plain 1:1 match. Group 1: LHS-only unmatched group. Group 2:
+        // two non-overlapping RHS series in the same partial exercising `one.rows`
+        // materialization, serialization, and `group_left(zone)` label selection,
+        // plus one filtered-out duplicate row that `opt_filter` drops.
+        let part1 = make_batch(&[
+            (
+                &[(METRIC_NAME, "req"), ("pod", "a")],
+                &[0, 10_000],
+                &[2.0, 3.0],
+                false,
+            ),
+            (
+                &[(METRIC_NAME, "req"), ("pod", "lonely")],
+                &[0],
+                &[9.0],
+                false,
+            ),
+            (
+                &[(METRIC_NAME, "err_a"), ("pod", "c"), ("zone", "eu")],
+                &[0],
+                &[10.0],
+                true,
+            ),
+            (
+                &[(METRIC_NAME, "err_b"), ("pod", "c"), ("zone", "us")],
+                &[10_000],
+                &[20.0],
+                true,
+            ),
+            (
+                &[(METRIC_NAME, "filtered_dup"), ("pod", "a")],
+                &[0],
+                &[999.0],
+                true,
+            ),
+        ]);
+        let filter1 = BooleanArray::from(vec![true, true, true, true, false]);
+
+        let part2 = make_batch(&[
+            (
+                &[(METRIC_NAME, "err"), ("pod", "a"), ("zone", "eu")],
+                &[0, 10_000],
+                &[5.0, 7.0],
+                true,
+            ),
+            (
+                &[(METRIC_NAME, "req"), ("pod", "c")],
+                &[0, 10_000],
+                &[1.0, 2.0],
+                false,
+            ),
+        ]);
+
+        let mut p1 = make_acc();
+        let base_size = p1.size();
+        p1.update_batch(&part1, &[0, 1, 2, 2, 0], Some(&filter1), 3)
+            .unwrap();
+        assert!(p1.groups[2].one.as_ref().unwrap().rows.is_some());
+        assert!(p1.size() > base_size);
+        let s1_first = p1.state(EmitTo::First(1)).unwrap();
+        assert_eq!(
+            p1.heap_size,
+            p1.groups.iter().map(Pairing::heap_size).sum::<usize>()
+        );
+        assert!(p1.heap_size > 0);
+        let s1_rest = p1.state(EmitTo::All).unwrap();
+        assert_eq!(p1.heap_size, 0);
+        assert_eq!(p1.size(), base_size);
+
+        let mut p2 = make_acc();
+        p2.update_batch(&part2, &[0, 1], None, 2).unwrap();
+        let s2_first = p2.state(EmitTo::First(1)).unwrap();
+        let s2_rest = p2.state(EmitTo::All).unwrap();
+
+        let mut final_acc = make_acc();
+        final_acc.merge_batch(&s1_first, &[0], 3).unwrap();
+        final_acc.merge_batch(&s1_rest, &[1, 2], 3).unwrap();
+        final_acc.merge_batch(&s2_first, &[0], 3).unwrap();
+
+        let first_out = final_acc.evaluate(EmitTo::First(1)).unwrap();
+        assert_eq!(
+            pairs_at(&first_out, 0),
+            [(lset("", "", "a", "eu"), vec![(0, 7.0), (10_000, 10.0)])]
+        );
+        assert_eq!(
+            final_acc.heap_size,
+            final_acc
+                .groups
+                .iter()
+                .map(Pairing::heap_size)
+                .sum::<usize>()
+        );
+        // Merge into the shifted group index after `EmitTo::First(1)`.
+        final_acc.merge_batch(&s2_rest, &[1], 2).unwrap();
+        let rest_out = final_acc.evaluate(EmitTo::All).unwrap();
+        assert!(pairs_at(&rest_out, 0).is_empty());
+        assert_eq!(
+            pairs_at(&rest_out, 1),
+            [
+                (lset("", "", "c", "eu"), vec![(0, 11.0)]),
+                (lset("", "", "c", "us"), vec![(10_000, 22.0)]),
+            ]
+        );
+        assert_eq!(final_acc.heap_size, 0);
+        assert_eq!(final_acc.size(), base_size);
+
+        // Verify `STATE_ONE_METRICS` and `STATE_GROUP` survive `state` + `merge_batch`
+        // when two partials collide on the one side at the same step.
+        let dup_batch = make_batch(&[
+            (&[(METRIC_NAME, "req"), ("pod", "d")], &[0], &[1.0], false),
+            (&[(METRIC_NAME, "rhs_1"), ("pod", "d")], &[0], &[2.0], true),
+            (&[(METRIC_NAME, "rhs_2"), ("pod", "d")], &[0], &[3.0], true),
+        ]);
+        let dup_states = make_acc().convert_to_state(&dup_batch, None).unwrap();
+        let mut dup_acc = make_acc();
+        dup_acc.merge_batch(&dup_states, &[0, 0, 0], 1).unwrap();
+        let dup_err = dup_acc.evaluate(EmitTo::All).unwrap_err().to_string();
+        assert!(
+            dup_err.contains("found duplicate series for the match group {pod=\"d\"}"),
+            "{dup_err}"
+        );
+        assert!(dup_err.contains("rhs_1"), "{dup_err}");
+        assert!(dup_err.contains("rhs_2"), "{dup_err}");
+
+        // Also verify DataFusion's high-cardinality partial bypass via
+        // `convert_to_state` reaches the exact same merged answer.
+        let converter = make_acc();
+        let bypass1 = converter.convert_to_state(&part1, Some(&filter1)).unwrap();
+        let bypass2 = converter.convert_to_state(&part2, None).unwrap();
+        let mut from_bypass = make_acc();
+        from_bypass
+            .merge_batch(&bypass1, &[0, 1, 2, 2, 0], 3)
+            .unwrap();
+        from_bypass.merge_batch(&bypass2, &[0, 2], 3).unwrap();
+        let bypass_out = from_bypass.evaluate(EmitTo::All).unwrap();
+        assert_eq!(
+            pairs_at(&bypass_out, 0),
+            [(lset("", "", "a", "eu"), vec![(0, 7.0), (10_000, 10.0)])]
+        );
+        assert!(pairs_at(&bypass_out, 1).is_empty());
+        assert_eq!(
+            pairs_at(&bypass_out, 2),
+            [
+                (lset("", "", "c", "eu"), vec![(0, 11.0)]),
+                (lset("", "", "c", "us"), vec![(10_000, 22.0)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn grouped_set_operators_handle_single_sided_and_matched_groups() {
+        use crate::Series;
+
+        let rows = [
+            Series::new(&[(METRIC_NAME, "l"), ("pod", "only_l")], vec![0], vec![1.0]).unwrap(),
+            Series::new(&[(METRIC_NAME, "r"), ("pod", "only_r")], vec![0], vec![2.0]).unwrap(),
+            Series::new(
+                &[(METRIC_NAME, "l"), ("pod", "both")],
+                vec![0, 10_000],
+                vec![3.0, 4.0],
+            )
+            .unwrap(),
+            Series::new(&[(METRIC_NAME, "r"), ("pod", "both")], vec![0], vec![9.0]).unwrap(),
+        ];
+        let batch = series::encode(
+            &names(&SCHEMA),
+            &rows,
+            series::Block {
+                start_ms: 0,
+                end_ms: 30_001,
+            },
+        )
+        .unwrap();
+        let cols: [ArrayRef; 3] = [
+            Arc::clone(batch.column_by_name(series::SAMPLES).unwrap()),
+            Arc::new(BooleanArray::from(vec![false, true, false, true])),
+            Arc::clone(batch.column_by_name(series::LABELS).unwrap()),
+        ];
+
+        for (op, want_g0, want_g1, want_g2) in [
+            (
+                Op::And,
+                vec![],
+                vec![],
+                vec![(lset("l", "", "both", ""), vec![(0, 3.0)])],
+            ),
+            (
+                Op::Unless,
+                vec![(lset("l", "", "only_l", ""), vec![(0, 1.0)])],
+                vec![],
+                vec![(lset("l", "", "both", ""), vec![(10_000, 4.0)])],
+            ),
+            (
+                Op::Or,
+                vec![(lset("l", "", "only_l", ""), vec![(0, 1.0)])],
+                vec![(lset("r", "", "only_r", ""), vec![(0, 2.0)])],
+                vec![(lset("l", "", "both", ""), vec![(0, 3.0), (10_000, 4.0)])],
+            ),
+        ] {
+            let mut acc = GroupedBinary::from_pairing(plain(op));
+            acc.update_batch(&cols, &[0, 1, 2, 2], None, 3).unwrap();
+            let out = acc.evaluate(EmitTo::All).unwrap();
+            assert_eq!(pairs_at(&out, 0), want_g0, "{}", op.as_str());
+            assert_eq!(pairs_at(&out, 1), want_g1, "{}", op.as_str());
+            assert_eq!(pairs_at(&out, 2), want_g2, "{}", op.as_str());
+        }
+    }
+
+    #[test]
+    fn empty_sample_rows_do_not_allocate_lanes_or_pollute_duplicates() {
+        let mut p = plain(Op::Add);
+        p.absorb(LHS, &lset("filtered_lhs", "", "a", ""), &[], &[])
+            .unwrap();
+        p.absorb(RHS, &lset("filtered_rhs", "", "a", ""), &[], &[])
+            .unwrap();
+        assert!(p.one.is_none());
+        assert!(p.one_pool.is_empty());
+        assert!(p.one_metrics.is_empty());
+        assert!(p.many.is_empty());
+
+        p.absorb(LHS, &lset("req", "", "a", ""), &[0], &[1.0])
+            .unwrap();
+        p.absorb(RHS, &lset("err_first", "", "a", ""), &[0], &[2.0])
+            .unwrap();
+        p.absorb(RHS, &lset("err_second", "", "a", ""), &[0], &[3.0])
+            .unwrap();
+        let err = p.evaluate().unwrap_err().to_string();
+        assert!(err.contains("err_first"), "{err}");
+        assert!(err.contains("err_second"), "{err}");
+        assert!(!err.contains("filtered_rhs"), "{err}");
+    }
+
+    #[test]
+    fn fast_path_handles_group_right_same_series_duplicates_and_disjoint_steps() {
+        // 1:1 fast path with `group_right` (`one_is_lhs = true`) on a
+        // non-commutative operator (`Op::Sub`: lhs - rhs = 10 - 3 = 7).
+        let mut gr = pairing(
+            Op::Sub,
+            false,
+            Matching {
+                card: Card::OneToMany,
+                on: true,
+                labels: names(&["pod"]),
+                include: names(&["zone"]),
+                ..Matching::default()
+            },
+        );
+        gr.absorb(LHS, &lset("total", "", "a", "eu"), &[0], &[10.0])
+            .unwrap();
+        gr.absorb(RHS, &lset("errors", "/x", "a", ""), &[0], &[3.0])
+            .unwrap();
+        assert!(gr.one.as_ref().unwrap().rows.is_none());
+        assert_eq!(
+            pairs_of(gr.evaluate().unwrap()),
+            [(lset("", "/x", "a", "eu"), vec![(0, 7.0)])]
+        );
+
+        // 1:1 fast path with `one.rows.is_none()` and `oc > 1` (same RHS series
+        // absorbed twice at the same step).
+        let mut dup = plain(Op::Add);
+        dup.absorb(LHS, &lset("req", "", "a", ""), &[0], &[1.0])
+            .unwrap();
+        dup.absorb(RHS, &lset("err", "", "a", ""), &[0], &[2.0])
+            .unwrap();
+        dup.absorb(RHS, &lset("err", "", "a", ""), &[0], &[3.0])
+            .unwrap();
+        assert!(dup.one.as_ref().unwrap().rows.is_none());
+        assert!(dup
+            .evaluate()
+            .unwrap_err()
+            .to_string()
+            .contains(DUPLICATE_SERIES));
+
+        // 1:1 fast path with disjoint steps (`paired == 0`).
+        let mut disjoint = plain(Op::Add);
+        disjoint
+            .absorb(LHS, &lset("req", "", "a", ""), &[0], &[1.0])
+            .unwrap();
+        disjoint
+            .absorb(RHS, &lset("err", "", "a", ""), &[10_000], &[2.0])
+            .unwrap();
+        assert!(pairs_of(disjoint.evaluate().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn u8_sample_counts_saturate_across_absorb_and_merge() {
+        let lhs = lset("req", "", "a", "");
+        let rhs_a = lset("err_a", "", "a", "");
+        let rhs_b = lset("err_b", "", "a", "");
+
+        // 256 and 257 samples at the same step must saturate at 255 rather than
+        // wrapping to 0 or 1.
+        for total in [256usize, 257] {
+            let mut p1 = plain(Op::Add);
+            p1.absorb(LHS, &lhs, &[0], &[1.0]).unwrap();
+            p1.absorb(RHS, &rhs_a, &[0], &[2.0]).unwrap();
+            for _ in 1..200 {
+                p1.absorb(RHS, &rhs_b, &[0], &[3.0]).unwrap();
+            }
+            let mut p2 = plain(Op::Add);
+            for _ in 200..total {
+                p2.absorb(RHS, &rhs_b, &[0], &[3.0]).unwrap();
+            }
+            let mut merged = plain(Op::Add);
+            for mut part in [p1, p2] {
+                let arrays: Vec<ArrayRef> = part
+                    .state()
+                    .unwrap()
+                    .iter()
+                    .map(|s| s.to_array().unwrap())
+                    .collect();
+                merged.merge_batch(&arrays).unwrap();
+            }
+            assert_eq!(merged.one.as_ref().unwrap().counts[0], u8::MAX);
+            assert!(merged
+                .evaluate()
+                .unwrap_err()
+                .to_string()
+                .contains(DUPLICATE_SERIES));
+        }
+    }
+
+    #[test]
+    fn single_sided_groups_with_fill_values_emit_or_short_circuit() {
+        let lhs = lset("req", "/x", "a", "");
+        let rhs = lset("err", "", "a", "eu");
+
+        // LHS-only (`one` is `None`) with `fill_rhs` emits filled samples.
+        let mut fill_r = pairing(
+            Op::Add,
+            false,
+            Matching {
+                fill_rhs: Some(5.0),
+                ..Matching::default()
+            },
+        );
+        fill_r.absorb(LHS, &lhs, &[0], &[2.0]).unwrap();
+        assert!(fill_r.one.is_none());
+        assert_eq!(
+            pairs_of(fill_r.evaluate().unwrap()),
+            [(lset("", "/x", "a", ""), vec![(0, 7.0)])]
+        );
+
+        // LHS-only (`one` is `None`) with only `fill_lhs` short-circuits to empty.
+        let mut fill_l_only = pairing(
+            Op::Add,
+            false,
+            Matching {
+                fill_lhs: Some(5.0),
+                ..Matching::default()
+            },
+        );
+        fill_l_only.absorb(LHS, &lhs, &[0], &[2.0]).unwrap();
+        assert!(pairs_of(fill_l_only.evaluate().unwrap()).is_empty());
+
+        // RHS-only (`many` is empty) with `fill_lhs` emits filled samples.
+        let mut fill_l = pairing(
+            Op::Add,
+            false,
+            Matching {
+                fill_lhs: Some(10.0),
+                ..Matching::default()
+            },
+        );
+        fill_l.absorb(RHS, &rhs, &[0], &[3.0]).unwrap();
+        assert!(fill_l.many.is_empty());
+        assert_eq!(
+            pairs_of(fill_l.evaluate().unwrap()),
+            [(lset("", "", "a", "eu"), vec![(0, 13.0)])]
+        );
+    }
+
+    #[test]
+    fn corrupt_partial_states_are_rejected_in_merge_row() {
+        let mut base = plain(Op::Add);
+        base.absorb(RHS, &lset("err", "", "a", ""), &[0], &[1.0])
+            .unwrap();
+        let valid: Vec<ArrayRef> = base
+            .state()
+            .unwrap()
+            .iter()
+            .map(|s| s.to_array().unwrap())
+            .collect();
+
+        // Empty `one_pool` with non-zero `one_counts` must fail even when
+        // `one_rows` is empty.
+        let mut empty_pool = valid.clone();
+        empty_pool[3] = Arc::new(ListArray::new(
+            state_item(STATE_ONE_POOL, DataType::Utf8),
+            OffsetBuffer::new(vec![0, 0].into()),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+            None,
+        ));
+        assert!(plain(Op::Add).merge_batch(&empty_pool).is_err());
+
+        // Negative `one_rows` entry at a step with `one_counts > 0` must fail.
+        let mut neg_rows = valid.clone();
+        neg_rows[2] = Arc::new(ListArray::new(
+            state_item(STATE_ONE_ROWS, DataType::Int32),
+            OffsetBuffer::new(vec![0, 4].into()),
+            Arc::new(Int32Array::from(vec![-1, -1, -1, -1])),
+            None,
+        ));
+        assert!(plain(Op::Add).merge_batch(&neg_rows).is_err());
+
+        // Mismatched `many_labels` row count must fail in `rectangle_slice`.
+        let mut many_base = plain(Op::Add);
+        many_base
+            .absorb(LHS, &lset("req", "", "a", ""), &[0], &[1.0])
+            .unwrap();
+        let mut bad_many: Vec<ArrayRef> = many_base
+            .state()
+            .unwrap()
+            .iter()
+            .map(|s| s.to_array().unwrap())
+            .collect();
+        bad_many[5] = Arc::new(ListArray::new(
+            state_item(STATE_MANY_LABELS, DataType::Utf8),
+            OffsetBuffer::new(vec![0, 0].into()),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+            None,
+        ));
+        assert!(plain(Op::Add).merge_batch(&bad_many).is_err());
     }
 }
