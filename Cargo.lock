@@ -2948,6 +2948,7 @@ dependencies = [
 name = "promql-common"
 version = "0.1.0"
 dependencies = [
+ "benchfmt",
  "chrono",
  "thiserror",
 ]

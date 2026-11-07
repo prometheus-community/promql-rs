@@ -3,12 +3,15 @@
 //!
 //! Engines and per-shape sources are initialized lazily outside the timed
 //! `keep_running` window so filtered runs do not construct unused datasets.
-//! `EnginePlan` isolates parsing and logical planning (including the store's
-//! `select`) from execution. `EngineExecutePreplanned` resets physical
-//! templates over preconstructed selected batches and drains DataFusion
-//! outputs without planning or API result collection. `EngineFocused*` covers
-//! adverse scaling shapes (see `benches/README.md`). All raw executions reset
-//! plan state before each run.
+//! `EngineInstantQuery` times full `instant_query` dispatch and `InstantResult`
+//! finalization across all four result arms. `EnginePlan` isolates parsing and
+//! logical planning (including the store's `select`) from execution, while
+//! `EngineExplain` formats prebuilt logical and physical plans without
+//! planning. `EngineExecutePreplanned` resets physical templates over
+//! preconstructed selected batches and drains DataFusion outputs without
+//! planning or API result collection. `EngineFocused*` covers adverse scaling
+//! shapes (see `benches/README.md`). All raw executions reset plan state
+//! before each run.
 //!
 //! Recommended CLI invocation:
 //! ```sh
@@ -25,7 +28,8 @@ use datafusion::physical_plan::execution_plan::reset_plan_states;
 use datafusion::physical_plan::{execute_stream, ExecutionPlan};
 use futures::StreamExt;
 use promql_engine::{
-    Engine, EngineOptions, MemorySeriesSource, RangeQuery, Series, SeriesIdEncoding, SeriesSource,
+    explain_physical_plan, explain_plan, Engine, EngineOptions, InstantResult, MemorySeriesSource,
+    RangeQuery, Series, SeriesIdEncoding, SeriesSource,
 };
 use promql_parser::ParserOptions;
 
@@ -728,13 +732,155 @@ fn register_focused<'a>(mut suite: Suite<'a>) -> Suite<'a> {
     suite
 }
 
+/// End-to-end `instant_query` coverage across all four `InstantResult` arms
+/// that `range_query` does not exercise directly: vector, raw matrix selector,
+/// scalar extraction, string literal, `absent` (hit and miss), and root
+/// instant sorts.
+fn register_instant_query<'a>(mut suite: Suite<'a>) -> Suite<'a> {
+    let idx = 1usize;
+    let shape = SHAPES[idx];
+    let at_ms = shape.end_ms();
+    for (kind, query) in [
+        ("vector_selector", "http_requests_total"),
+        ("matrix_5m", "http_requests_total[5m]"),
+        ("scalar_sum", "scalar(sum(http_requests_total))"),
+        ("string_literal", r#""promql-rs""#),
+        ("absent_hit", r#"absent(nonexistent_metric{job="api"})"#),
+        ("absent_miss", r#"absent(http_requests_total{code="200"})"#),
+        ("sort_desc", "sort_desc(http_requests_total)"),
+        (
+            "sort_by_label_desc",
+            r#"sort_by_label_desc(http_requests_total, "route", "pod")"#,
+        ),
+    ] {
+        let mut checked = false;
+        suite = suite.bench(
+            format!("EngineInstantQuery/kind={kind}/shape={}", shape.id()),
+            move |b| {
+                let engine = blocking_engine();
+                let source = shared_source(idx);
+                if !checked {
+                    match (
+                        kind,
+                        engine.instant_query(source.as_ref(), query, at_ms).unwrap(),
+                    ) {
+                        (
+                            "vector_selector" | "sort_desc" | "sort_by_label_desc",
+                            InstantResult::Vector(batches),
+                        ) => assert_eq!(points(&batches), shape.series),
+                        ("matrix_5m", InstantResult::Matrix(batches)) => {
+                            assert!(points(&batches) > shape.series);
+                        }
+                        ("scalar_sum", InstantResult::Scalar(v)) => {
+                            assert!(v.is_finite() && v > 0.0);
+                        }
+                        ("string_literal", InstantResult::String(s)) => {
+                            assert_eq!(s, "promql-rs");
+                        }
+                        ("absent_hit", InstantResult::Vector(batches)) => {
+                            assert_eq!(points(&batches), 1);
+                        }
+                        ("absent_miss", InstantResult::Vector(batches)) => {
+                            assert_eq!(points(&batches), 0);
+                        }
+                        (_, other) => panic!("unexpected result for {kind}: {other:?}"),
+                    }
+                    checked = true;
+                }
+                b.report_allocs();
+                while b.keep_running() {
+                    let res: InstantResult = engine
+                        .instant_query(source.as_ref(), black_box(query), at_ms)
+                        .unwrap();
+                    black_box(res);
+                }
+            },
+        );
+    }
+    suite
+}
+
+/// Logical and physical plan explain rendering (`explain_plan` and
+/// `explain_physical_plan`) on prebuilt plans so formatting and expression
+/// folding cost is isolated from planning.
+fn register_explain<'a>(mut suite: Suite<'a>) -> Suite<'a> {
+    let idx = 1usize;
+    let shape = SHAPES[idx];
+    let end = shape.end_ms();
+    let range = RangeQuery::new(end - HOUR_MS, end, STEP_MS);
+    for (qname, query) in [
+        ("rate_sum", "sum by (route) (rate(http_requests_total[5m]))"),
+        (
+            "group_left",
+            "http_requests_total / on(route) group_left() sum by (route) (http_requests_total)",
+        ),
+    ] {
+        let mut plan_opt = None;
+        let mut exec_opt = None;
+        suite = suite
+            .bench(
+                format!(
+                    "EngineExplain/level=logical/query={qname}/shape={}",
+                    shape.id()
+                ),
+                move |b| {
+                    let engine = async_engine();
+                    let rt = current_thread_rt();
+                    let plan = plan_opt.get_or_insert_with(|| {
+                        let source = shared_source(idx);
+                        let plan = rt
+                            .block_on(engine.plan_async(source.as_ref(), query, &range))
+                            .unwrap();
+                        assert!(explain_plan(&plan).contains("SeriesEval:"));
+                        plan
+                    });
+                    b.report_allocs();
+                    while b.keep_running() {
+                        black_box(explain_plan(black_box(plan)));
+                    }
+                },
+            )
+            .bench(
+                format!(
+                    "EngineExplain/level=physical/query={qname}/shape={}",
+                    shape.id()
+                ),
+                move |b| {
+                    let engine = async_engine();
+                    let rt = current_thread_rt();
+                    let exec = exec_opt.get_or_insert_with(|| {
+                        let source = shared_source(idx);
+                        let exec = rt
+                            .block_on(engine.prepare_async(source.as_ref(), query, &range))
+                            .unwrap()
+                            .physical_plan()
+                            .clone();
+                        let rendered = explain_physical_plan(exec.as_ref());
+                        assert!(
+                            rendered.contains("SeriesEvalExec:")
+                                && rendered.contains("SeriesSetExec:")
+                        );
+                        exec
+                    });
+                    b.report_allocs();
+                    while b.keep_running() {
+                        black_box(explain_physical_plan(black_box(exec.as_ref())));
+                    }
+                },
+            );
+    }
+    suite
+}
+
 fn main() {
     let mut suite = Suite::from_env("promql_engine/engine").with_alloc(&ALLOC);
     suite = register_query(suite);
+    suite = register_instant_query(suite);
     suite = register_linear_regression(suite);
     suite = register_elementwise(suite);
     suite = register_binary(suite);
     suite = register_plan(suite);
+    suite = register_explain(suite);
     suite = register_contiguous(suite);
     suite = register_execute_preplanned(suite);
     suite = register_focused(suite);
