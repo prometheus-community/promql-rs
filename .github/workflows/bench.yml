@@ -1,10 +1,9 @@
 name: Benchmarks
 
-# On demand for now. The `bencher` output format below is what
-# github-action-benchmark and Bencher ingest, so wiring a tracker later
-# adds a step to this job rather than replacing it; CodSpeed would add its
-# own `cargo codspeed` job instead. Shared runners are noisy, so read
-# single runs as order-of-magnitude, not as regressions.
+# On demand for now. Emits Go Benchmark Data Format (benchfmt) lines for
+# benchstat comparisons across commits or against upstream Go Prometheus.
+# Shared runners are noisy, so read single runs as order-of-magnitude, not as
+# regressions.
 on:
   workflow_dispatch:
 
@@ -41,12 +40,10 @@ jobs:
             ${{ runner.os }}-mbx-bench-
 
       - name: Run benchmarks
-        run: mise run bench -- -- --output-format bencher | tee bench.txt
+        run: mise run bench -- -- -benchtime 1s -count 6 -cpu 2 -benchmem | tee bench.txt
 
       - name: Upload results
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bench-results
-          path: |
-            bench.txt
-            target/criterion
+          path: bench.txt

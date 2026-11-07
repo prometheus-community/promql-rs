@@ -1,28 +1,22 @@
 //! Numerical-kernel microbenchmarks and isolated preplanned series evaluation.
 //!
-//! `series_eval/*` includes DataFusion stream creation, the real executor and
-//! Arrow output construction/draining and execution-state reset, but excludes
-//! source selection/planning. Other groups drive public kernels/accumulators
-//! directly. `aggregate/singleton_spans` isolates legal descending span growth;
-//! benches/README.md gives the bounded serial comparison and profile commands.
+//! `SeriesEval*` includes DataFusion stream creation, the real executor, Arrow
+//! output construction/draining, and execution-state reset, while excluding
+//! source selection and planning. Other groups drive public kernels and
+//! accumulators directly. `AggregateSingletonSpans` isolates legal descending
+//! span growth. Fixtures are deterministic and constructed lazily outside the
+//! timed `keep_running` window so filtered runs do not pay setup costs for
+//! non-matching cases.
 //!
-//! Every group is named `area/function` and parameterized by input size,
-//! so a tracker keys a stable history on ids like
-//! `series_eval/selector/plain/16000`. Names are chosen once: renaming a
-//! benchmark resets its history. Fixtures are deterministic and built
-//! outside the timed closure. To compare two states of the code:
-//!
+//! Recommended CLI invocation:
 //! ```sh
-//! cargo bench -p promql-engine --bench kernels -- --save-baseline before
-//! # change code
-//! cargo bench -p promql-engine --bench kernels -- --baseline before
+//! cargo bench -p promql-engine --bench kernels -- -bench '^Benchmark' -benchtime 1s -count 6 -cpu 2 -benchmem | tee ${bench}.txt
 //! ```
 
 use std::hint::black_box;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
 
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
+use benchfmt::{CountingAlloc, Suite};
 use datafusion::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, BooleanBufferBuilder, ListArray,
 };
@@ -45,10 +39,8 @@ use promql_engine::selector::STALE_NAN_BITS;
 use promql_engine::series::{self, Block, Series};
 use promql_engine::{Engine, MemorySeriesSource, Params, RangeQuery};
 
-#[path = "support/pprof.rs"]
-mod profiler;
-
-use profiler::PProfProfiler;
+#[global_allocator]
+static ALLOC: CountingAlloc = CountingAlloc::new();
 
 /// Scrape interval of every synthetic series.
 const SCRAPE_MS: i64 = 15_000;
@@ -63,6 +55,9 @@ const WHOLE: Block = Block {
     start_ms: i64::MIN,
     end_ms: i64::MAX,
 };
+
+/// Bytes per `(timestamp_ms: i64, value: f64)` sample pair for `MB/s` throughput.
+const SAMPLE_BYTES: u64 = 16;
 
 /// A counter scraped every `SCRAPE_MS`, rising by a value that varies
 /// per sample and resetting every 1000 samples, like a restarting pod.
@@ -164,96 +159,19 @@ fn labelled(k: usize, n: usize) -> Vec<Series> {
         .collect()
 }
 
-/// The elementwise kernels behind `Steps::add_run`: one slice of values
-/// folded into as many accumulator lanes. 240 lanes is an hour at 15s,
-/// 1440 a day at 60s.
-fn math_add_each(c: &mut Criterion) {
-    let mut g = c.benchmark_group("math/add_each");
-    for lanes in [240usize, 1440] {
-        let values: Vec<f64> = (0..lanes).map(|i| 1.0 + (i % 7) as f64).collect();
-        g.throughput(Throughput::Elements(lanes as u64));
-
-        let (mut sums, mut comps) = (vec![0.0; lanes], vec![0.0; lanes]);
-        g.bench_function(BenchmarkId::new("kahan", lanes), |b| {
-            b.iter(|| {
-                math::kahan_add_each(&mut sums, &mut comps, black_box(&values));
-                black_box(&sums);
-            })
-        });
-
-        let (mut acc, mut comps, mut counts) =
-            (vec![0.0; lanes], vec![0.0; lanes], vec![0.0; lanes]);
-        let mut incremental = BooleanBufferBuilder::new(lanes);
-        incremental.append_n(lanes, false);
-        g.bench_function(BenchmarkId::new("mean", lanes), |b| {
-            b.iter(|| {
-                math::mean_add_each(
-                    &mut acc,
-                    &mut comps,
-                    &mut counts,
-                    FlagLane::new(&mut incremental, 0, lanes),
-                    black_box(&values),
-                );
-                black_box(&acc);
-            })
-        });
-
-        let mut cur = vec![f64::NAN; lanes];
-        g.bench_function(BenchmarkId::new("max", lanes), |b| {
-            b.iter(|| {
-                math::max_add_each(&mut cur, black_box(&values));
-                black_box(&cur);
-            })
-        });
-
-        let (mut means, mut m2s, mut counts) =
-            (vec![0.0; lanes], vec![0.0; lanes], vec![0.0; lanes]);
-        g.bench_function(BenchmarkId::new("welford", lanes), |b| {
-            b.iter(|| {
-                math::welford_add_each(&mut means, &mut m2s, &mut counts, black_box(&values));
-                black_box(&means);
-            })
-        });
-    }
-    g.finish();
+fn runtime() -> &'static tokio::runtime::Runtime {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    })
 }
 
-/// The sequential reductions behind the `*_over_time` functions.
-fn math_reductions(c: &mut Criterion) {
-    let mut g = c.benchmark_group("math/reductions");
-    for n in LENGTHS {
-        let (_, vs) = counter(n);
-        g.throughput(Throughput::Elements(n as u64));
-        g.bench_function(BenchmarkId::new("kahan_sum", n), |b| {
-            b.iter(|| math::kahan_sum(black_box(&vs)).value())
-        });
-        g.bench_function(BenchmarkId::new("mean_of", n), |b| {
-            b.iter(|| math::mean_of(black_box(&vs)))
-        });
-        g.bench_function(BenchmarkId::new("variance_of", n), |b| {
-            b.iter(|| math::variance_of(black_box(&vs)))
-        });
-        // No slice-at-a-time welford reduction exists; the `stddev` and
-        // `stdvar` aggregations fold the accumulator a sample at a time, so
-        // the bench folds it too.
-        g.bench_function(BenchmarkId::new("welford_of", n), |b| {
-            b.iter(|| {
-                let mut w = Welford::default();
-                for v in black_box(&vs) {
-                    w.add(*v);
-                }
-                w.variance()
-            })
-        });
-    }
-    g.finish();
-}
-
-fn runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
+fn task_ctx() -> &'static Arc<TaskContext> {
+    static CTX: OnceLock<Arc<TaskContext>> = OnceLock::new();
+    CTX.get_or_init(|| Arc::new(TaskContext::default()))
 }
 
 /// The sole evaluator is reached through a preplanned public engine query;
@@ -282,14 +200,17 @@ fn selected_plan(
         None => format!("http_requests_total{modifier}"),
     };
     let source = MemorySeriesSource::try_new(rows).unwrap();
-    rt.block_on(Engine::new().prepare_async(
-        &source,
-        &query,
-        &RangeQuery::new(p.start_ms, p.end_ms, p.step_ms),
-    ))
-    .unwrap()
-    .physical_plan()
-    .clone()
+    let plan = rt
+        .block_on(Engine::new().prepare_async(
+            &source,
+            &query,
+            &RangeQuery::new(p.start_ms, p.end_ms, p.step_ms),
+        ))
+        .unwrap()
+        .physical_plan()
+        .clone();
+    assert_answers(rt, &plan, task_ctx());
+    plan
 }
 
 #[derive(Clone, Copy)]
@@ -330,132 +251,304 @@ fn single_counter(ts: Vec<i64>, vs: Vec<f64>) -> Vec<Series> {
     vec![Series::new(&[("__name__", "http_requests_total")], ts, vs).unwrap()]
 }
 
-/// One series walked across the grid by the real `SeriesEvalExec`.
-fn selector_eval_series(c: &mut Criterion) {
-    let rt = runtime();
-    let ctx = Arc::new(TaskContext::default());
-    let mut g = c.benchmark_group("series_eval/selector");
-    for n in LENGTHS {
-        let (ts, vs) = counter(n);
-        let stale = with_stale(&vs, 100);
-        let p = selector_params(n);
-        let pinned = Params {
-            at_ms: Some(p.end_ms),
-            ..p
-        };
-        g.throughput(Throughput::Elements(n as u64));
-        for (name, rows, p) in [
-            ("plain", single_counter(ts.clone(), vs.clone()), &p),
-            ("stale_every_100", single_counter(ts.clone(), stale), &p),
-            ("at_pinned", single_counter(ts, vs), &pinned),
-        ] {
-            let plan = selected_plan(&rt, None, p, rows);
-            assert_answers(&rt, &plan, &ctx);
-            g.bench_function(BenchmarkId::new(name, n), |b| {
-                b.iter(|| drain_plan(&rt, black_box(&plan), &ctx))
+/// The elementwise kernels behind `Steps::add_run`: one slice of values
+/// folded into as many accumulator lanes. 240 lanes is an hour at 15s,
+/// 1440 a day at 60s.
+fn register_math_add_each<'a>(mut suite: Suite<'a>) -> Suite<'a> {
+    for lanes in [240usize, 1440] {
+        let bytes = (lanes * size_of::<f64>()) as u64;
+
+        suite = suite
+            .bench(format!("MathAddEach/op=kahan/lanes={lanes}"), move |b| {
+                let values: Vec<f64> = (0..lanes).map(|i| 1.0 + (i % 7) as f64).collect();
+                let (mut sums, mut comps) = (vec![0.0; lanes], vec![0.0; lanes]);
+                b.set_bytes(bytes);
+                b.report_allocs();
+                while b.keep_running() {
+                    math::kahan_add_each(&mut sums, &mut comps, black_box(&values));
+                    black_box(&sums);
+                }
+            })
+            .bench(format!("MathAddEach/op=mean/lanes={lanes}"), move |b| {
+                let values: Vec<f64> = (0..lanes).map(|i| 1.0 + (i % 7) as f64).collect();
+                let (mut acc, mut comps, mut counts) =
+                    (vec![0.0; lanes], vec![0.0; lanes], vec![0.0; lanes]);
+                let mut incremental = BooleanBufferBuilder::new(lanes);
+                incremental.append_n(lanes, false);
+                b.set_bytes(bytes);
+                b.report_allocs();
+                while b.keep_running() {
+                    math::mean_add_each(
+                        &mut acc,
+                        &mut comps,
+                        &mut counts,
+                        FlagLane::new(&mut incremental, 0, lanes),
+                        black_box(&values),
+                    );
+                    black_box(&acc);
+                }
+            })
+            .bench(format!("MathAddEach/op=max/lanes={lanes}"), move |b| {
+                let values: Vec<f64> = (0..lanes).map(|i| 1.0 + (i % 7) as f64).collect();
+                let mut cur = vec![f64::NAN; lanes];
+                b.set_bytes(bytes);
+                b.report_allocs();
+                while b.keep_running() {
+                    math::max_add_each(&mut cur, black_box(&values));
+                    black_box(&cur);
+                }
+            })
+            .bench(format!("MathAddEach/op=welford/lanes={lanes}"), move |b| {
+                let values: Vec<f64> = (0..lanes).map(|i| 1.0 + (i % 7) as f64).collect();
+                let (mut means, mut m2s, mut counts) =
+                    (vec![0.0; lanes], vec![0.0; lanes], vec![0.0; lanes]);
+                b.set_bytes(bytes);
+                b.report_allocs();
+                while b.keep_running() {
+                    math::welford_add_each(&mut means, &mut m2s, &mut counts, black_box(&values));
+                    black_box(&means);
+                }
             });
+    }
+    suite
+}
+
+/// The sequential reductions behind the `*_over_time` functions.
+fn register_math_reductions<'a>(mut suite: Suite<'a>) -> Suite<'a> {
+    for n in LENGTHS {
+        let bytes = (n * size_of::<f64>()) as u64;
+        suite = suite
+            .bench(
+                format!("MathReductions/op=kahan_sum/samples={n}"),
+                move |b| {
+                    let mut vs_opt = None;
+                    let vs = vs_opt.get_or_insert_with(|| counter(n).1);
+                    b.set_bytes(bytes);
+                    b.report_allocs();
+                    while b.keep_running() {
+                        black_box(math::kahan_sum(black_box(vs)).value());
+                    }
+                },
+            )
+            .bench(format!("MathReductions/op=mean_of/samples={n}"), move |b| {
+                let mut vs_opt = None;
+                let vs = vs_opt.get_or_insert_with(|| counter(n).1);
+                b.set_bytes(bytes);
+                b.report_allocs();
+                while b.keep_running() {
+                    black_box(math::mean_of(black_box(vs)));
+                }
+            })
+            .bench(
+                format!("MathReductions/op=variance_of/samples={n}"),
+                move |b| {
+                    let mut vs_opt = None;
+                    let vs = vs_opt.get_or_insert_with(|| counter(n).1);
+                    b.set_bytes(bytes);
+                    b.report_allocs();
+                    while b.keep_running() {
+                        black_box(math::variance_of(black_box(vs)));
+                    }
+                },
+            )
+            // No slice-at-a-time welford reduction exists; the `stddev` and
+            // `stdvar` aggregations fold the accumulator a sample at a time, so
+            // the bench folds it too.
+            .bench(
+                format!("MathReductions/op=welford_of/samples={n}"),
+                move |b| {
+                    let mut vs_opt = None;
+                    let vs = vs_opt.get_or_insert_with(|| counter(n).1);
+                    b.set_bytes(bytes);
+                    b.report_allocs();
+                    while b.keep_running() {
+                        let mut w = Welford::default();
+                        for v in black_box(vs.as_slice()) {
+                            w.add(*v);
+                        }
+                        black_box(w.variance());
+                    }
+                },
+            );
+    }
+    suite
+}
+
+/// One series walked across the grid by the real `SeriesEvalExec`.
+fn register_selector_eval_series<'a>(mut suite: Suite<'a>) -> Suite<'a> {
+    #[derive(Clone, Copy)]
+    enum SelectorCase {
+        Plain,
+        StaleEvery100,
+        AtPinned,
+    }
+
+    for n in LENGTHS {
+        let bytes = n as u64 * SAMPLE_BYTES;
+        for (name, case) in [
+            ("plain", SelectorCase::Plain),
+            ("stale_every_100", SelectorCase::StaleEvery100),
+            ("at_pinned", SelectorCase::AtPinned),
+        ] {
+            suite = suite.bench(
+                format!("SeriesEvalSelector/case={name}/samples={n}"),
+                move |b| {
+                    let rt = runtime();
+                    let ctx = task_ctx();
+                    let mut plan_opt = None;
+                    let plan = plan_opt.get_or_insert_with(|| {
+                        let (ts, vs) = counter(n);
+                        let p = selector_params(n);
+                        match case {
+                            SelectorCase::Plain => {
+                                selected_plan(rt, None, &p, single_counter(ts, vs))
+                            }
+                            SelectorCase::StaleEvery100 => {
+                                let stale = with_stale(&vs, 100);
+                                selected_plan(rt, None, &p, single_counter(ts, stale))
+                            }
+                            SelectorCase::AtPinned => {
+                                let pinned = Params {
+                                    at_ms: Some(p.end_ms),
+                                    ..p
+                                };
+                                selected_plan(rt, None, &pinned, single_counter(ts, vs))
+                            }
+                        }
+                    });
+                    b.set_bytes(bytes);
+                    b.report_allocs();
+                    while b.keep_running() {
+                        drain_plan(rt, black_box(plan), ctx);
+                    }
+                },
+            );
         }
     }
-    g.finish();
+    suite
 }
 
 /// A thousand identities; output construction is timed, selection is not.
-fn selector_apply(c: &mut Criterion) {
+fn register_selector_apply<'a>(suite: Suite<'a>) -> Suite<'a> {
     let (k, n) = (1_000usize, 1_000usize);
-    let rt = runtime();
-    let ctx = Arc::new(TaskContext::default());
-    let plan = selected_plan(&rt, None, &selector_params(n), labelled(k, n));
-    assert_answers(&rt, &plan, &ctx);
-    let mut g = c.benchmark_group("series_eval/selector_apply");
-    g.throughput(Throughput::Elements((k * n) as u64));
-    g.bench_function(BenchmarkId::from_parameter(format!("{k}x{n}")), |b| {
-        b.iter(|| drain_plan(&rt, black_box(&plan), &ctx))
-    });
-    g.finish();
+    let bytes = (k * n) as u64 * SAMPLE_BYTES;
+    suite.bench(format!("SeriesEvalSelectorApply/shape={k}x{n}"), move |b| {
+        let rt = runtime();
+        let ctx = task_ctx();
+        let mut plan_opt = None;
+        let plan = plan_opt
+            .get_or_insert_with(|| selected_plan(rt, None, &selector_params(n), labelled(k, n)));
+        b.set_bytes(bytes);
+        b.report_allocs();
+        while b.keep_running() {
+            drain_plan(rt, black_box(plan), ctx);
+        }
+    })
 }
 
 /// Buffer and sweep internals stay private; this times their production driver.
-fn range_function(c: &mut Criterion) {
-    let rt = runtime();
-    let ctx = Arc::new(TaskContext::default());
-    let mut g = c.benchmark_group("series_eval/range");
+fn register_range_function<'a>(mut suite: Suite<'a>) -> Suite<'a> {
     for n in LENGTHS {
-        let (ts, vs) = counter(n);
-        let stale = with_stale(&vs, 100);
-        let p = range_params(n);
-        g.throughput(Throughput::Elements(n as u64));
-        for (name, func, values) in [
-            ("rate", Func::Rate, &vs),
-            ("increase", Func::Increase, &vs),
-            ("count_over_time", Func::CountOverTime, &vs),
-            ("max_over_time", Func::MaxOverTime, &vs),
-            ("stddev_over_time", Func::StddevOverTime, &vs),
-            ("deriv", Func::Deriv, &vs),
-            ("rate_stale_every_100", Func::Rate, &stale),
+        let bytes = n as u64 * SAMPLE_BYTES;
+        for (name, func, stale) in [
+            ("rate", Func::Rate, false),
+            ("increase", Func::Increase, false),
+            ("count_over_time", Func::CountOverTime, false),
+            ("max_over_time", Func::MaxOverTime, false),
+            ("stddev_over_time", Func::StddevOverTime, false),
+            ("deriv", Func::Deriv, false),
+            ("rate_stale_every_100", Func::Rate, true),
         ] {
-            let plan = selected_plan(
-                &rt,
-                Some(BenchRangeFunc::Func(func)),
-                &p,
-                single_counter(ts.clone(), values.clone()),
+            suite = suite.bench(
+                format!("SeriesEvalRange/func={name}/samples={n}"),
+                move |b| {
+                    let rt = runtime();
+                    let ctx = task_ctx();
+                    let mut plan_opt = None;
+                    let plan = plan_opt.get_or_insert_with(|| {
+                        let (ts, vs) = counter(n);
+                        let values = if stale { with_stale(&vs, 100) } else { vs };
+                        selected_plan(
+                            rt,
+                            Some(BenchRangeFunc::Func(func)),
+                            &range_params(n),
+                            single_counter(ts, values),
+                        )
+                    });
+                    b.set_bytes(bytes);
+                    b.report_allocs();
+                    while b.keep_running() {
+                        drain_plan(rt, black_box(plan), ctx);
+                    }
+                },
             );
-            assert_answers(&rt, &plan, &ctx);
-            g.bench_function(BenchmarkId::new(name, n), |b| {
-                b.iter(|| drain_plan(&rt, black_box(&plan), &ctx))
-            });
         }
     }
-    g.finish();
+    suite
 }
 
 /// The pinned window is reused, while `predict_linear` refits at every
 /// evaluation timestamp because Prometheus anchors the intercept there.
-fn predict_linear_series(c: &mut Criterion) {
-    let rt = runtime();
-    let ctx = Arc::new(TaskContext::default());
-    let mut g = c.benchmark_group("series_eval/predict_linear");
+fn register_predict_linear_series<'a>(mut suite: Suite<'a>) -> Suite<'a> {
     for n in LENGTHS {
-        let (ts, vs) = counter(n);
-        let p = range_params(n);
-        let pinned = Params {
-            at_ms: Some(p.end_ms),
-            ..p
-        };
-        g.throughput(Throughput::Elements(n as u64));
-        for (name, params) in [("moving", &p), ("at_pinned", &pinned)] {
-            let plan = selected_plan(
-                &rt,
-                Some(BenchRangeFunc::PredictLinear),
-                params,
-                single_counter(ts.clone(), vs.clone()),
+        let bytes = n as u64 * SAMPLE_BYTES;
+        for (name, pin) in [("moving", false), ("at_pinned", true)] {
+            suite = suite.bench(
+                format!("SeriesEvalPredictLinear/mode={name}/samples={n}"),
+                move |b| {
+                    let rt = runtime();
+                    let ctx = task_ctx();
+                    let mut plan_opt = None;
+                    let plan = plan_opt.get_or_insert_with(|| {
+                        let (ts, vs) = counter(n);
+                        let mut p = range_params(n);
+                        if pin {
+                            p.at_ms = Some(p.end_ms);
+                        }
+                        selected_plan(
+                            rt,
+                            Some(BenchRangeFunc::PredictLinear),
+                            &p,
+                            single_counter(ts, vs),
+                        )
+                    });
+                    b.set_bytes(bytes);
+                    b.report_allocs();
+                    while b.keep_running() {
+                        drain_plan(rt, black_box(plan), ctx);
+                    }
+                },
             );
-            assert_answers(&rt, &plan, &ctx);
-            g.bench_function(BenchmarkId::new(name, n), |b| {
-                b.iter(|| drain_plan(&rt, black_box(&plan), &ctx))
-            });
         }
     }
-    g.finish();
+    suite
 }
 
 /// `rate` over a thousand identities through the sole executor.
-fn range_apply(c: &mut Criterion) {
+fn register_range_apply<'a>(suite: Suite<'a>) -> Suite<'a> {
     let (k, n) = (1_000usize, 1_000usize);
-    let rt = runtime();
-    let ctx = Arc::new(TaskContext::default());
-    let plan = selected_plan(
-        &rt,
-        Some(BenchRangeFunc::Func(Func::Rate)),
-        &range_params(n),
-        labelled(k, n),
-    );
-    assert_answers(&rt, &plan, &ctx);
-    let mut g = c.benchmark_group("series_eval/range_apply");
-    g.throughput(Throughput::Elements((k * n) as u64));
-    g.bench_function(BenchmarkId::new("rate", format!("{k}x{n}")), |b| {
-        b.iter(|| drain_plan(&rt, black_box(&plan), &ctx))
-    });
-    g.finish();
+    let bytes = (k * n) as u64 * SAMPLE_BYTES;
+    suite.bench(
+        format!("SeriesEvalRangeApply/func=rate/shape={k}x{n}"),
+        move |b| {
+            let rt = runtime();
+            let ctx = task_ctx();
+            let mut plan_opt = None;
+            let plan = plan_opt.get_or_insert_with(|| {
+                selected_plan(
+                    rt,
+                    Some(BenchRangeFunc::Func(Func::Rate)),
+                    &range_params(n),
+                    labelled(k, n),
+                )
+            });
+            b.set_bytes(bytes);
+            b.report_allocs();
+            while b.keep_running() {
+                drain_plan(rt, black_box(plan), ctx);
+            }
+        },
+    )
 }
 
 /// One accumulator filled with a whole `samples` column, all of it in
@@ -469,114 +562,145 @@ fn filled(op: Op, column: &ArrayRef, groups: &[usize], end_ms: i64, total: usize
 
 /// Folding `k` aligned series into one accumulator, the partial phase of
 /// a cross-series aggregation. The accumulator's allocation is included.
-fn aggregate_add_series(c: &mut Criterion) {
+fn register_aggregate_add_series<'a>(mut suite: Suite<'a>) -> Suite<'a> {
     let steps = 1440usize;
     let end_ms = (steps as i64 - 1) * STEP_MS;
-    let mut g = c.benchmark_group("aggregate/add_series");
     for k in [100usize, 1_000] {
-        let column = samples_of(&aligned(k, steps));
-        let one = vec![0usize; k];
-        g.throughput(Throughput::Elements((k * steps) as u64));
+        let bytes = (k * steps) as u64 * SAMPLE_BYTES;
         for (name, op) in [
             ("sum", Op::Sum),
             ("avg", Op::Avg),
             ("stddev", Op::Stddev),
             ("max", Op::Max),
         ] {
-            g.bench_function(BenchmarkId::new(name, k), |b| {
-                b.iter(|| filled(op, black_box(&column), &one, end_ms, 1))
-            });
+            suite = suite.bench(
+                format!("AggregateAddSeries/op={name}/series={k}"),
+                move |b| {
+                    let mut fix_opt = None;
+                    let (column, one) = fix_opt
+                        .get_or_insert_with(|| (samples_of(&aligned(k, steps)), vec![0usize; k]));
+                    b.set_bytes(bytes);
+                    b.report_allocs();
+                    while b.keep_running() {
+                        black_box(filled(op, black_box(column), one, end_ms, 1));
+                    }
+                },
+            );
         }
     }
-    g.finish();
+    suite
 }
 
 /// Singleton contributions in legal between-ID order. This isolates lane
 /// front growth in Prometheus `aggregation` (83962c35) from source/planner
 /// work. Ascending is the control; descending must not repeatedly move the
 /// entire accumulated span. Values and update order are never pre-reduced.
-fn aggregate_singleton_spans(c: &mut Criterion) {
-    let mut g = c.benchmark_group("aggregate/singleton_spans");
+fn register_aggregate_singleton_spans<'a>(mut suite: Suite<'a>) -> Suite<'a> {
     for steps in [1024usize, 8192] {
         let end_ms = (steps as i64 - 1) * STEP_MS;
-        let groups = vec![0; steps];
-        g.throughput(Throughput::Elements(steps as u64));
+        let bytes = steps as u64 * SAMPLE_BYTES;
         for descending in [false, true] {
-            let rows: Vec<_> = (0..steps)
-                .map(|i| {
-                    let step = if descending { steps - 1 - i } else { i };
-                    (vec![step as i64 * STEP_MS], vec![1.0])
-                })
-                .collect();
-            let column = samples_of(&rows);
-            let mut probe = filled(Op::Sum, &column, &groups, end_ms, 1);
-            let result = probe.evaluate(EmitTo::All).unwrap();
-            let list = result.as_list::<i32>();
-            assert_eq!(list.len(), 1);
-            assert_eq!(list.value(0).len(), steps);
             let name = if descending {
                 "descending"
             } else {
                 "ascending"
             };
-            g.bench_function(BenchmarkId::new(name, steps), |b| {
-                b.iter(|| filled(Op::Sum, black_box(&column), &groups, end_ms, 1))
-            });
+            suite = suite.bench(
+                format!("AggregateSingletonSpans/order={name}/steps={steps}"),
+                move |b| {
+                    let mut fix_opt = None;
+                    let (column, groups) = fix_opt.get_or_insert_with(|| {
+                        let groups = vec![0; steps];
+                        let rows: Vec<_> = (0..steps)
+                            .map(|i| {
+                                let step = if descending { steps - 1 - i } else { i };
+                                (vec![step as i64 * STEP_MS], vec![1.0])
+                            })
+                            .collect();
+                        let column = samples_of(&rows);
+                        let mut probe = filled(Op::Sum, &column, &groups, end_ms, 1);
+                        let result = probe.evaluate(EmitTo::All).unwrap();
+                        let list = result.as_list::<i32>();
+                        assert_eq!(list.len(), 1);
+                        assert_eq!(list.value(0).len(), steps);
+                        (column, groups)
+                    });
+                    b.set_bytes(bytes);
+                    b.report_allocs();
+                    while b.keep_running() {
+                        black_box(filled(Op::Sum, black_box(column), groups, end_ms, 1));
+                    }
+                },
+            );
         }
     }
-    g.finish();
+    suite
 }
 
-/// The shuffle between the two aggregation phases: serializing one
-/// accumulator's state and merging it into another. Emitting the state
-/// consumes the accumulator's lanes, so each sample refills one outside
-/// the timed closure.
-fn aggregate_state_merge(c: &mut Criterion) {
+/// The shuffle between the two aggregation phases: emitting partial state
+/// from a filled accumulator (`phase=state`, comparable against
+/// `AggregateAddSeries/op=.../series=100` because `state()` consumes the
+/// accumulator's lanes) and merging that state into a final accumulator
+/// (`phase=merge_batch`).
+fn register_aggregate_state_merge<'a>(mut suite: Suite<'a>) -> Suite<'a> {
     let steps = 1440usize;
     let end_ms = (steps as i64 - 1) * STEP_MS;
-    let column = samples_of(&aligned(100, steps));
-    let one = vec![0usize; 100];
-    let mut g = c.benchmark_group("aggregate/state_merge");
-    g.throughput(Throughput::Elements(steps as u64));
+    let bytes = steps as u64 * SAMPLE_BYTES;
     for (name, op) in [("sum", Op::Sum), ("avg", Op::Avg), ("stddev", Op::Stddev)] {
-        g.bench_function(BenchmarkId::new(format!("{name}/state"), steps), |b| {
-            b.iter_batched(
-                || filled(op, &column, &one, end_ms, 1),
-                |mut acc| acc.state(EmitTo::All).unwrap(),
-                BatchSize::SmallInput,
+        suite = suite
+            .bench(
+                format!("AggregateStateMerge/op={name}/phase=state/steps={steps}"),
+                move |b| {
+                    let mut fix_opt = None;
+                    let (column, one) = fix_opt.get_or_insert_with(|| {
+                        (samples_of(&aligned(100, steps)), vec![0usize; 100])
+                    });
+                    b.set_bytes(bytes);
+                    b.report_allocs();
+                    while b.keep_running() {
+                        let mut acc = filled(op, black_box(column), one, end_ms, 1);
+                        black_box(acc.state(EmitTo::All).unwrap());
+                    }
+                },
             )
-        });
-        let state: ArrayRef = filled(op, &column, &one, end_ms, 1)
-            .state(EmitTo::All)
-            .unwrap()
-            .remove(0);
-        g.bench_function(
-            BenchmarkId::new(format!("{name}/merge_batch"), steps),
-            |b| {
-                b.iter(|| {
-                    let mut acc = Grouped::new(op, 0, end_ms, STEP_MS).unwrap();
-                    acc.merge_batch(std::slice::from_ref(black_box(&state)), &[0], 1)
-                        .unwrap();
-                    acc.evaluate(EmitTo::All).unwrap()
-                })
-            },
-        );
+            .bench(
+                format!("AggregateStateMerge/op={name}/phase=merge_batch/steps={steps}"),
+                move |b| {
+                    let mut state_opt = None;
+                    let state = state_opt.get_or_insert_with(|| {
+                        let column = samples_of(&aligned(100, steps));
+                        let one = vec![0usize; 100];
+                        filled(op, &column, &one, end_ms, 1)
+                            .state(EmitTo::All)
+                            .unwrap()
+                            .remove(0)
+                    });
+                    b.set_bytes(bytes);
+                    b.report_allocs();
+                    while b.keep_running() {
+                        let mut acc = Grouped::new(op, 0, end_ms, STEP_MS).unwrap();
+                        acc.merge_batch(std::slice::from_ref(black_box(state)), &[0], 1)
+                            .unwrap();
+                        black_box(acc.evaluate(EmitTo::All).unwrap());
+                    }
+                },
+            );
     }
-    g.finish();
+    suite
 }
 
-/// The plan's `promql_binary` aggregate over match groups: a fresh accumulator, one left and one right row, then
-/// `evaluate`. Accumulator construction is inside the timed closure because
-/// the plan builds one per match group too, and at 1 group against 1000 the
-/// pair separates the per-step lane work from that fixed cost. Fixtures are
-/// sliced out of one encoded batch beforehand, so only the kernel is timed.
-/// Ids are `binary/pairing/<op>/<groups>x<steps>`.
-fn binary_pairing(c: &mut Criterion) {
-    let steps = 1440usize;
-    let step_ms = 60_000i64;
-    let end_ms = (steps as i64 - 1) * step_ms;
-    let mut g = c.benchmark_group("binary/pairing");
-    for groups in [1usize, 1_000] {
+struct BinaryFixture {
+    pairs: Vec<[ArrayRef; 3]>,
+    schema: Schema,
+    exprs: Vec<Arc<dyn PhysicalExpr>>,
+    fields: Vec<FieldRef>,
+    return_field: FieldRef,
+    udaf: datafusion::logical_expr::AggregateUDF,
+}
+
+impl BinaryFixture {
+    fn new(groups: usize, steps: usize, step_ms: i64, op: BinOp, return_bool: bool) -> Self {
+        let end_ms = (steps as i64 - 1) * step_ms;
         // Left and right of group `i` are rows `2i` and `2i + 1`. Left
         // ranges over 1..=100 and right sits at 50.5, so a `>` keeps about
         // half the steps and never ties.
@@ -584,8 +708,6 @@ fn binary_pairing(c: &mut Criterion) {
             .map(|row| {
                 let (i, right) = (row / 2, row % 2 == 1);
                 let id = format!("g-{i}");
-                // The two sides of a batch cannot share a label set, so
-                // they differ by name like `a / b` does.
                 let name = if right { "rhs" } else { "lhs" };
                 let labels = [("__name__", name), ("group", id.as_str())];
                 let ts = (0..steps).map(|j| j as i64 * step_ms).collect();
@@ -620,120 +742,159 @@ fn binary_pairing(c: &mut Criterion) {
             Field::new("side", DataType::Boolean, false),
             Field::new(series::LABELS, labels.data_type().clone(), false),
         ]);
-        g.throughput(Throughput::Elements((groups * steps) as u64));
+        let mut exprs: Vec<Arc<dyn PhysicalExpr>> = vec![
+            Arc::new(Column::new(series::SAMPLES, 0)),
+            Arc::new(Column::new("side", 1)),
+            Arc::new(Column::new(series::LABELS, 2)),
+        ];
+        exprs.extend(
+            [
+                ScalarValue::from(binary::literal(op, return_bool)),
+                ScalarValue::from(""),
+                ScalarValue::Int64(Some(0)),
+                ScalarValue::Int64(Some(end_ms)),
+                ScalarValue::Int64(Some(step_ms)),
+            ]
+            .into_iter()
+            .map(|v| Arc::new(Literal::new(v)) as Arc<dyn PhysicalExpr>),
+        );
+        let fields: Vec<FieldRef> = exprs
+            .iter()
+            .map(|e| e.return_field(&schema).unwrap())
+            .collect();
+        let udaf = binary::udaf();
+        let return_field = Arc::new(Field::new("out", binary::output_type(&names), false));
+
+        // Verify the grid literals produce non-empty output before timing.
+        let args = AccumulatorArgs {
+            return_field: Arc::clone(&return_field),
+            schema: &schema,
+            ignore_nulls: false,
+            order_bys: &[],
+            is_reversed: false,
+            name: udaf.name(),
+            is_distinct: false,
+            exprs: &exprs,
+            expr_fields: &fields,
+        };
+        let mut probe = udaf.accumulator(args).unwrap();
+        probe.update_batch(&pairs[0]).unwrap();
+        let ScalarValue::List(out) = probe.evaluate().unwrap() else {
+            panic!("a list of output series")
+        };
+        assert!(!out.value(0).is_empty());
+
+        Self {
+            pairs,
+            schema,
+            exprs,
+            fields,
+            return_field,
+            udaf,
+        }
+    }
+
+    fn run(&self) {
+        let args = AccumulatorArgs {
+            return_field: Arc::clone(&self.return_field),
+            schema: &self.schema,
+            ignore_nulls: false,
+            order_bys: &[],
+            is_reversed: false,
+            name: self.udaf.name(),
+            is_distinct: false,
+            exprs: &self.exprs,
+            expr_fields: &self.fields,
+        };
+        for pair in &self.pairs {
+            let mut acc = self.udaf.accumulator(args.clone()).unwrap();
+            acc.update_batch(black_box(pair)).unwrap();
+            black_box(acc.evaluate().unwrap());
+        }
+    }
+}
+
+/// The plan's `promql_binary` aggregate over match groups: a fresh accumulator,
+/// one left and one right row, then `evaluate`. Accumulator construction is
+/// inside the timed closure because the plan builds one per match group too.
+fn register_binary_pairing<'a>(mut suite: Suite<'a>) -> Suite<'a> {
+    let steps = 1440usize;
+    let step_ms = 60_000i64;
+    for groups in [1usize, 1_000] {
+        let bytes = (groups * steps) as u64 * SAMPLE_BYTES;
         for (name, op, return_bool) in [
             ("add", BinOp::Add, false),
             ("div", BinOp::Div, false),
             ("gtr", BinOp::Gtr, false),
             ("gtr_bool", BinOp::Gtr, true),
         ] {
-            let mut exprs: Vec<Arc<dyn PhysicalExpr>> = vec![
-                Arc::new(Column::new(series::SAMPLES, 0)),
-                Arc::new(Column::new("side", 1)),
-                Arc::new(Column::new(series::LABELS, 2)),
-            ];
-            exprs.extend(
-                [
-                    ScalarValue::from(binary::literal(op, return_bool)),
-                    ScalarValue::from(""),
-                    ScalarValue::Int64(Some(0)),
-                    ScalarValue::Int64(Some(end_ms)),
-                    ScalarValue::Int64(Some(step_ms)),
-                ]
-                .into_iter()
-                .map(|v| Arc::new(Literal::new(v)) as Arc<dyn PhysicalExpr>),
-            );
-            let fields: Vec<FieldRef> = exprs
-                .iter()
-                .map(|e| e.return_field(&schema).unwrap())
-                .collect();
-            let udaf = binary::udaf();
-            let args = AccumulatorArgs {
-                return_field: Arc::new(Field::new("out", binary::output_type(&names), false)),
-                schema: &schema,
-                ignore_nulls: false,
-                order_bys: &[],
-                is_reversed: false,
-                name: udaf.name(),
-                is_distinct: false,
-                exprs: &exprs,
-                expr_fields: &fields,
-            };
-            // A grid the literals got wrong pairs nothing, and the bench
-            // would time an empty walk.
-            let mut probe = udaf.accumulator(args.clone()).unwrap();
-            probe.update_batch(&pairs[0]).unwrap();
-            let ScalarValue::List(out) = probe.evaluate().unwrap() else {
-                panic!("a list of output series")
-            };
-            assert!(!out.value(0).is_empty());
-            g.bench_function(BenchmarkId::new(name, format!("{groups}x{steps}")), |b| {
-                b.iter(|| {
-                    for pair in &pairs {
-                        let mut acc = udaf.accumulator(args.clone()).unwrap();
-                        acc.update_batch(black_box(pair)).unwrap();
-                        black_box(acc.evaluate().unwrap());
+            suite = suite.bench(
+                format!("BinaryPairing/op={name}/shape={groups}x{steps}"),
+                move |b| {
+                    let mut fix_opt = None;
+                    let fix = fix_opt.get_or_insert_with(|| {
+                        BinaryFixture::new(groups, steps, step_ms, op, return_bool)
+                    });
+                    b.set_bytes(bytes);
+                    b.report_allocs();
+                    while b.keep_running() {
+                        fix.run();
                     }
-                })
-            });
+                },
+            );
         }
     }
-    g.finish();
+    suite
 }
 
 /// `elementwise::apply` under a binary operator's bound, the vector-scalar
 /// path. The sawtooth values straddle 100, so `> 100` keeps about half and
 /// the filtered path rebuilds row boundaries for a realistic fraction,
-/// where `* 2` leaves them alone. Ids are
-/// `elementwise/binary/<op>/<rows>x<samples>`.
-fn elementwise_binary(c: &mut Criterion) {
+/// where `* 2` leaves them alone.
+fn register_elementwise_binary<'a>(mut suite: Suite<'a>) -> Suite<'a> {
     let (rows, samples) = (1_000usize, 1_440usize);
-    let all: Vec<(Vec<i64>, Vec<f64>)> = (0..rows)
-        .map(|i| {
-            let ts = (0..samples).map(|j| j as i64 * 60_000).collect();
-            let vs = (0..samples).map(|j| ((i * 7 + j) % 200) as f64).collect();
-            (ts, vs)
-        })
-        .collect();
-    let column = samples_of(&all);
-    let list: &ListArray = column.as_list::<i32>();
-    let mut g = c.benchmark_group("elementwise/binary");
-    g.throughput(Throughput::Elements((rows * samples) as u64));
+    let bytes = (rows * samples) as u64 * SAMPLE_BYTES;
     for (name, spelling, scalar) in [
         ("mul", "*", 2.0),
         ("gtr", ">", 100.0),
         ("gtr_bool", "> bool", 100.0),
     ] {
-        let bound = elementwise::Func::parse(spelling)
-            .unwrap()
-            .bind(Some(scalar), None);
-        g.bench_function(BenchmarkId::new(name, format!("{rows}x{samples}")), |b| {
-            b.iter(|| elementwise::apply(black_box(list), bound))
-        });
+        suite = suite.bench(
+            format!("ElementwiseBinary/op={name}/shape={rows}x{samples}"),
+            move |b| {
+                let mut col_opt = None;
+                let column = col_opt.get_or_insert_with(|| {
+                    let all: Vec<(Vec<i64>, Vec<f64>)> = (0..rows)
+                        .map(|i| {
+                            let ts = (0..samples).map(|j| j as i64 * 60_000).collect();
+                            let vs = (0..samples).map(|j| ((i * 7 + j) % 200) as f64).collect();
+                            (ts, vs)
+                        })
+                        .collect();
+                    samples_of(&all)
+                });
+                let list: &ListArray = column.as_list::<i32>();
+                let bound = elementwise::Func::parse(spelling)
+                    .unwrap()
+                    .bind(Some(scalar), None);
+                b.set_bytes(bytes);
+                b.report_allocs();
+                while b.keep_running() {
+                    black_box(elementwise::apply(black_box(list), bound).unwrap());
+                }
+            },
+        );
     }
-    g.finish();
+    suite
 }
 
 /// `elementwise::apply` under a date extractor, the per-sample map path.
 /// The values are Unix timestamps a minute apart from early 2024, what
 /// `hour(timestamp(x))` hands the extractor, so the calendar arithmetic
 /// runs on the dates a real query reaches rather than on small integers.
-/// Ids are `elementwise/date/<function>/<rows>x<samples>`.
-fn elementwise_date(c: &mut Criterion) {
+fn register_elementwise_date<'a>(mut suite: Suite<'a>) -> Suite<'a> {
     let (rows, samples) = (1_000usize, 1_440usize);
-    let all: Vec<(Vec<i64>, Vec<f64>)> = (0..rows)
-        .map(|i| {
-            let ts = (0..samples).map(|j| j as i64 * 60_000).collect();
-            let vs = (0..samples)
-                .map(|j| 1_704_067_200.0 + (i * 86_400 + j * 60) as f64)
-                .collect();
-            (ts, vs)
-        })
-        .collect();
-    let column = samples_of(&all);
-    let list: &ListArray = column.as_list::<i32>();
-    let mut g = c.benchmark_group("elementwise/date");
-    g.throughput(Throughput::Elements((rows * samples) as u64));
+    let bytes = (rows * samples) as u64 * SAMPLE_BYTES;
     for name in [
         "day_of_month",
         "day_of_week",
@@ -744,57 +905,98 @@ fn elementwise_date(c: &mut Criterion) {
         "month",
         "year",
     ] {
-        let bound = elementwise::Func::parse(name).unwrap().bind(None, None);
-        g.bench_function(BenchmarkId::new(name, format!("{rows}x{samples}")), |b| {
-            b.iter(|| elementwise::apply(black_box(list), bound))
-        });
+        suite = suite.bench(
+            format!("ElementwiseDate/func={name}/shape={rows}x{samples}"),
+            move |b| {
+                let mut col_opt = None;
+                let column = col_opt.get_or_insert_with(|| {
+                    let all: Vec<(Vec<i64>, Vec<f64>)> = (0..rows)
+                        .map(|i| {
+                            let ts = (0..samples).map(|j| j as i64 * 60_000).collect();
+                            let vs = (0..samples)
+                                .map(|j| 1_704_067_200.0 + (i * 86_400 + j * 60) as f64)
+                                .collect();
+                            (ts, vs)
+                        })
+                        .collect();
+                    samples_of(&all)
+                });
+                let list: &ListArray = column.as_list::<i32>();
+                let bound = elementwise::Func::parse(name).unwrap().bind(None, None);
+                b.set_bytes(bytes);
+                b.report_allocs();
+                while b.keep_running() {
+                    black_box(elementwise::apply(black_box(list), bound).unwrap());
+                }
+            },
+        );
     }
-    g.finish();
+    suite
 }
 
 /// The two edges of the seam: rows into a batch and back, plus clipping
 /// one series to a range.
-fn series_encode_decode(c: &mut Criterion) {
+fn register_series_encode_decode<'a>(suite: Suite<'a>) -> Suite<'a> {
     let (k, n) = (1_000usize, 1_000usize);
-    let all = labelled(k, n);
-    let names = series::label_names_of(&all);
-    let batch = series::encode(&names, &all, WHOLE).unwrap();
-    let mut g = c.benchmark_group("series");
-    g.throughput(Throughput::Elements((k * n) as u64));
-    g.bench_function(BenchmarkId::new("encode", format!("{k}x{n}")), |b| {
-        b.iter(|| series::encode(&names, black_box(&all), WHOLE).unwrap())
-    });
-    g.bench_function(BenchmarkId::new("decode", format!("{k}x{n}")), |b| {
-        b.iter(|| series::decode(std::slice::from_ref(black_box(&batch))).unwrap())
-    });
+    let bytes = (k * n) as u64 * SAMPLE_BYTES;
     let (lo, hi) = (n as i64 * SCRAPE_MS / 4, n as i64 * SCRAPE_MS / 2);
-    g.bench_function(BenchmarkId::new("clip", format!("{k}x{n}")), |b| {
-        b.iter(|| series::clip(black_box(&batch), lo, hi).unwrap())
-    });
-    g.finish();
+    suite
+        .bench(format!("Series/op=encode/shape={k}x{n}"), move |b| {
+            let mut fix_opt = None;
+            let (all, names) = fix_opt.get_or_insert_with(|| {
+                let all = labelled(k, n);
+                let names = series::label_names_of(&all);
+                (all, names)
+            });
+            b.set_bytes(bytes);
+            b.report_allocs();
+            while b.keep_running() {
+                black_box(series::encode(names, black_box(all), WHOLE).unwrap());
+            }
+        })
+        .bench(format!("Series/op=decode/shape={k}x{n}"), move |b| {
+            let mut batch_opt = None;
+            let batch = batch_opt.get_or_insert_with(|| {
+                let all = labelled(k, n);
+                let names = series::label_names_of(&all);
+                series::encode(&names, &all, WHOLE).unwrap()
+            });
+            b.set_bytes(bytes);
+            b.report_allocs();
+            while b.keep_running() {
+                black_box(series::decode(std::slice::from_ref(black_box(batch))).unwrap());
+            }
+        })
+        .bench(format!("Series/op=clip/shape={k}x{n}"), move |b| {
+            let mut batch_opt = None;
+            let batch = batch_opt.get_or_insert_with(|| {
+                let all = labelled(k, n);
+                let names = series::label_names_of(&all);
+                series::encode(&names, &all, WHOLE).unwrap()
+            });
+            b.set_bytes(bytes);
+            b.report_allocs();
+            while b.keep_running() {
+                black_box(series::clip(black_box(batch), lo, hi).unwrap());
+            }
+        })
 }
 
-criterion_group! {
-    name = benches;
-    config = Criterion::default()
-        .with_profiler(PProfProfiler::new(100))
-        .warm_up_time(Duration::from_millis(500))
-        .measurement_time(Duration::from_secs(2))
-        .sample_size(50);
-    targets =
-        math_add_each,
-        math_reductions,
-        selector_eval_series,
-        selector_apply,
-        range_function,
-        predict_linear_series,
-        range_apply,
-        aggregate_add_series,
-        aggregate_singleton_spans,
-        aggregate_state_merge,
-        binary_pairing,
-        elementwise_binary,
-        elementwise_date,
-        series_encode_decode
+fn main() {
+    let mut suite = Suite::from_env("promql_engine/kernels").with_alloc(&ALLOC);
+    suite = register_math_add_each(suite);
+    suite = register_math_reductions(suite);
+    suite = register_selector_eval_series(suite);
+    suite = register_selector_apply(suite);
+    suite = register_range_function(suite);
+    suite = register_predict_linear_series(suite);
+    suite = register_range_apply(suite);
+    suite = register_aggregate_add_series(suite);
+    suite = register_aggregate_singleton_spans(suite);
+    suite = register_aggregate_state_merge(suite);
+    suite = register_binary_pairing(suite);
+    suite = register_elementwise_binary(suite);
+    suite = register_elementwise_date(suite);
+    suite = register_series_encode_decode(suite);
+    suite.run();
 }
-criterion_main!(benches);

@@ -1,17 +1,18 @@
-//! Parser benchmarks: `parse_expr` over representative queries and
-//! `parse_series_desc` over a promqltest `load` line. Ids are
-//! `parser/parse_expr/<name>`, chosen once; throughput is bytes of input.
+//! Parser throughput and allocation benchmarks: `parse_expr` over representative
+//! queries and `parse_series_desc` over a promqltest `load` line. Throughput is
+//! reported in decimal `MB/s` of input text.
 //!
+//! Recommended CLI invocation:
 //! ```sh
-//! cargo bench -p promql-parser -- --save-baseline before
-//! # change code
-//! cargo bench -p promql-parser -- --baseline before
+//! cargo bench -p promql-parser --bench parse -- -bench '^BenchmarkParse' -benchtime 1s -count 6 -cpu 2 -benchmem | tee ${bench}.txt
 //! ```
 
 use std::hint::black_box;
-use std::time::Duration;
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use benchfmt::{CountingAlloc, Suite};
+
+#[global_allocator]
+static ALLOC: CountingAlloc = CountingAlloc::new();
 
 const QUERIES: [(&str, &str); 10] = [
     ("selector", "http_requests_total"),
@@ -44,37 +45,33 @@ const QUERIES: [(&str, &str); 10] = [
     ),
 ];
 
-fn parse_expr(c: &mut Criterion) {
-    let mut g = c.benchmark_group("parser/parse_expr");
+fn main() {
+    let mut suite = Suite::from_env("promql_parser").with_alloc(&ALLOC);
+
     for (name, q) in QUERIES {
         if let Err(e) = promql_parser::parse_expr(q) {
             panic!("{name}: {e:?}");
         }
-        g.throughput(Throughput::Bytes(q.len() as u64));
-        g.bench_function(name, |b| {
-            b.iter(|| promql_parser::parse_expr(black_box(q)).unwrap())
+        suite = suite.bench(format!("ParseExpr/case={name}"), move |b| {
+            b.set_bytes(q.len() as u64);
+            b.report_allocs();
+            while b.keep_running() {
+                black_box(promql_parser::parse_expr(black_box(q)).unwrap());
+            }
         });
     }
-    g.finish();
-}
 
-/// A `load` line whose values expand to a thousand samples, the cost of
-/// seeding one series in the conformance suite.
-fn parse_series_desc(c: &mut Criterion) {
+    // A `load` line whose values expand to a thousand samples, the cost of
+    // seeding one series in the conformance suite.
     let line = r#"http_requests_total{pod="nginx-1", route="/api", code="200"} 0+10x1000"#;
-    let mut g = c.benchmark_group("parser/parse_series_desc");
-    g.throughput(Throughput::Bytes(line.len() as u64));
-    g.bench_function("counter_1000", |b| {
-        b.iter(|| promql_parser::parse_series_desc(black_box(line)).unwrap())
+    promql_parser::parse_series_desc(line).unwrap();
+    suite = suite.bench("ParseSeriesDesc/case=counter_1000", move |b| {
+        b.set_bytes(line.len() as u64);
+        b.report_allocs();
+        while b.keep_running() {
+            black_box(promql_parser::parse_series_desc(black_box(line)).unwrap());
+        }
     });
-    g.finish();
-}
 
-criterion_group! {
-    name = benches;
-    config = Criterion::default()
-        .warm_up_time(Duration::from_millis(500))
-        .measurement_time(Duration::from_secs(2));
-    targets = parse_expr, parse_series_desc
+    suite.run();
 }
-criterion_main!(benches);
