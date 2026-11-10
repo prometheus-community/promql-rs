@@ -4,6 +4,7 @@ members = [
     "promql-common",
     "promql-conformance",
     "promql-engine",
+    "promql-histogram",
     "promql-parser",
     "promql-sync",
 ]

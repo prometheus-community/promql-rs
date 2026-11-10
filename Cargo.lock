@@ -2988,6 +2988,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "promql-histogram"
+version = "0.1.0"
+dependencies = [
+ "benchfmt",
+ "thiserror",
+]
+
+[[package]]
 name = "promql-parser"
 version = "0.1.0"
 dependencies = [

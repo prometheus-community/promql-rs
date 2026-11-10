@@ -16,6 +16,7 @@ The workspace members are defined in [`Cargo.toml`](Cargo.toml).
 |---|---|
 | [promql-engine](promql-engine/README.md) | PromQL evaluation, the `SeriesSource` trait, and the Arrow schema for series. |
 | [promql-parser](promql-parser/README.md) | Grammar, lexers, AST, and parse errors ported from upstream `promql/parser`. |
+| [promql-histogram](promql-histogram/README.md) | Native-histogram types and kernels; not yet connected to engine evaluation. |
 | [promql-common](promql-common/README.md) | `model::Duration` and duration parsing, shared by the parser and engine. |
 | [promql-conformance](promql-conformance/README.md) | Prometheus's promqltest corpus, engine adapters, and the passing-test allowlist. |
 | [promql-sync](promql-sync/README.md) | Commands to check vendored files, fetch upstream revisions, and generate the Rust grammar. |
