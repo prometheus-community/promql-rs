@@ -47,5 +47,9 @@ name = "engine"
 harness = false
 
 [[bench]]
+name = "go_compare"
+harness = false
+
+[[bench]]
 name = "memory"
 harness = false
