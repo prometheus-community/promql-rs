@@ -31,6 +31,7 @@ impl ArithmeticOutcome {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct KahanSum {
     sum: FloatHistogram,
     compensation: FloatHistogram,
@@ -81,6 +82,28 @@ impl KahanSum {
     pub fn heap_size(&self) -> usize {
         self.sum.heap_size() + self.compensation.heap_size()
     }
+
+    /// Whether the running sum has overflowed, the test Prometheus applies
+    /// before switching an average to an incremental mean. The compensation
+    /// term is not consulted there either.
+    pub fn has_overflow(&self) -> bool {
+        self.sum.has_overflow()
+    }
+
+    /// Multiplies both the sum and its compensation, as Prometheus scales
+    /// `mean` and `kahanC` together while averaging incrementally.
+    pub fn mul(&mut self, factor: f64) -> &mut Self {
+        self.sum.mul(factor);
+        self.compensation.mul(factor);
+        self
+    }
+
+    /// Divides both the sum and its compensation.
+    pub fn div(&mut self, divisor: f64) -> &mut Self {
+        self.sum.div(divisor);
+        self.compensation.div(divisor);
+        self
+    }
 }
 
 impl FloatHistogram {
@@ -91,6 +114,19 @@ impl FloatHistogram {
             + self.positive_spans.capacity() * std::mem::size_of::<Span>()
             + self.positive_buckets.capacity() * std::mem::size_of::<f64>()
             + self.custom_values.capacity() * std::mem::size_of::<f64>()
+    }
+
+    /// Prometheus `FloatHistogram.HasOverflow`: whether any count or the
+    /// sum is infinite, which aggregating enough histograms can produce.
+    pub fn has_overflow(&self) -> bool {
+        self.zero_count.is_infinite()
+            || self.count.is_infinite()
+            || self.sum.is_infinite()
+            || self
+                .positive_buckets
+                .iter()
+                .chain(&self.negative_buckets)
+                .any(|bucket| bucket.is_infinite())
     }
 
     pub fn copy_to_schema(&self, target_schema: i32) -> Self {
