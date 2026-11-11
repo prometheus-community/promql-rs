@@ -8,7 +8,7 @@ PROMQL_PROMQLTEST_BLESS=1 cargo test -p promql-conformance --test promqltest
 
 Nothing here gates CI. This file is the roadmap, and the core line below is the target: it reads 100% when the engine passes every eval that is neither native histograms, subquery nor experimental syntax. An eval is flag-gated if a stock parser refuses its query at a feature gate, or by its file where the grammar has no productions to reach the gate with (`docs/feature-flags.md`, Conformance). An eval is native-histogram if an expected row is a native histogram sample or a selector in its query matches, by its label matchers, a series the active load blocks load with native histogram samples (`{{…}}`, or derived by `load_with_nhcb`). Each eval is in exactly one category, first match wins: flag-gated, native histograms, subquery, core. The category comes from the eval, never from whether it passes, so the denominators hold still.
 
-**Core: 727 of 871 evals pass (83.5%).**
+**Core: 728 of 871 evals pass (83.6%).**
 
 - Native histograms: 2 of 805 pass.
 - Subqueries: 0 of 65 pass.
@@ -18,15 +18,15 @@ Nothing here gates CI. This file is the roadmap, and the core line below is the 
   - `promql-extended-range-selectors`: 8 of 88
   - `promql-binop-fill-modifiers`: 44 of 44
 
-All but the flag-gated: **729 of 1741 evals pass** (41.9%).
+All but the flag-gated: **730 of 1741 evals pass** (41.9%).
 
 ## Core evals
 
 | | evals |
 |---|---:|
 | total | 871 |
-| passing | 727 |
-| not passing | 144 |
+| passing | 728 |
+| not passing | 143 |
 
 The not-passing ones are the missing features and the unattributed failures below. Fixing those is what takes the core to 100%.
 
@@ -37,8 +37,8 @@ Each failing core eval is filed under a missing feature the engine names, or lef
 | failing evals | reason |
 |---:|---|
 | 118 | missing features |
-| 26 | unattributed |
-| 144 | **total** |
+| 25 | unattributed |
+| 143 | **total** |
 
 ## Missing features
 
@@ -59,10 +59,6 @@ Core evals the engine does not name a missing feature for: wrong results, panics
 
 - `metric @ 100s @ 10000`
 - `metric @ 1m40s @ 10000`
-
-### functions (1)
-
-- `label_replace(testmetric, "\xff", "", "src", "(.*)") @ 0`
 
 ### name_label_dropping (8)
 
@@ -108,7 +104,7 @@ Core evals the engine does not name a missing feature for: wrong results, panics
 | collision | 2 | 0 | 0 | 0 | 2 (100%) | 2 of 2 (100%) | core green |
 | subquery | 34 | 2 | 30 | 0 | 2 (6%) | 2 of 2 (100%) | core green |
 | fill-modifier | 1 | 0 | 0 | 44 | 1 (100%) | 1 of 1 (100%) | core green |
-| functions | 350 | 99 | 5 | 63 | 237 (68%) | 237 of 246 (96%) |  |
+| functions | 350 | 99 | 5 | 63 | 238 (68%) | 238 of 246 (97%) |  |
 | at_modifier | 69 | 0 | 29 | 2 | 38 (55%) | 38 of 40 (95%) |  |
 | aggregators | 158 | 35 | 0 | 2 | 93 (59%) | 93 of 123 (76%) |  |
 | type_and_unit | 58 | 0 | 0 | 0 | 43 (74%) | 43 of 58 (74%) |  |

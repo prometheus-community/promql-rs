@@ -321,6 +321,7 @@ functions = [
     'label_replace(series, "idx", "replaced", "idx", ".*") @ 0',
     'label_replace(series, "idx", "replaced", "idx", ".*") @ 0..1200000/1200000',
     'label_replace(series, "idx", "replaced", "idx", ".*") @ 1200000',
+    'label_replace(testmetric, "\xff", "", "src", "(.*)") @ 0',
     'label_replace(testmetric, "dst", "", "dst", ".*") @ 0',
     'label_replace(testmetric, "dst", "$1-value-$2", "src", "(.*)-value-(.*)") @ 0',
     'label_replace(testmetric, "dst", "destination-value-$1", "src", "source-value-(.*)") @ 0',
