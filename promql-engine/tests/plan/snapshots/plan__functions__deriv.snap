@@ -3,5 +3,5 @@ source: promql-engine/tests/plan/functions.rs
 expression: "deriv(http_requests_total[5m])"
 ---
 Projection: labels{job, pod}
-  SeriesEval: deriv(samples[5m], 600000..1200000 step 30s) per series per block
+  SeriesEval: deriv(floats[5m], 600000..1200000 step 30s) per series per block
     TableScan: http_requests_total

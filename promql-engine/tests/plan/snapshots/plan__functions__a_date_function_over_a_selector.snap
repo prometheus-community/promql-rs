@@ -2,8 +2,8 @@
 source: promql-engine/tests/plan/functions.rs
 expression: day_of_week(temperature)
 ---
-Projection: labels{city}, promql_elementwise(day_of_week_0.samples, Utf8("day_of_week"), Float64(NULL), Float64(NULL))
+Projection: labels{city}, promql_elementwise(day_of_week_0.floats, Utf8("day_of_week"), Float64(NULL), Float64(NULL))
   SubqueryAlias: day_of_week_0
-    Projection: labels, samples, block_start, block_end
-      SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+    Projection: labels, floats, block_start, block_end
+      SeriesEval: vector_selector(floats, 600000..1200000 step 30s, lookback 5m) per series per block
         TableScan: temperature

@@ -2,10 +2,10 @@
 source: promql-engine/tests/plan/functions.rs
 expression: timestamp(abs(temperature))
 ---
-Projection: labels{city}, promql_elementwise(timestamp_1.samples, Utf8("timestamp"), Float64(NULL), Float64(NULL))
+Projection: labels{city}, promql_elementwise(timestamp_1.floats, Utf8("timestamp"), Float64(NULL), Float64(NULL))
   SubqueryAlias: timestamp_1
-    Projection: labels{city}, promql_elementwise(abs_0.samples, Utf8("abs"), Float64(NULL), Float64(NULL))
+    Projection: labels{city}, promql_elementwise(abs_0.floats, Utf8("abs"), Float64(NULL), Float64(NULL))
       SubqueryAlias: abs_0
-        Projection: labels, samples, block_start, block_end
-          SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+        Projection: labels, floats, block_start, block_end
+          SeriesEval: vector_selector(floats, 600000..1200000 step 30s, lookback 5m) per series per block
             TableScan: temperature

@@ -3,5 +3,5 @@ source: promql-engine/tests/plan/at_modifier.rs
 expression: "rate(http_requests_total[5m] @ 900)"
 ---
 Projection: labels{job, pod}
-  SeriesEval: rate(samples[5m] @ 900000, 600000..1200000 step 30s) per series per block
+  SeriesEval: rate(floats[5m] @ 900000, 600000..1200000 step 30s) per series per block
     TableScan: http_requests_total

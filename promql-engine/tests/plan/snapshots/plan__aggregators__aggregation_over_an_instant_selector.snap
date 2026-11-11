@@ -3,7 +3,7 @@ source: promql-engine/tests/plan/aggregators.rs
 expression: sum(http_requests_total)
 ---
 Projection: labels{}
-  Aggregate: sum(samples, 600000..1200000 step 30s) per block
-    Projection: labels, samples, block_start, block_end
-      SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+  Aggregate: sum(floats, 600000..1200000 step 30s) per block
+    Projection: labels, floats, block_start, block_end
+      SeriesEval: vector_selector(floats, 600000..1200000 step 30s, lookback 5m) per series per block
         TableScan: http_requests_total
