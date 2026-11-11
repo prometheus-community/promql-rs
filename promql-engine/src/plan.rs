@@ -39,7 +39,9 @@ use std::time::Duration;
 use datafusion::catalog::Session;
 use datafusion::common::{Column, ScalarValue};
 use datafusion::datasource::{provider_as_source, MemTable};
-use datafusion::logical_expr::{col, lit, LogicalPlan, LogicalPlanBuilder};
+use datafusion::functions::core::expr_fn::get_field;
+use datafusion::functions::string::expr_fn::concat_ws;
+use datafusion::logical_expr::{col, lit, Expr as DfExpr, LogicalPlan, LogicalPlanBuilder};
 use promql_parser::ast::{
     AggregateExpr, AtModifier, BinaryExpr, Call, Expr, MatrixSelector, UnaryExpr,
     VectorMatchCardinality, VectorSelector,
@@ -57,6 +59,7 @@ use crate::matcher::{effective_matchers, METRIC_NAME};
 use crate::matrix;
 use crate::params::{step_count, Params};
 use crate::range::{Func, RangeOp};
+use crate::relabel;
 use crate::selector;
 use crate::series::{Block, Series, BLOCK_END, BLOCK_START, LABELS, SAMPLES};
 use crate::series_eval::SeriesEval;
@@ -704,9 +707,9 @@ impl Planner<'_> {
         if let Some(func) = sort::Func::parse(name) {
             return self.sort(call, func).await;
         }
-        // `label_replace` and `label_join` do not get here yet. When they
-        // do they must stop `grouping`: they rewrite labels, so a `by`
-        // can name a label the input lacks while its source goes unnamed.
+        if name == "label_replace" || name == "label_join" {
+            return self.relabel(call).await;
+        }
         self.range_function(call, above).await
     }
 
@@ -840,6 +843,98 @@ impl Planner<'_> {
                     args.get(1).copied(),
                 )
                 .alias(SAMPLES),
+                col(BLOCK_START),
+                col(BLOCK_END),
+            ])?
+            .build()?;
+        Ok(Planned { plan, label_names })
+    }
+
+    /// `label_replace` and `label_join`: upstream's `evalLabelReplace`
+    /// and `evalLabelJoin` (`promql/functions.go` at 83962c35). Both
+    /// rebuild `labels` with a computed destination; "" deletes it.
+    async fn relabel(&mut self, call: &Call) -> Result<Planned, EngineError> {
+        let name = call.func.name.as_str();
+        let mut strings = Vec::with_capacity(call.args.len() - 1);
+        for arg in &call.args[1..] {
+            strings.push(string_literal(arg).ok_or_else(|| {
+                EngineError::Unsupported(format!("the {name} function over {}", describe(arg)))
+            })?);
+        }
+        // Checked in upstream's order and before the input is planned, as
+        // upstream panics before `ev.eval` reads a series.
+        let invalid = |what: &str, label: &str| {
+            EngineError::Query(format!("invalid {what} label name in {name}(): {label}"))
+        };
+        let dst = strings[0];
+        let regex = if name == "label_replace" {
+            Some(relabel::compile(strings[3])?)
+        } else {
+            if let Some(src) = strings[2..].iter().find(|s| s.is_empty()) {
+                return Err(invalid("source", src));
+            }
+            None
+        };
+        if dst.is_empty() {
+            return Err(invalid("destination", dst));
+        }
+
+        // No `by` reaches the store: the call can create the label a `by`
+        // names, and the store would group by a label the series lack.
+        let input = self
+            .expr(
+                &call.args[0],
+                Above {
+                    func: Some(name),
+                    grouping: None,
+                },
+            )
+            .await?;
+        let mut label_names = input.label_names.clone();
+        label_names.push(dst.to_string());
+        label_names.sort();
+        label_names.dedup();
+        // `get_field` on a label the input lacks is a plan error; upstream
+        // reads it as "".
+        let read = |label: &str| -> DfExpr {
+            if input.label_names.iter().any(|have| have == label) {
+                get_field(col(LABELS), label)
+            } else {
+                lit("")
+            }
+        };
+        let dst_value = match regex {
+            Some(regex) => relabel::call(read(strings[2]), read(dst), regex, strings[1]),
+            // `concat_ws` wants a value to join; `strings.Join` of nothing
+            // is "".
+            None if strings.len() == 2 => lit(""),
+            None => concat_ws(
+                lit(strings[1]),
+                strings[2..].iter().map(|s| read(s)).collect(),
+            ),
+        };
+        let labels_expr = labels::call(
+            label_names
+                .iter()
+                .map(|label| {
+                    let value = if label == dst {
+                        dst_value.clone()
+                    } else {
+                        read(label)
+                    };
+                    (label.clone(), value)
+                })
+                .collect(),
+        );
+        // Upstream's `mergeSeriesWithSameLabelset` runs here and errors on
+        // a collision with shared timestamps; this engine defers it to
+        // `labelset::finalize`, so `count` above a collision counts both.
+        let stage = self.stage(name);
+        let plan = LogicalPlanBuilder::from(input.plan)
+            .alias(stage)?
+            .project(vec![
+                labels_expr.alias(LABELS),
+                col(SAMPLES),
                 col(BLOCK_START),
                 col(BLOCK_END),
             ])?
