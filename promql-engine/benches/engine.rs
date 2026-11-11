@@ -519,7 +519,7 @@ fn points(batches: &[datafusion::arrow::array::RecordBatch]) -> usize {
         .iter()
         .map(|batch| {
             let samples = batch
-                .column_by_name(promql_engine::series::SAMPLES)
+                .column_by_name(promql_engine::series::FLOATS)
                 .unwrap()
                 .as_list::<i32>();
             (samples.offsets()[batch.num_rows()] - samples.offsets()[0]) as usize

@@ -93,7 +93,7 @@ Extra source columns are allowed and dropped during evaluation.
 | Column | Arrow type | Meaning |
 |---|---|---|
 | `labels` | `Struct<{name}: Utf8View, …>` | Sorted, non-null fields for the selection's label names. An absent label has value `""`. |
-| `samples` | `List<Struct<timestamp: Timestamp(ms), value: Float64>>` | Samples in a chunk. |
+| `floats` | `List<Struct<timestamp: Timestamp(ms), value: Float64>>` | Float samples in a chunk. |
 | `block_start` | `Timestamp(ms)` | Inclusive start of the block's window-end range. |
 | `block_end` | `Timestamp(ms)` | Exclusive end of the block's window-end range. |
 | `series_id` | `UInt64` or `FixedSizeBinary(n > 0)` | Opaque ID corresponding one-to-one with the full label set. |
@@ -126,7 +126,7 @@ The `series` module defines the raw and evaluated Arrow shapes:
 | `series::clip`, `drop_empty`, `drop_unused_labels`, `validate` | Sample clipping, empty-row removal, label-schema reduction, and schema checks. |
 | `Series` | Decoded row with `labels()`, `label(name)`, `timestamps()`, and `values()`. |
 
-Evaluated results keep `labels`, `samples`, `block_start`, and `block_end`.
+Evaluated results keep `labels`, `floats`, `block_start`, and `block_end`.
 `series_id` does not appear in results.
 
 ## Implementation references

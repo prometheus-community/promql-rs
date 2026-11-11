@@ -402,7 +402,7 @@ impl SeriesSource for SlicedRawSource {
         };
         let batch = series::encode(&names, &rows, block).unwrap();
         let samples = batch
-            .column_by_name(series::SAMPLES)
+            .column_by_name(series::FLOATS)
             .unwrap()
             .as_list::<i32>();
         let entries = samples.values().as_struct();
@@ -448,7 +448,7 @@ impl SeriesSource for SlicedRawSource {
         ];
         let schema = Arc::new(Schema::new_with_metadata(
             [
-                series::SAMPLES,
+                series::FLOATS,
                 "extra",
                 series::SERIES_ID,
                 series::BLOCK_END,
@@ -469,7 +469,7 @@ impl SeriesSource for SlicedRawSource {
         let batch = RecordBatch::try_new(schema.clone(), columns)?.slice(1, 1);
         assert_eq!(
             batch
-                .column_by_name(series::SAMPLES)
+                .column_by_name(series::FLOATS)
                 .unwrap()
                 .as_list::<i32>()
                 .offsets()[0],
@@ -517,7 +517,7 @@ async fn instant_matrix_and_scalar_accept_sliced_reordered_sources_with_metadata
                     .collect::<Vec<_>>(),
                 [
                     series::LABELS,
-                    series::SAMPLES,
+                    series::FLOATS,
                     series::BLOCK_START,
                     series::BLOCK_END
                 ]
@@ -529,7 +529,7 @@ async fn instant_matrix_and_scalar_accept_sliced_reordered_sources_with_metadata
             for field in schema.fields() {
                 assert_eq!(field.metadata().get("source-field"), Some(field.name()));
             }
-            let DataType::List(item) = schema.field_with_name(series::SAMPLES).unwrap().data_type()
+            let DataType::List(item) = schema.field_with_name(series::FLOATS).unwrap().data_type()
             else {
                 panic!("not a samples list")
             };

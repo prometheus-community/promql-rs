@@ -148,7 +148,7 @@ fn raw_batches(blocks: usize, groups: usize, input_size: usize) -> Vec<RecordBat
         Field::new(series::BLOCK_START, series::timestamp_type(), false),
         Field::new(series::BLOCK_END, series::timestamp_type(), false),
         Field::new("job", DataType::Utf8View, false),
-        Field::new(series::SAMPLES, series::samples_type(), false),
+        Field::new(series::FLOATS, series::floats_type(), false),
     ]));
     let mut batches = Vec::new();
     for block in 0..blocks {
@@ -212,7 +212,7 @@ fn partial(input: Arc<dyn ExecutionPlan>) -> AggregateExec {
     let expr = AggregateExprBuilder::new(
         Arc::new(udaf()),
         vec![
-            col(series::SAMPLES, &schema).unwrap(),
+            col(series::FLOATS, &schema).unwrap(),
             lit("sum"),
             lit(0i64),
             lit(63i64),
@@ -220,7 +220,7 @@ fn partial(input: Arc<dyn ExecutionPlan>) -> AggregateExec {
         ],
     )
     .schema(schema.clone())
-    .alias(series::SAMPLES)
+    .alias(series::FLOATS)
     .build()
     .unwrap();
     let agg = AggregateExec::try_new(
@@ -479,7 +479,7 @@ async fn migrated_ordered_upper_states_survive_memory_pressure_and_tiny_drains()
     let steps = 64;
     let schema = Arc::new(Schema::new(vec![
         Field::new("job", DataType::Utf8View, false),
-        Field::new(series::SAMPLES, series::samples_type(), false),
+        Field::new(series::FLOATS, series::floats_type(), false),
         Field::new(series::BLOCK_START, series::timestamp_type(), false),
         Field::new(series::BLOCK_END, series::timestamp_type(), false),
     ]));
@@ -527,7 +527,7 @@ async fn migrated_ordered_upper_states_survive_memory_pressure_and_tiny_drains()
     ctx.register_table("t", Arc::new(table)).unwrap();
     let frame = ctx
         .sql(&format!(
-            "SELECT block_start, block_end, job, {NAME}(samples, 'sum', 0, {}, 1) AS samples \
+            "SELECT block_start, block_end, job, {NAME}(floats, 'sum', 0, {}, 1) AS floats \
          FROM t GROUP BY block_start, block_end, job",
             steps - 1,
         ))

@@ -181,7 +181,7 @@ async fn the_plan_keeps_the_range_kernel_and_modifiers_in_typed_evaluation() {
     let rendered = promql_engine::explain_plan(&plan);
     assert!(
         rendered.contains(
-            "SeriesEval: rate(samples[5m] offset 1m, 0..600000 step 30s) per series per block"
+            "SeriesEval: rate(floats[5m] offset 1m, 0..600000 step 30s) per series per block"
         ),
         "{rendered}"
     );

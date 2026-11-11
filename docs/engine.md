@@ -66,11 +66,11 @@ consumer projects labels away. It binds fields by name and emits canonical
 `labels, samples, block_start, block_end`, retaining metadata without raw IDs
 or uniqueness constraints. Predicates and limits remain above evaluation: a
 raw chunk is not a result row. Direct column projections can prune unused
-evaluation outputs, including labels for samples-only output. The evaluator
+evaluation outputs, including labels for floats-only output. The evaluator
 retains a canonical-order subset; native `ProjectionExec` owns aliases,
 reordering and repeated columns. Arbitrary expressions remain native projections.
 
-A scalar UDF over `samples` cannot implement range evaluation here. It sees
+A scalar UDF over `floats` cannot implement range evaluation here. It sees
 only one chunk, not all chunks needed by a window. Concatenating a whole series
 in the store to satisfy that signature merely moves the unbounded copy down
 one layer. The typed evaluator folds chunks directly, retaining numerical

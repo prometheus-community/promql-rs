@@ -181,7 +181,7 @@ impl Default for Absent {
         Self {
             signature: Signature::exact(
                 vec![
-                    series::samples_type(),
+                    series::floats_type(),
                     DataType::Int64,
                     DataType::Int64,
                     DataType::Int64,
@@ -196,7 +196,7 @@ pub fn udaf() -> AggregateUDF {
     AggregateUDF::new_from_impl(Absent::default())
 }
 
-/// `promql_absent(samples, start, end, step)`. The grid is an argument
+/// `promql_absent(floats, start, end, step)`. The grid is an argument
 /// for the same reason it is one of `promql_aggregate`: it is what turns
 /// a timestamp into a step, and here also what the answer is made of.
 pub fn call(
@@ -234,14 +234,14 @@ impl AggregateUDFImpl for Absent {
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        if arg_types.first() != Some(&series::samples_type()) {
+        if arg_types.first() != Some(&series::floats_type()) {
             return plan_err!(
                 "{NAME}: first argument must be {}, got {:?}",
-                series::samples_type(),
+                series::floats_type(),
                 arg_types.first()
             );
         }
-        Ok(series::samples_type())
+        Ok(series::floats_type())
     }
 
     /// A list, empty when every step was answered; never NULL.
@@ -256,7 +256,7 @@ impl AggregateUDFImpl for Absent {
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
         Ok(vec![Arc::new(Field::new(
             format_state_name(args.name, "present"),
-            series::samples_type(),
+            series::floats_type(),
             false,
         ))])
     }
@@ -271,7 +271,7 @@ mod tests {
     use datafusion::prelude::{SessionConfig, SessionContext};
 
     use super::*;
-    use crate::series::SAMPLES;
+    use crate::series::FLOATS;
 
     fn labels(query: &str) -> Vec<(String, String)> {
         let Expr::Call(call) = promql_parser::parse_expr(query).expect("parses") else {
@@ -455,8 +455,8 @@ mod tests {
     #[tokio::test]
     async fn one_row_comes_out_of_no_rows_across_partitions() {
         let schema = Arc::new(Schema::new(vec![Field::new(
-            SAMPLES,
-            series::samples_type(),
+            FLOATS,
+            series::floats_type(),
             false,
         )]));
         let row = |ts: &[i64]| RecordBatch::try_new(schema.clone(), vec![samples(&[ts])]).unwrap();
@@ -474,7 +474,7 @@ mod tests {
                 .unwrap()
                 .aggregate(
                     vec![],
-                    vec![call(col(SAMPLES), 0, 120_000, 30_000).alias(SAMPLES)],
+                    vec![call(col(FLOATS), 0, 120_000, 30_000).alias(FLOATS)],
                 )
                 .unwrap()
                 .collect()

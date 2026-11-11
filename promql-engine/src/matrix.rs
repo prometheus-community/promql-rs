@@ -1,5 +1,5 @@
 //! A range selector answered as an instant query's result:
-//! `promql_matrix_selector(samples, mint, maxt)`.
+//! `promql_matrix_selector(floats, mint, maxt)`.
 //!
 //! Ports `matrixSelector` and `matrixIterSlice` (`promql/engine.go` at
 //! 83962c35) for the one step an instant query has. The result is the
@@ -68,7 +68,7 @@ pub fn udf() -> ScalarUDF {
     ScalarUDF::new_from_impl(MatrixSelector::default())
 }
 
-/// `promql_matrix_selector(samples, mint, maxt)`.
+/// `promql_matrix_selector(floats, mint, maxt)`.
 pub fn call(samples: Expr, window: Window) -> Expr {
     udf().call(vec![samples, lit(window.mint), lit(window.maxt)])
 }
@@ -83,10 +83,10 @@ impl ScalarUDFImpl for MatrixSelector {
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        if !arg_types.first().is_some_and(series::is_samples_type) {
+        if !arg_types.first().is_some_and(series::is_floats_type) {
             return plan_err!(
                 "{NAME}: first argument must be {}, got {:?}",
-                series::samples_type(),
+                series::floats_type(),
                 arg_types.first()
             );
         }
@@ -134,7 +134,7 @@ impl ScalarUDFImpl for MatrixSelector {
     }
 }
 
-/// Keep, in every row of `samples`, the samples `window` holds.
+/// Keep, in every row of `floats`, the samples `window` holds.
 pub fn apply(samples: &ListArray, window: Window) -> Result<ListArray> {
     // A list slice retains the entire backing child. `filtered` counts
     // predicates relative to the first referenced offset, as elementwise
@@ -283,7 +283,7 @@ mod tests {
     #[test]
     fn matrix_return_field_keeps_source_metadata_and_nullability() {
         let input = Arc::new(
-            Field::new(series::SAMPLES, samples().data_type().clone(), true)
+            Field::new(series::FLOATS, samples().data_type().clone(), true)
                 .with_metadata([("unit".into(), "samples".into())].into_iter().collect()),
         );
         let args = [

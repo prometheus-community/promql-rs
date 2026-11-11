@@ -202,7 +202,7 @@ pub fn group_keys(input: &[String], grouping: &[String], without: bool) -> Vec<S
 /// The namespace an aggregation's group-key columns live in.
 ///
 /// Aliased to the bare label name, a group column collides with the
-/// planner's own `samples` and `labels` columns as soon as a series
+/// planner's own `floats` and `labels` columns as soon as a series
 /// carries a label so named.
 ///
 /// The prefix holds for any label name, the quoted UTF-8 ones included:
@@ -292,7 +292,7 @@ mod tests {
     use datafusion::logical_expr::{LogicalPlanBuilder, LogicalTableSource};
 
     use super::*;
-    use crate::series::SAMPLES;
+    use crate::series::FLOATS;
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
@@ -305,8 +305,8 @@ mod tests {
     fn planned_group(input: &[String], keys: &[String]) -> Result<Vec<String>> {
         let source = Arc::new(LogicalTableSource::new(series::schema(input)));
         let plan = LogicalPlanBuilder::scan("series", source, None)?
-            .aggregate(group_exprs(keys), vec![count(col(SAMPLES)).alias(SAMPLES)])?
-            .project(vec![regroup(keys).alias(LABELS), col(SAMPLES)])?
+            .aggregate(group_exprs(keys), vec![count(col(FLOATS)).alias(FLOATS)])?
+            .project(vec![regroup(keys).alias(LABELS), col(FLOATS)])?
             .build()?;
         match plan
             .schema()
@@ -331,8 +331,8 @@ mod tests {
     }
 
     #[test]
-    fn a_label_named_samples_survives_its_reserved_namesake() {
-        let names = s(&["samples"]);
+    fn a_label_named_floats_survives_its_reserved_namesake() {
+        let names = s(&["floats"]);
         assert_eq!(planned_group(&names, &names).unwrap(), names);
     }
 
@@ -344,7 +344,7 @@ mod tests {
 
     #[test]
     fn the_group_prefix_cannot_reach_a_reserved_column_name() {
-        for reserved in [LABELS, SAMPLES] {
+        for reserved in [LABELS, FLOATS] {
             assert!(!reserved.starts_with(GROUP_PREFIX));
         }
     }

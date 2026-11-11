@@ -8,7 +8,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::physical_plan::collect;
 use datafusion::prelude::SessionContext;
 use promql_engine::selector::STALE_NAN_BITS;
-use promql_engine::series::{self, Block, SAMPLES};
+use promql_engine::series::{self, Block, FLOATS};
 use promql_engine::{Engine, SelectHints, Series, SeriesSource};
 
 #[allow(dead_code)] // Each bench binary uses a different subset of the helpers.
@@ -186,7 +186,7 @@ async fn chunk_probes_preserve_large_future_tails_and_stale_bits() {
             .iter()
             .any(|row| row.timestamps().last() == Some(&127_000)));
         for batch in &batches {
-            let samples = batch.column_by_name(SAMPLES).unwrap().as_list::<i32>();
+            let samples = batch.column_by_name(FLOATS).unwrap().as_list::<i32>();
             assert!(!samples.value(0).is_empty());
         }
         let stale_count = decoded

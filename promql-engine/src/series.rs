@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! labels       Struct<{name}: Utf8View, …>   fields sorted by name
-//! samples      List<Struct<timestamp: Timestamp(ms), value: Float64>>
+//! floats       List<Struct<timestamp: Timestamp(ms), value: Float64>>
 //! block_start  Timestamp(ms)                 window ends the block answers, from here
 //! block_end    Timestamp(ms)                 to here, exclusive
 //! series_id    UInt64 | FixedSizeBinary(n>0) mandatory for raw sources, absent from results
@@ -92,7 +92,7 @@ macro_rules! invalid {
 }
 
 pub const LABELS: &str = "labels";
-pub const SAMPLES: &str = "samples";
+pub const FLOATS: &str = "floats";
 pub const TIMESTAMP: &str = "timestamp";
 pub const VALUE: &str = "value";
 pub const BLOCK_START: &str = "block_start";
@@ -128,7 +128,7 @@ pub fn sample_item() -> FieldRef {
     ))
 }
 
-pub fn samples_type() -> DataType {
+pub fn floats_type() -> DataType {
     DataType::List(sample_item())
 }
 
@@ -150,7 +150,7 @@ pub fn labels_type(names: &[String]) -> DataType {
 pub fn schema(label_names: &[String]) -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new(LABELS, labels_type(label_names), false),
-        Field::new(SAMPLES, samples_type(), false),
+        Field::new(FLOATS, floats_type(), false),
         Field::new(BLOCK_START, timestamp_type(), false),
         Field::new(BLOCK_END, timestamp_type(), false),
     ]))
@@ -218,11 +218,11 @@ pub fn block_of(batch: &RecordBatch, row: usize) -> Block {
 /// the batch.
 pub fn validate(schema: &Schema) -> Result<(), SeriesError> {
     let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-    if names != [LABELS, SAMPLES, BLOCK_START, BLOCK_END]
-        && names != [LABELS, SAMPLES, BLOCK_START, BLOCK_END, SERIES_ID]
+    if names != [LABELS, FLOATS, BLOCK_START, BLOCK_END]
+        && names != [LABELS, FLOATS, BLOCK_START, BLOCK_END, SERIES_ID]
     {
         return Err(invalid!(
-            "expected exactly the columns `{LABELS}`, `{SAMPLES}`, `{BLOCK_START}` and \
+            "expected exactly the columns `{LABELS}`, `{FLOATS}`, `{BLOCK_START}` and \
              `{BLOCK_END}`, optionally followed by `{SERIES_ID}`, in that order, got {}",
             names.join(", ")
         ));
@@ -279,16 +279,16 @@ pub fn validate(schema: &Schema) -> Result<(), SeriesError> {
     }
 
     let samples = schema
-        .field_with_name(SAMPLES)
-        .map_err(|_| format!("no `{SAMPLES}` column"))?;
+        .field_with_name(FLOATS)
+        .map_err(|_| format!("no `{FLOATS}` column"))?;
     if samples.is_nullable() {
-        return Err(invalid!("`{SAMPLES}` must not be nullable"));
+        return Err(invalid!("`{FLOATS}` must not be nullable"));
     }
-    if !is_samples_type(samples.data_type()) {
+    if !is_floats_type(samples.data_type()) {
         return Err(invalid!(
-            "`{SAMPLES}` is {}, expected {}",
+            "`{FLOATS}` is {}, expected {}",
             samples.data_type(),
-            samples_type()
+            floats_type()
         ));
     }
     for name in [BLOCK_START, BLOCK_END] {
@@ -309,8 +309,8 @@ pub fn validate(schema: &Schema) -> Result<(), SeriesError> {
 
 /// Field metadata is not part of the numerical shape. Arrow's recursive
 /// comparison also ignores names, so retain the canonical item/child names.
-pub(crate) fn is_samples_type(data_type: &DataType) -> bool {
-    let expected = samples_type();
+pub(crate) fn is_floats_type(data_type: &DataType) -> bool {
+    let expected = floats_type();
     match (data_type, &expected) {
         (DataType::List(item), DataType::List(expected_item)) => {
             item.name() == expected_item.name()
@@ -594,7 +594,7 @@ pub fn decode(batches: &[RecordBatch]) -> Result<Vec<Series>, SeriesError> {
         validate(&batch.schema())?;
         let labels = batch.column_by_name(LABELS).expect("validated").as_struct();
         let samples = batch
-            .column_by_name(SAMPLES)
+            .column_by_name(FLOATS)
             .expect("validated")
             .as_list::<i32>();
         for row in 0..batch.num_rows() {
@@ -717,7 +717,7 @@ fn coalesce_samples(run: &[Series]) -> Result<StructArray, SeriesError> {
 /// the sample children would duplicate the answer for no semantic change.
 pub fn drop_empty(batch: &RecordBatch) -> RecordBatch {
     let samples = batch
-        .column_by_name(SAMPLES)
+        .column_by_name(FLOATS)
         .expect("validated")
         .as_list::<i32>();
     if (0..batch.num_rows()).all(|row| samples.value_length(row) > 0) {
@@ -750,7 +750,7 @@ pub fn drop_empty(batch: &RecordBatch) -> RecordBatch {
         .iter()
         .zip(batch.columns())
         .map(|(field, column)| {
-            if field.name() == SAMPLES {
+            if field.name() == FLOATS {
                 Arc::clone(&kept)
             } else {
                 predicate
@@ -853,7 +853,7 @@ fn replace_column(
 /// pruned by time — is handed back untouched.
 pub fn clip(batch: &RecordBatch, start_ms: i64, end_ms: i64) -> Result<RecordBatch, SeriesError> {
     let samples = batch
-        .column_by_name(SAMPLES)
+        .column_by_name(FLOATS)
         .expect("canonical")
         .as_list::<i32>();
     let entries = samples.values().as_struct();
@@ -905,8 +905,8 @@ pub fn clip(batch: &RecordBatch, start_ms: i64, end_ms: i64) -> Result<RecordBat
     );
     replace_column(
         batch,
-        SAMPLES,
-        Field::new(SAMPLES, samples_type(), false),
+        FLOATS,
+        Field::new(FLOATS, floats_type(), false),
         Arc::new(samples),
     )
 }
@@ -1450,7 +1450,7 @@ mod tests {
 
         let nullable = with_block(
             Field::new(LABELS, labels_type(&["a".to_string()]), true),
-            Field::new(SAMPLES, samples_type(), false),
+            Field::new(FLOATS, floats_type(), false),
         );
         assert!(validate(&nullable)
             .unwrap_err()
@@ -1471,7 +1471,7 @@ mod tests {
         ));
         let nanos = with_block(
             Field::new(LABELS, labels_type(&[]), false),
-            Field::new(SAMPLES, DataType::List(ns_item), false),
+            Field::new(FLOATS, DataType::List(ns_item), false),
         );
         assert!(validate(&nanos)
             .unwrap_err()
@@ -1484,7 +1484,7 @@ mod tests {
                 DataType::Struct(Fields::from(vec![Field::new("a", DataType::Utf8, false)])),
                 false,
             ),
-            Field::new(SAMPLES, samples_type(), false),
+            Field::new(FLOATS, floats_type(), false),
         );
         assert!(validate(&plain)
             .unwrap_err()
@@ -1501,7 +1501,7 @@ mod tests {
                 )])),
                 false,
             ),
-            Field::new(SAMPLES, samples_type(), false),
+            Field::new(FLOATS, floats_type(), false),
         );
         assert!(validate(&dictionary)
             .unwrap_err()
@@ -1517,7 +1517,7 @@ mod tests {
                 ])),
                 false,
             ),
-            Field::new(SAMPLES, samples_type(), false),
+            Field::new(FLOATS, floats_type(), false),
         );
         assert!(validate(&unsorted)
             .unwrap_err()
@@ -1527,7 +1527,7 @@ mod tests {
         let bare = || {
             vec![
                 Field::new(LABELS, labels_type(&[]), false),
-                Field::new(SAMPLES, samples_type(), false),
+                Field::new(FLOATS, floats_type(), false),
             ]
         };
         let without_block = Schema::new(bare());
@@ -1645,7 +1645,7 @@ mod tests {
             );
             let mut fields = input.schema().fields().to_vec();
             fields[1] = Arc::new(
-                Field::new(SAMPLES, samples.data_type().clone(), false)
+                Field::new(FLOATS, samples.data_type().clone(), false)
                     .with_metadata(metadata.clone()),
             );
             let mut columns = input.columns().to_vec();
@@ -1727,8 +1727,8 @@ mod tests {
             let input = batch.slice(start, len);
             let out = drop_empty(&input);
             validate(&out.schema()).unwrap();
-            let original = input.column_by_name(SAMPLES).unwrap().as_list::<i32>();
-            let kept = out.column_by_name(SAMPLES).unwrap().as_list::<i32>();
+            let original = input.column_by_name(FLOATS).unwrap().as_list::<i32>();
+            let kept = out.column_by_name(FLOATS).unwrap().as_list::<i32>();
             assert_eq!(kept.offsets().to_vec(), expected_offsets);
             assert!(Arc::ptr_eq(original.values(), kept.values()));
             let expected = decode(std::slice::from_ref(&input)).unwrap();
@@ -1778,11 +1778,11 @@ mod tests {
         assert_eq!(out.num_rows(), 0);
         assert!(Arc::ptr_eq(
             all_empty
-                .column_by_name(SAMPLES)
+                .column_by_name(FLOATS)
                 .unwrap()
                 .as_list::<i32>()
                 .values(),
-            out.column_by_name(SAMPLES)
+            out.column_by_name(FLOATS)
                 .unwrap()
                 .as_list::<i32>()
                 .values(),
@@ -1855,7 +1855,7 @@ mod tests {
         b.push(30, 4.0);
 
         let first = b.take_first(2);
-        assert_eq!(first.data_type(), &samples_type());
+        assert_eq!(first.data_type(), &floats_type());
         assert_eq!(builder_rows(&first), vec![vec![(0, 1.0)], vec![]]);
 
         b.finish_row();

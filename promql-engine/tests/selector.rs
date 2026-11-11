@@ -140,7 +140,7 @@ fn range_query_returns_validated_batches_with_no_empty_series() {
         .unwrap();
     for batch in &batches {
         promql_engine::series::validate(&batch.schema()).unwrap();
-        let samples = batch.column_by_name("samples").unwrap();
+        let samples = batch.column_by_name("floats").unwrap();
         let samples = samples
             .as_any()
             .downcast_ref::<datafusion::arrow::array::ListArray>()
@@ -211,7 +211,7 @@ async fn the_plan_has_typed_evaluation_over_a_scan() {
         .unwrap();
 
     let rendered = promql_engine::explain_plan(&plan);
-    assert!(rendered.contains("SeriesEval: vector_selector(samples offset 30s, 600000..1200000 step 30s, lookback 5m) per series per block"), "{rendered}");
+    assert!(rendered.contains("SeriesEval: vector_selector(floats offset 30s, 600000..1200000 step 30s, lookback 5m) per series per block"), "{rendered}");
     let mut node = &plan;
     while !matches!(node, LogicalPlan::Extension(_)) {
         node = node.inputs()[0];
@@ -228,7 +228,7 @@ async fn the_plan_has_typed_evaluation_over_a_scan() {
             .iter()
             .map(|f| f.name().as_str())
             .collect::<Vec<_>>(),
-        ["labels", "samples", "block_start", "block_end"]
+        ["labels", "floats", "block_start", "block_end"]
     );
 
     // A different offset is a different typed evaluation, so the two can

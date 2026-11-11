@@ -30,7 +30,7 @@ use datafusion::arrow::array::{AsArray, RecordBatch, StringViewArray};
 use datafusion::arrow::datatypes::TimestampMillisecondType;
 
 use crate::error::EngineError;
-use crate::series::{self, BLOCK_START, LABELS, SAMPLES, TIMESTAMP};
+use crate::series::{self, BLOCK_START, FLOATS, LABELS, TIMESTAMP};
 
 /// Prometheus's own sentence, word for word: the conformance suite
 /// compares error text, not error kinds.
@@ -107,7 +107,7 @@ impl<'a> OrderedRows<'a> {
                     .as_primitive::<TimestampMillisecondType>(),
             );
             let samples = batch
-                .column_by_name(SAMPLES)
+                .column_by_name(FLOATS)
                 .expect("validated")
                 .as_list::<i32>();
             offsets.push(samples.value_offsets());
@@ -484,7 +484,7 @@ mod tests {
         let rows = OrderedRows::new(&batches).unwrap();
         assert_eq!(rows.order.len(), 4);
         for (batch, input) in batches.iter().enumerate() {
-            let samples = input.column_by_name(SAMPLES).unwrap().as_list::<i32>();
+            let samples = input.column_by_name(FLOATS).unwrap().as_list::<i32>();
             let timestamps = samples
                 .values()
                 .as_struct()
@@ -533,7 +533,7 @@ mod tests {
     /// when the output is a slice of it, fresh when the rows were copied.
     fn values_buffer(batch: &RecordBatch) -> *const u8 {
         batch
-            .column_by_name(SAMPLES)
+            .column_by_name(FLOATS)
             .unwrap()
             .as_list::<i32>()
             .values()

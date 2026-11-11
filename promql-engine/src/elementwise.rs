@@ -1,5 +1,5 @@
 //! Instant-vector functions as one DataFusion scalar function:
-//! `promql_elementwise(samples, 'abs', a, b)`.
+//! `promql_elementwise(floats, 'abs', a, b)`.
 //!
 //! These are the functions that look at one sample at a time and change
 //! nothing else: same series, same timestamps, a new value. Upstream
@@ -491,7 +491,7 @@ pub fn udf() -> ScalarUDF {
     ScalarUDF::new_from_impl(Elementwise::default())
 }
 
-/// `promql_elementwise(samples, 'abs', a, b)`. The two scalar arguments
+/// `promql_elementwise(floats, 'abs', a, b)`. The two scalar arguments
 /// are always present in the plan, NULL where the call had none, so one
 /// signature serves every function.
 pub fn call(samples: Expr, func: Func, a: Option<f64>, b: Option<f64>) -> Expr {
@@ -513,10 +513,10 @@ impl ScalarUDFImpl for Elementwise {
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        if !arg_types.first().is_some_and(series::is_samples_type) {
+        if !arg_types.first().is_some_and(series::is_floats_type) {
             return plan_err!(
                 "{NAME}: first argument must be {}, got {:?}",
-                series::samples_type(),
+                series::floats_type(),
                 arg_types.first()
             );
         }
@@ -1041,7 +1041,7 @@ mod tests {
         )
         .unwrap();
         batch
-            .column_by_name(series::SAMPLES)
+            .column_by_name(series::FLOATS)
             .unwrap()
             .as_list::<i32>()
             .clone()
@@ -1252,7 +1252,7 @@ mod tests {
         )
         .unwrap();
         let input = batch
-            .column_by_name(series::SAMPLES)
+            .column_by_name(series::FLOATS)
             .unwrap()
             .as_list::<i32>()
             .slice(1, 1);
@@ -1335,7 +1335,7 @@ mod tests {
         )
         .unwrap();
         batch
-            .column_by_name(series::SAMPLES)
+            .column_by_name(series::FLOATS)
             .unwrap()
             .as_list::<i32>()
             .clone()
@@ -1505,7 +1505,7 @@ mod tests {
         )
         .unwrap();
         let input = input
-            .column_by_name(series::SAMPLES)
+            .column_by_name(series::FLOATS)
             .unwrap()
             .as_list::<i32>()
             .clone();

@@ -96,7 +96,7 @@ async fn series_evaluation_reports_partition_width_and_only_block_order() {
                         .iter()
                         .map(|f| f.name().as_str())
                         .collect::<Vec<_>>(),
-                    ["labels", "samples", "block_start", "block_end", "series_id"]
+                    ["labels", "floats", "block_start", "block_end", "series_id"]
                 );
                 // Source co-location does not establish compatibility with
                 // DataFusion's hash function.
@@ -148,7 +148,7 @@ async fn series_evaluation_reports_partition_width_and_only_block_order() {
                         .iter()
                         .map(|f| f.name().as_str())
                         .collect::<Vec<_>>(),
-                    ["labels", "samples", "block_start", "block_end"]
+                    ["labels", "floats", "block_start", "block_end"]
                 );
             }
         }
@@ -238,7 +238,7 @@ async fn both_id_encodings_retain_raw_dependencies_below_series_eval() {
                                 .iter()
                                 .map(|f| f.name().as_str())
                                 .collect::<Vec<_>>(),
-                            ["labels", "samples", "block_start", "block_end"]
+                            ["labels", "floats", "block_start", "block_end"]
                         );
                         assert_eq!(
                             extension.node.schema().functional_dependencies(),
@@ -267,9 +267,9 @@ async fn ordinary_column_projection_preserves_aliases_schema_and_optimizer_fixpo
         let original = plan(1, id, "x").await;
         let eval = series_eval(&original);
         for names in [
-            vec!["samples"],
-            vec!["block_end", "samples", "block_start", "labels"],
-            vec!["samples", "samples"],
+            vec!["floats"],
+            vec!["block_end", "floats", "block_start", "labels"],
+            vec!["floats", "floats"],
         ] {
             let expressions = names
                 .iter()
@@ -297,9 +297,9 @@ async fn ordinary_column_projection_preserves_aliases_schema_and_optimizer_fixpo
                 let pruned = series_eval(&projected);
                 assert_eq!(pruned.children()[0].schema(), eval.children()[0].schema());
                 assert_eq!(pruned.children()[0].schema().fields().len(), 5);
-                if names.iter().all(|name| *name == "samples") {
+                if names.iter().all(|name| *name == "floats") {
                     assert_eq!(pruned.schema().fields().len(), 1);
-                    assert_eq!(pruned.schema().field(0).name(), "samples");
+                    assert_eq!(pruned.schema().field(0).name(), "floats");
                 }
             }
             let batches =
@@ -309,7 +309,7 @@ async fn ordinary_column_projection_preserves_aliases_schema_and_optimizer_fixpo
             assert!(batches.iter().any(|b| b.num_rows() > 0));
             for batch in batches {
                 assert_eq!(batch.schema(), projected_schema);
-                let index = names.iter().position(|n| *n == "samples").unwrap();
+                let index = names.iter().position(|n| *n == "floats").unwrap();
                 let samples = batch.column(index).as_list::<i32>();
                 assert!((0..batch.num_rows()).all(|row| samples.value_length(row) > 0));
             }

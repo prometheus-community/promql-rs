@@ -59,7 +59,7 @@ use crate::matcher::{mask_all, CompiledMatcher};
 use crate::series::decode;
 use crate::series::{
     clip, drop_empty, drop_unused_labels, encode, label_names_of, sample_item, with_block, Block,
-    Series, LABELS, SAMPLES, SERIES_ID, TIMESTAMP,
+    Series, FLOATS, LABELS, SERIES_ID, TIMESTAMP,
 };
 use crate::source::{SelectHints, SeriesSource};
 
@@ -456,7 +456,7 @@ fn split_into_chunks(
     rows_per_batch: usize,
 ) -> Result<Vec<RecordBatch>> {
     let samples = batch
-        .column_by_name(SAMPLES)
+        .column_by_name(FLOATS)
         .expect("canonical")
         .as_list::<i32>();
     let offsets = samples.value_offsets();
@@ -508,7 +508,7 @@ fn split_into_chunks(
             .iter()
             .zip(batch.columns())
             .map(|(field, column)| {
-                if field.name() == SAMPLES {
+                if field.name() == FLOATS {
                     Ok(Arc::clone(&samples))
                 } else {
                     take(column, &indices, None)
@@ -627,7 +627,7 @@ mod tests {
         let mut actual = Vec::new();
         for chunk in chunks {
             assert_eq!(chunk.schema(), batch.schema());
-            let samples = chunk.column_by_name(SAMPLES).unwrap().as_list::<i32>();
+            let samples = chunk.column_by_name(FLOATS).unwrap().as_list::<i32>();
             assert!(samples.value_offsets().windows(2).all(|w| w[1] - w[0] == 1));
             actual.extend_from_slice(
                 chunk
@@ -637,7 +637,7 @@ mod tests {
                     .values(),
             );
         }
-        let samples = batch.column_by_name(SAMPLES).unwrap().as_list::<i32>();
+        let samples = batch.column_by_name(FLOATS).unwrap().as_list::<i32>();
         let expected: Vec<_> = (0..batch.num_rows())
             .flat_map(|row| {
                 std::iter::repeat_n(expected.value(row), samples.value_length(row) as usize)

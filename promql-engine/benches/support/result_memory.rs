@@ -6,13 +6,13 @@ use std::collections::HashMap;
 
 use datafusion::arrow::array::{ArrayData, AsArray, RecordBatch};
 use datafusion::arrow::buffer::Buffer;
-use promql_engine::series::{LABELS, SAMPLES};
+use promql_engine::series::{FLOATS, LABELS};
 
 /// Logical payload: visible sample pairs (16 bytes each) plus UTF-8 label
 /// value bytes. Excludes offsets, views, block columns, capacities and headers.
 /// A repeated label value counts once per logical occurrence, not per owner.
 pub fn logical_bytes(batch: &RecordBatch) -> usize {
-    let samples = batch.column_by_name(SAMPLES).unwrap().as_list::<i32>();
+    let samples = batch.column_by_name(FLOATS).unwrap().as_list::<i32>();
     let points = samples.offsets()[batch.num_rows()] - samples.offsets()[0];
     let labels = batch.column_by_name(LABELS).unwrap().as_struct();
     let label_bytes: usize = labels

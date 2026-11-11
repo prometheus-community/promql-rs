@@ -128,7 +128,7 @@ fn aligned(k: usize, steps: usize) -> Vec<(Vec<i64>, Vec<f64>)> {
         .collect()
 }
 
-/// The `samples` column of those series, which is what the aggregate's
+/// The `floats` column of those series, which is what the aggregate's
 /// `update_batch` is handed. Routed through the canonical encoder so the
 /// list offsets and child layout match what the plan really produces.
 fn samples_of(all: &[(Vec<i64>, Vec<f64>)]) -> ArrayRef {
@@ -142,7 +142,7 @@ fn samples_of(all: &[(Vec<i64>, Vec<f64>)]) -> ArrayRef {
         })
         .collect();
     let batch = series::encode(&series::label_names_of(&series), &series, WHOLE).unwrap();
-    Arc::clone(batch.column_by_name(series::SAMPLES).unwrap())
+    Arc::clone(batch.column_by_name(series::FLOATS).unwrap())
 }
 
 /// `k` series of `n` samples with five labels, four of them varying.
@@ -247,7 +247,7 @@ fn assert_answers(
     assert!(batches.iter().any(|batch| batch.num_rows() > 0));
     for batch in batches {
         let out = batch
-            .column_by_name(series::SAMPLES)
+            .column_by_name(series::FLOATS)
             .unwrap()
             .as_list::<i32>();
         assert!((0..out.len()).all(|row| !out.value(row).is_empty()));
@@ -569,7 +569,7 @@ fn register_range_apply<'a>(suite: Suite<'a>) -> Suite<'a> {
     )
 }
 
-/// One accumulator filled with a whole `samples` column, all of it in
+/// One accumulator filled with a whole `floats` column, all of it in
 /// `groups` groups assigned round-robin.
 fn filled(op: Op, column: &ArrayRef, groups: &[usize], end_ms: i64, total: usize) -> Grouped {
     let mut acc = Grouped::new(op, 0, end_ms, STEP_MS).unwrap();
@@ -780,7 +780,7 @@ impl BinaryFixture {
             .collect();
         let names = series::label_names_of(&rows);
         let batch = series::encode(&names, &rows, WHOLE).unwrap();
-        let samples = batch.column_by_name(series::SAMPLES).unwrap();
+        let samples = batch.column_by_name(series::FLOATS).unwrap();
         let labels = batch.column_by_name(series::LABELS).unwrap();
         let sides: ArrayRef = Arc::new(BooleanArray::from(vec![false, true]));
         let pairs: Vec<[ArrayRef; 3]> = (0..groups)
@@ -793,12 +793,12 @@ impl BinaryFixture {
             })
             .collect();
         let schema = Schema::new(vec![
-            Field::new(series::SAMPLES, series::samples_type(), false),
+            Field::new(series::FLOATS, series::floats_type(), false),
             Field::new("side", DataType::Boolean, false),
             Field::new(series::LABELS, labels.data_type().clone(), false),
         ]);
         let mut exprs: Vec<Arc<dyn PhysicalExpr>> = vec![
-            Arc::new(Column::new(series::SAMPLES, 0)),
+            Arc::new(Column::new(series::FLOATS, 0)),
             Arc::new(Column::new("side", 1)),
             Arc::new(Column::new(series::LABELS, 2)),
         ];
@@ -1242,12 +1242,12 @@ fn register_absent<'a>(mut suite: Suite<'a>) -> Suite<'a> {
                     .get_or_insert_with(|| {
                         let udaf = absent::udaf();
                         let schema = Schema::new(vec![Field::new(
-                            series::SAMPLES,
-                            series::samples_type(),
+                            series::FLOATS,
+                            series::floats_type(),
                             false,
                         )]);
                         let exprs: Vec<Arc<dyn PhysicalExpr>> = vec![
-                            Arc::new(Column::new(series::SAMPLES, 0)),
+                            Arc::new(Column::new(series::FLOATS, 0)),
                             Arc::new(Literal::new(ScalarValue::Int64(Some(0)))),
                             Arc::new(Literal::new(ScalarValue::Int64(Some(end_ms)))),
                             Arc::new(Literal::new(ScalarValue::Int64(Some(STEP_MS)))),
@@ -1257,7 +1257,7 @@ fn register_absent<'a>(mut suite: Suite<'a>) -> Suite<'a> {
                             .map(|e| e.return_field(&schema).unwrap())
                             .collect();
                         let return_field =
-                            Arc::new(Field::new("out", series::samples_type(), false));
+                            Arc::new(Field::new("out", series::floats_type(), false));
                         let column = populate.then(|| {
                             let rows: Vec<(Vec<i64>, Vec<f64>)> = (0..10)
                                 .map(|_| {

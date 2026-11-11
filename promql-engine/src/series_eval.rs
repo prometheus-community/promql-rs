@@ -22,7 +22,7 @@ use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, Phy
 
 use crate::buffer::Kernel;
 use crate::params::Params;
-use crate::series::{BLOCK_END, BLOCK_START, LABELS, SAMPLES, SERIES_ID};
+use crate::series::{BLOCK_END, BLOCK_START, FLOATS, LABELS, SERIES_ID};
 
 pub(crate) mod exec;
 mod state;
@@ -52,7 +52,7 @@ impl SeriesEval {
         // Bind by name, retaining field and schema metadata but not raw
         // identity uniqueness. Physical construction binds the ID type.
         input.schema().field_with_unqualified_name(SERIES_ID)?;
-        let fields = [LABELS, SAMPLES, BLOCK_START, BLOCK_END]
+        let fields = [LABELS, FLOATS, BLOCK_START, BLOCK_END]
             .into_iter()
             .map(|name| input.schema().field_with_unqualified_name(name).cloned())
             .collect::<Result<Vec<_>>>()?;
@@ -109,7 +109,7 @@ impl UserDefinedLogicalNodeCore for SeriesEval {
         // Samples-only output still needs full raw identity, samples and
         // blocks. Speculative extracted columns are not output aliases.
         let schema = self.input.schema();
-        let columns = [LABELS, SAMPLES, BLOCK_START, BLOCK_END, SERIES_ID]
+        let columns = [LABELS, FLOATS, BLOCK_START, BLOCK_END, SERIES_ID]
             .into_iter()
             .map(|name| schema.index_of_column_by_name(None, name))
             .collect::<Option<Vec<_>>>()?;
@@ -224,7 +224,7 @@ mod tests {
             .iter()
             .map(|f| f.name().as_str())
             .collect();
-        assert_eq!(names, [LABELS, SAMPLES, BLOCK_START, BLOCK_END]);
+        assert_eq!(names, [LABELS, FLOATS, BLOCK_START, BLOCK_END]);
         assert_eq!(
             eval.schema.functional_dependencies(),
             &FunctionalDependencies::empty()
@@ -387,11 +387,11 @@ mod tests {
         assert_eq!(rebuilt, eval);
         assert_eq!(rebuilt.partial_cmp(&eval), Some(Ordering::Equal));
         assert!(eval
-            .with_exprs_and_inputs(vec![col(SAMPLES)], vec![raw()])
+            .with_exprs_and_inputs(vec![col(FLOATS)], vec![raw()])
             .is_err());
         assert!(eval.with_exprs_and_inputs(vec![], vec![]).is_err());
         let reordered = datafusion::logical_expr::LogicalPlanBuilder::from(raw())
-            .project([SERIES_ID, BLOCK_END, SAMPLES, LABELS, BLOCK_START].map(col))
+            .project([SERIES_ID, BLOCK_END, FLOATS, LABELS, BLOCK_START].map(col))
             .unwrap()
             .build()
             .unwrap();
@@ -407,7 +407,7 @@ mod tests {
     #[test]
     fn raw_identity_is_mandatory_even_for_samples_only_output() {
         let missing_id = datafusion::logical_expr::LogicalPlanBuilder::from(raw())
-            .project([LABELS, SAMPLES, BLOCK_START, BLOCK_END].map(col))
+            .project([LABELS, FLOATS, BLOCK_START, BLOCK_END].map(col))
             .unwrap()
             .build()
             .unwrap();

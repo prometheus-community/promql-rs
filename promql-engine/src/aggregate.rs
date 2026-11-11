@@ -1,5 +1,5 @@
 //! PromQL aggregation as a DataFusion aggregate function:
-//! `promql_aggregate(samples, 'sum') … GROUP BY <label columns>`.
+//! `promql_aggregate(floats, 'sum') … GROUP BY <label columns>`.
 //!
 //! Every input series is already on the query's step grid — evaluation
 //! emits at `start + i * step` — so a timestamp *is* an array index, and
@@ -1074,7 +1074,7 @@ impl Grouped {
         }
     }
 
-    /// The timestamps and values of a whole `samples` column, flat; the
+    /// The timestamps and values of a whole `floats` column, flat; the
     /// list offsets cut them into series.
     fn samples(list: &ListArray) -> Result<(&[i64], &[f64])> {
         let entries = list.values().as_struct();
@@ -1438,7 +1438,7 @@ impl Default for Aggregate {
         Self {
             signature: Signature::exact(
                 vec![
-                    series::samples_type(),
+                    series::floats_type(),
                     DataType::Utf8,
                     DataType::Int64,
                     DataType::Int64,
@@ -1454,7 +1454,7 @@ pub fn udaf() -> AggregateUDF {
     AggregateUDF::new_from_impl(Aggregate::default())
 }
 
-/// `promql_aggregate(samples, '<op>', start, end, step)`. The step grid
+/// `promql_aggregate(floats, '<op>', start, end, step)`. The step grid
 /// is an argument because it is what turns a timestamp into an array
 /// index; see `Grid`.
 pub fn call(samples: Expr, op: Op, start_ms: i64, end_ms: i64, step_ms: i64) -> Expr {
@@ -1518,14 +1518,14 @@ impl AggregateUDFImpl for Aggregate {
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        if arg_types.first() != Some(&series::samples_type()) {
+        if arg_types.first() != Some(&series::floats_type()) {
             return plan_err!(
                 "{NAME}: first argument must be {}, got {:?}",
-                series::samples_type(),
+                series::floats_type(),
                 arg_types.first()
             );
         }
-        Ok(series::samples_type())
+        Ok(series::floats_type())
     }
 
     /// Every group yields a list, possibly empty; never NULL.
@@ -1762,7 +1762,7 @@ mod tests {
         (index < view.len && view.seen.get_bit(at)).then(|| get(view.lanes, at))
     }
 
-    /// One list row of an emitted `samples` array.
+    /// One list row of an emitted `floats` array.
     fn rows(list: &ListArray, group: usize) -> Vec<(i64, f64)> {
         let row = list.value(group);
         let entries = row.as_struct();
@@ -2158,7 +2158,7 @@ mod tests {
         acc.add_series(0, &[30_000], &[1.0]).unwrap();
         acc.add_series(0, &[0], &[2.0]).unwrap();
         let arr = acc.evaluate(EmitTo::All).unwrap();
-        assert_eq!(arr.data_type(), &series::samples_type());
+        assert_eq!(arr.data_type(), &series::floats_type());
         let list = arr.as_list::<i32>();
         assert_eq!(list.len(), 2, "one row per group, empty or not");
         assert_eq!(list.value(0).len(), 2);
@@ -2170,7 +2170,7 @@ mod tests {
         );
         assert_eq!(
             empty_samples().to_array().unwrap().data_type(),
-            &series::samples_type()
+            &series::floats_type()
         );
     }
 
@@ -2367,7 +2367,7 @@ mod tests {
         assert!(err.contains(&format!("{STATE_N} is not Float64")), "{err}");
     }
 
-    /// A `samples` column holding one list row per series.
+    /// A `floats` column holding one list row per series.
     fn samples_column(series: &[Vec<(i64, f64)>]) -> ArrayRef {
         let mut offsets = vec![0i32];
         let (mut ts, mut vs) = (Vec::new(), Vec::new());
@@ -2395,7 +2395,7 @@ mod tests {
     fn batches() -> (Arc<Schema>, Vec<RecordBatch>) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("job", DataType::Utf8, false),
-            Field::new(series::SAMPLES, series::samples_type(), false),
+            Field::new(series::FLOATS, series::floats_type(), false),
         ]));
         let mut batches = Vec::new();
         for batch in 0..6 {
@@ -2447,7 +2447,7 @@ mod tests {
         )
         .unwrap();
         let sql = format!(
-            "SELECT job, {NAME}(samples, '{}', 0, 4, 1) AS out FROM t GROUP BY job ORDER BY job",
+            "SELECT job, {NAME}(floats, '{}', 0, 4, 1) AS out FROM t GROUP BY job ORDER BY job",
             op.as_str()
         );
         let frame = ctx.sql(&sql).await.unwrap();
@@ -2534,7 +2534,7 @@ mod tests {
         .unwrap();
         let frame = ctx
             .sql(&format!(
-                "SELECT {NAME}(samples, 'sum', 0, 4, 1) AS out FROM t"
+                "SELECT {NAME}(floats, 'sum', 0, 4, 1) AS out FROM t"
             ))
             .await
             .unwrap();

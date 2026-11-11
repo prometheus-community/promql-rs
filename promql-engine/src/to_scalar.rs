@@ -152,7 +152,7 @@ pub fn udaf() -> AggregateUDF {
     AggregateUDF::new_from_impl(Scalar::default())
 }
 
-/// `promql_scalar(samples, start, end, step)`. The grid is an argument
+/// `promql_scalar(floats, start, end, step)`. The grid is an argument
 /// for the reason [`crate::absent::call`] gives.
 pub fn call(
     samples: datafusion::logical_expr::Expr,
@@ -189,10 +189,10 @@ impl AggregateUDFImpl for Scalar {
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        if !arg_types.first().is_some_and(series::is_samples_type) {
+        if !arg_types.first().is_some_and(series::is_floats_type) {
             return plan_err!(
                 "{NAME}: first argument must be {}, got {:?}",
-                series::samples_type(),
+                series::floats_type(),
                 arg_types.first()
             );
         }
@@ -201,7 +201,7 @@ impl AggregateUDFImpl for Scalar {
                 return plan_err!("{NAME}: argument {i} must be Int64, got {t}");
             }
         }
-        Ok(series::samples_type())
+        Ok(series::floats_type())
     }
 
     fn is_nullable(&self) -> bool {
@@ -215,7 +215,7 @@ impl AggregateUDFImpl for Scalar {
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
         Ok(vec![Arc::new(Field::new(
             format_state_name(args.name, "said"),
-            series::samples_type(),
+            series::floats_type(),
             false,
         ))])
     }
@@ -230,7 +230,7 @@ mod tests {
     use datafusion::prelude::{SessionConfig, SessionContext};
 
     use super::*;
-    use crate::series::SAMPLES;
+    use crate::series::FLOATS;
 
     const GRID: (i64, i64, i64) = (0, 60_000, 30_000);
 
@@ -289,7 +289,7 @@ mod tests {
             DataType::Int64,
             DataType::Int64,
         ];
-        assert_eq!(scalar.return_type(&types).unwrap(), series::samples_type());
+        assert_eq!(scalar.return_type(&types).unwrap(), series::floats_type());
         types[1] = DataType::Float64;
         assert!(scalar.return_type(&types).is_err());
         types[1] = DataType::Int64;
@@ -344,8 +344,8 @@ mod tests {
     #[tokio::test]
     async fn no_rows_at_all_is_nan_at_every_step() {
         let schema = Arc::new(Schema::new(vec![Field::new(
-            SAMPLES,
-            series::samples_type(),
+            FLOATS,
+            series::floats_type(),
             false,
         )]));
         let table =
@@ -359,7 +359,7 @@ mod tests {
             .unwrap()
             .aggregate(
                 Vec::<datafusion::logical_expr::Expr>::new(),
-                vec![call(col(SAMPLES), GRID.0, GRID.1, GRID.2).alias(SAMPLES)],
+                vec![call(col(FLOATS), GRID.0, GRID.1, GRID.2).alias(FLOATS)],
             )
             .unwrap();
         let batches = df.collect().await.unwrap();

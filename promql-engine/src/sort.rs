@@ -36,7 +36,7 @@ use datafusion::logical_expr::{
     Volatility,
 };
 
-use crate::series::{self, LABELS, SAMPLES, VALUE};
+use crate::series::{self, FLOATS, LABELS, VALUE};
 
 /// Which of the four this is. Named for the `promql/functions.go`
 /// functions they mirror.
@@ -97,7 +97,7 @@ pub fn exprs(func: Func, labels: &[String], label_names: &[String]) -> Vec<SortE
         // An instant query narrows a row to at most one sample, so the
         // last is the step's. A row with none is null, which sorts after
         // every NaN, and `drop_empty` removes it before anyone sees it.
-        let value = get_field(array_element(col(SAMPLES), lit(-1_i64)), VALUE);
+        let value = get_field(array_element(col(FLOATS), lit(-1_i64)), VALUE);
         return vec![
             // NaN last whichever way the values go: `funcSort` and
             // `funcSortDesc` both reverse a heap that sorts NaN first.

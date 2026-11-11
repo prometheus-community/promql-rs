@@ -193,7 +193,7 @@ async fn selectors_and_ranges_release_upper_block_prefixes_through_exchange_befo
         let mut points = Vec::new();
         for batch in output {
             let lists = batch
-                .column_by_name(series::SAMPLES)
+                .column_by_name(series::FLOATS)
                 .unwrap()
                 .as_list::<i32>();
             for row in 0..batch.num_rows() {

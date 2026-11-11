@@ -15,9 +15,9 @@
 //!
 //! Projection: promql_labels('pod', __group__pod) AS labels, samples, block_start, block_end
 //!   Aggregate: groupBy=[block_start, block_end, get_field(labels, 'pod') AS __group__pod],
-//!              aggr=[promql_aggregate(samples, 'sum') AS samples]
+//!              aggr=[promql_aggregate(floats, 'sum') AS floats]
 //!     Projection: promql_labels(…without __name__) AS labels, samples, block_start, block_end
-//!       SeriesEval: rate(samples[5m], …) per series per block
+//!       SeriesEval: rate(floats[5m], …) per series per block
 //!         TableScan: selector_0        ← SelectorTable over SeriesSource::select
 //! ```
 //!
@@ -28,7 +28,7 @@
 //! above reads the shape by position through [`series::validate`].
 //!
 //! The `__group__` prefix on a group key keeps a label named `labels`
-//! or `samples` from colliding with the engine's own columns; see
+//! or `floats` from colliding with the engine's own columns; see
 //! [`labels::group_exprs`]. [`labels::regroup`] restores the bare name.
 
 use std::future::Future;
@@ -58,7 +58,7 @@ use crate::matrix;
 use crate::params::{step_count, Params};
 use crate::range::{Func, RangeOp};
 use crate::selector;
-use crate::series::{Block, Series, BLOCK_END, BLOCK_START, LABELS, SAMPLES};
+use crate::series::{Block, Series, BLOCK_END, BLOCK_START, FLOATS, LABELS};
 use crate::series_eval::SeriesEval;
 use crate::sort;
 use crate::source::{Grouping, SelectHints, SelectorTable, SeriesSource};
@@ -733,16 +733,16 @@ impl Planner<'_> {
             .aggregate(
                 Vec::<datafusion::logical_expr::Expr>::new(),
                 vec![to_scalar::call(
-                    col(SAMPLES),
+                    col(FLOATS),
                     self.query.start_ms,
                     self.query.end_ms,
                     self.query.step_ms,
                 )
-                .alias(SAMPLES)],
+                .alias(FLOATS)],
             )?
             .project(whole_grid(
                 labels::call(Vec::new()).alias(LABELS),
-                col(SAMPLES),
+                col(FLOATS),
             ))?
             .build()?;
         Ok(Planned {
@@ -770,14 +770,14 @@ impl Planner<'_> {
             .aggregate(
                 Vec::<datafusion::logical_expr::Expr>::new(),
                 vec![absent::call(
-                    col(SAMPLES),
+                    col(FLOATS),
                     self.query.start_ms,
                     self.query.end_ms,
                     self.query.step_ms,
                 )
-                .alias(SAMPLES)],
+                .alias(FLOATS)],
             )?
-            .project(whole_grid(labels_expr.alias(LABELS), col(SAMPLES)))?
+            .project(whole_grid(labels_expr.alias(LABELS), col(FLOATS)))?
             .build()?;
         Ok(Planned { plan, label_names })
     }
@@ -834,12 +834,12 @@ impl Planner<'_> {
             .project(vec![
                 labels_expr.alias(LABELS),
                 elementwise::call(
-                    col(SAMPLES),
+                    col(FLOATS),
                     func,
                     args.first().copied(),
                     args.get(1).copied(),
                 )
-                .alias(SAMPLES),
+                .alias(FLOATS),
                 col(BLOCK_START),
                 col(BLOCK_END),
             ])?
@@ -887,7 +887,7 @@ impl Planner<'_> {
             .alias(stage)?
             .project(vec![
                 labels_expr.alias(LABELS),
-                elementwise::call(col(SAMPLES), func, None, None).alias(SAMPLES),
+                elementwise::call(col(FLOATS), func, None, None).alias(FLOATS),
                 col(BLOCK_START),
                 col(BLOCK_END),
             ])?
@@ -960,12 +960,12 @@ impl Planner<'_> {
             .project(vec![
                 labels_expr.alias(LABELS),
                 elementwise::call(
-                    col(SAMPLES),
+                    col(FLOATS),
                     elementwise::Func::Binary { op, return_bool },
                     a,
                     b,
                 )
-                .alias(SAMPLES),
+                .alias(FLOATS),
                 col(BLOCK_START),
                 col(BLOCK_END),
             ])?
@@ -1020,7 +1020,7 @@ impl Planner<'_> {
             .aggregate(
                 labels::group_exprs(&keys),
                 vec![binary::call(
-                    col(SAMPLES),
+                    col(FLOATS),
                     col(binary::SIDE),
                     col(LABELS),
                     op,
@@ -1041,7 +1041,7 @@ impl Planner<'_> {
             .unnest_column(Column::new_unqualified(PAIRS))?
             .project(whole_grid(
                 col(pair_column(binary::PAIR_LABELS)).alias(LABELS),
-                col(pair_column(binary::PAIR_SAMPLES)).alias(SAMPLES),
+                col(pair_column(binary::PAIR_FLOATS)).alias(FLOATS),
             ))?
             .build()?;
         // The aggregation builds the result labels itself, in the
@@ -1067,7 +1067,7 @@ impl Planner<'_> {
             .alias(stage)?
             .project(vec![
                 labels::widen(&operand.label_names, names).alias(LABELS),
-                col(SAMPLES),
+                col(FLOATS),
                 lit(is_rhs).alias(binary::SIDE),
             ])?
             .build()?)
@@ -1316,7 +1316,7 @@ impl Planner<'_> {
         let plan = builder
             .project(vec![
                 col(LABELS),
-                matrix::call(col(SAMPLES), window).alias(SAMPLES),
+                matrix::call(col(FLOATS), window).alias(FLOATS),
                 col(BLOCK_START),
                 col(BLOCK_END),
             ])?
@@ -1359,13 +1359,13 @@ impl Planner<'_> {
             .aggregate(
                 group,
                 vec![aggregate::call(
-                    col(SAMPLES),
+                    col(FLOATS),
                     op,
                     self.query.start_ms,
                     self.query.end_ms,
                     self.query.step_ms,
                 )
-                .alias(SAMPLES)],
+                .alias(FLOATS)],
             )?
             .project(canonical(labels::regroup(&keys).alias(LABELS)))?
             .build()?;
@@ -1399,7 +1399,7 @@ fn whole_grid(
 /// aliasing `labels` to its own name leaves the optimizer two columns
 /// of that name to choose from.
 fn canonical(labels: datafusion::logical_expr::Expr) -> Vec<datafusion::logical_expr::Expr> {
-    vec![labels, col(SAMPLES), col(BLOCK_START), col(BLOCK_END)]
+    vec![labels, col(FLOATS), col(BLOCK_START), col(BLOCK_END)]
 }
 
 fn offset_ms(vs: &VectorSelector) -> Result<i64, EngineError> {

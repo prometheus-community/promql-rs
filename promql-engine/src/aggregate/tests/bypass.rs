@@ -244,7 +244,7 @@ fn bypass_singleton_and_multi_sample_partial_merge_in_both_orders() {
 fn native_input(end: i64) -> Arc<dyn ExecutionPlan> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("job", DataType::Utf8, false),
-        Field::new(series::SAMPLES, series::samples_type(), true),
+        Field::new(series::FLOATS, series::floats_type(), true),
         Field::new("keep", DataType::Boolean, true),
     ]));
     let mut batches = Vec::new();
@@ -301,7 +301,7 @@ fn native_input(end: i64) -> Arc<dyn ExecutionPlan> {
 fn native_large_variance_input() -> Arc<dyn ExecutionPlan> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("job", DataType::Utf8, false),
-        Field::new(series::SAMPLES, series::samples_type(), true),
+        Field::new(series::FLOATS, series::floats_type(), true),
         Field::new("keep", DataType::Boolean, true),
     ]));
     // Matching keys make the final accumulator merge, rather than just copy,
@@ -357,7 +357,7 @@ async fn native_with_input(
     let expr = AggregateExprBuilder::new(
         ctx.udaf(NAME).unwrap(),
         vec![
-            col(series::SAMPLES, &schema).unwrap(),
+            col(series::FLOATS, &schema).unwrap(),
             lit(op.as_str()),
             lit(0i64),
             lit(end),

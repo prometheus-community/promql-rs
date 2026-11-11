@@ -1,6 +1,6 @@
 //! The binary operators between two vectors, and the matching that
 //! decides which series pair, as an aggregate function:
-//! `promql_binary(samples, __rhs, labels, '+', 'on(job) group_left()', start, end, step)`.
+//! `promql_binary(floats, __rhs, labels, '+', 'on(job) group_left()', start, end, step)`.
 //!
 //! [`Op`] is the arithmetic itself, upstream's `vectorElemBinop`
 //! (`promql/engine.go:3257` at 83962c35) restricted to the float/float
@@ -546,12 +546,12 @@ pub fn is_matching_error(message: &str) -> bool {
 /// The result label set and the samples under it, the shape [`udaf`]
 /// answers with.
 pub const PAIR_LABELS: &str = "labels";
-pub const PAIR_SAMPLES: &str = "samples";
+pub const PAIR_FLOATS: &str = "floats";
 
 fn pair_fields(names: &[String]) -> Fields {
     Fields::from(vec![
         Field::new(PAIR_LABELS, series::labels_type(names), false),
-        Field::new(PAIR_SAMPLES, series::samples_type(), false),
+        Field::new(PAIR_FLOATS, series::floats_type(), false),
     ])
 }
 
@@ -1516,7 +1516,7 @@ pub fn udaf() -> AggregateUDF {
     AggregateUDF::new_from_impl(Binary::default())
 }
 
-/// `promql_binary(samples, <side>, labels, '<op>', '<matching>', …grid)`.
+/// `promql_binary(floats, <side>, labels, '<op>', '<matching>', …grid)`.
 ///
 /// The grid is an argument for the same reason [`crate::aggregate`]
 /// takes one: it turns a timestamp into a lane index. `labels` is the
@@ -1618,10 +1618,10 @@ impl AggregateUDFImpl for Binary {
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        if arg_types.first() != Some(&series::samples_type()) {
+        if arg_types.first() != Some(&series::floats_type()) {
             return plan_err!(
                 "{NAME}: first argument must be {}, got {:?}",
-                series::samples_type(),
+                series::floats_type(),
                 arg_types.first()
             );
         }
@@ -1753,7 +1753,7 @@ mod tests {
         let pairs = list.value(0);
         let pairs = pairs.as_struct();
         let labels = pairs.column_by_name(PAIR_LABELS).unwrap().as_struct();
-        let samples = pairs.column_by_name(PAIR_SAMPLES).unwrap().as_list::<i32>();
+        let samples = pairs.column_by_name(PAIR_FLOATS).unwrap().as_list::<i32>();
         (0..pairs.len())
             .map(|row| {
                 let entries = samples.value(row);

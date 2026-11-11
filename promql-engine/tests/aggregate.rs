@@ -223,10 +223,10 @@ async fn the_plan_is_an_aggregate_over_the_label_fields() {
         .unwrap();
     let rendered = promql_engine::explain_plan(&plan);
     assert!(
-        rendered.contains("Aggregate: sum by (route) (samples, 0..60000 step 30s) per block"),
+        rendered.contains("Aggregate: sum by (route) (floats, 0..60000 step 30s) per block"),
         "{rendered}"
     );
-    assert!(rendered.contains("SeriesEval: vector_selector(samples, 0..60000 step 30s, lookback 5m) per series per block"), "{rendered}");
+    assert!(rendered.contains("SeriesEval: vector_selector(floats, 0..60000 step 30s, lookback 5m) per series per block"), "{rendered}");
     assert_eq!(
         promql_engine::series::label_names(plan.schema().as_arrow()),
         ["route"]

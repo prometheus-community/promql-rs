@@ -286,7 +286,7 @@ mod generate {
     use super::{Case, Corpus, ExpectedSeries};
 
     const INTERVAL_SECS: f64 = 15.0;
-    const SAMPLES: usize = 40;
+    const FLOATS: usize = 40;
     /// Half of `COUNTERS`/`GAUGES` get a straight run of samples; the
     /// other half are split into two same-labelled lines that each hold
     /// half the timeline, to exercise `from_descriptions`'s "duplicate
@@ -361,8 +361,8 @@ mod generate {
     /// friends all see the cases they exist for.
     fn counter_tokens(rng: &mut Rng, start: f64) -> Vec<Token> {
         let mut cur = start;
-        let mut out = Vec::with_capacity(SAMPLES);
-        for _ in 0..SAMPLES {
+        let mut out = Vec::with_capacity(FLOATS);
+        for _ in 0..FLOATS {
             if rng.chance(0.06) {
                 out.push(Token::Gap);
                 continue;
@@ -386,8 +386,8 @@ mod generate {
     /// monotone line.
     fn gauge_tokens(rng: &mut Rng, start: f64) -> Vec<Token> {
         let mut cur = start;
-        let mut out = Vec::with_capacity(SAMPLES);
-        for _ in 0..SAMPLES {
+        let mut out = Vec::with_capacity(FLOATS);
+        for _ in 0..FLOATS {
             if rng.chance(0.06) {
                 out.push(Token::Gap);
                 continue;

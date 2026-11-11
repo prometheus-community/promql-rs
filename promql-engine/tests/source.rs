@@ -119,7 +119,7 @@ impl SeriesSource for PartitionedSource {
         // Put columns in a different order beneath evaluation to exercise
         // name binding through ordinary DataFusion operators.
         let filtered: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(lit(true), input)?);
-        let names = ["block_end", "labels", "samples", "block_start", SERIES_ID];
+        let names = ["block_end", "labels", "floats", "block_start", SERIES_ID];
         let expressions = names
             .into_iter()
             .map(|name| {
@@ -237,7 +237,7 @@ async fn source_assembly_survives_engine_optimization() {
                     .map(|batch| {
                         let columns = [
                             series::LABELS,
-                            series::SAMPLES,
+                            series::FLOATS,
                             series::BLOCK_START,
                             series::BLOCK_END,
                             series::SERIES_ID,
@@ -407,7 +407,7 @@ async fn reordered_source_columns_preserve_answers_and_metadata() {
                 .map(String::as_str),
             Some("partitioned")
         );
-        for name in ["labels", "samples", "block_start", "block_end"] {
+        for name in ["labels", "floats", "block_start", "block_end"] {
             assert_eq!(
                 plan.schema()
                     .field_with_name(name)
@@ -433,7 +433,7 @@ async fn reordered_source_columns_preserve_answers_and_metadata() {
         assert_eq!(seen, 1);
         let aliased = Arc::new(
             ProjectionExec::try_new(
-                ["samples", "labels"]
+                ["floats", "labels"]
                     .into_iter()
                     .map(|name| {
                         (
@@ -455,7 +455,7 @@ async fn reordered_source_columns_preserve_answers_and_metadata() {
         assert!(batches.iter().any(|batch| batch.num_rows() > 0));
         for batch in batches {
             assert_eq!(batch.schema(), aliased_schema);
-            assert_eq!(batch.schema().field(0).name(), "out_samples");
+            assert_eq!(batch.schema().field(0).name(), "out_floats");
             assert_eq!(batch.schema().field(1).name(), "out_labels");
             assert_eq!(
                 batch
@@ -464,7 +464,7 @@ async fn reordered_source_columns_preserve_answers_and_metadata() {
                     .metadata()
                     .get("source-field")
                     .map(String::as_str),
-                Some("samples")
+                Some("floats")
             );
             assert!((0..batch.num_rows()).all(|row| batch
                 .column(0)

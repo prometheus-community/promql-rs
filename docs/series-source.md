@@ -103,7 +103,7 @@ block and one chunk per series; it still supplies mandatory IDs.
 
 ```text
 labels       Struct<{name}: Utf8View, …>    one field per label name, sorted
-samples      List<Struct<timestamp: Timestamp(ms), value: Float64>>
+floats       List<Struct<timestamp: Timestamp(ms), value: Float64>>
 block_start  Timestamp(ms)                  inclusive window-end boundary
 block_end    Timestamp(ms)                  exclusive; both constant within a block
 series_id    UInt64 | FixedSizeBinary(n>0)  mandatory raw identity, internal to evaluation
@@ -116,7 +116,7 @@ arrays, not run-end encoded. `Float64` preserves StaleNaN's exact `0x7ff0_0000_0
 nothing may cast it through an ordinary NaN.
 
 Columns bind by name, so sources may reorder them and supply extra columns.
-Evaluation binds `labels`, `samples`, both edges and `series_id`; it emits the
+Evaluation binds `labels`, `floats`, both edges and `series_id`; it emits the
 canonical four fields in that order, preserving field and schema metadata.
 IDs and other source-only columns never escape evaluation. `series.rs` defines
 the shape; `series::validate` is an explicit utility, not a required

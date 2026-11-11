@@ -53,7 +53,7 @@ use super::state;
 use crate::buffer::{EvalContext, Kernel, PushCursor, WorkBudget};
 use crate::params::Params;
 use crate::series::{
-    self, Block, SamplesBuilder, BLOCK_END, BLOCK_START, LABELS, SAMPLES, SERIES_ID,
+    self, Block, SamplesBuilder, BLOCK_END, BLOCK_START, FLOATS, LABELS, SERIES_ID,
 };
 
 const BATCH_SAMPLES: usize = 1 << 20;
@@ -82,7 +82,7 @@ impl SeriesEvalExec {
         grid: Params,
     ) -> Result<Self> {
         let input_schema = input.schema();
-        let fields = [LABELS, SAMPLES, BLOCK_START, BLOCK_END]
+        let fields = [LABELS, FLOATS, BLOCK_START, BLOCK_END]
             .into_iter()
             .map(|name| input_schema.field_with_name(name).cloned().map(Arc::new))
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -270,7 +270,7 @@ impl ExecutionPlan for SeriesEvalExec {
         let DataType::Struct(fields) = schema.field_with_name(LABELS)?.data_type() else {
             return internal_err!("series evaluation needs canonical labels");
         };
-        let DataType::List(sample_item) = schema.field_with_name(SAMPLES)?.data_type() else {
+        let DataType::List(sample_item) = schema.field_with_name(FLOATS)?.data_type() else {
             unreachable!("trusted source samples shape");
         };
         Ok(Box::pin(cooperative(SeriesStream {
@@ -572,7 +572,7 @@ impl SeriesStream {
         budget: &mut WorkBudget,
     ) -> Result<usize> {
         let samples = batch
-            .column_by_name(SAMPLES)
+            .column_by_name(FLOATS)
             .expect("bound source column")
             .as_list::<i32>();
         let (ts, vs) = series::sample_slices(samples.values().as_struct());

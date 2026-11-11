@@ -66,7 +66,7 @@ fn single_step_updates_and_emission_match_every_scalar_operator_bit_for_bit() {
         let output = acc.evaluate(EmitTo::All).unwrap();
         let list = output.as_list::<i32>();
         assert_eq!(list.offsets().as_ref(), &[0, 1, 2, 3, 4, 4, 4, 4, 4]);
-        assert_eq!(list.data_type(), &series::samples_type());
+        assert_eq!(list.data_type(), &series::floats_type());
         for (g, want) in expected.iter().enumerate() {
             let got = rows(list, g);
             assert_eq!(got[0].0, 41);

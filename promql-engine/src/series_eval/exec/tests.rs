@@ -160,7 +160,7 @@ async fn reference(
     let mut groups: Vec<ReferenceSeries> = Vec::new();
     let mut previous = None;
     for input in &source.0 {
-        let samples = input.column_by_name(SAMPLES).unwrap().as_list::<i32>();
+        let samples = input.column_by_name(FLOATS).unwrap().as_list::<i32>();
         let (ts, vs) = series::sample_slices(samples.values().as_struct());
         for row in 0..input.num_rows() {
             let bounds = series::block_of(input, row);
@@ -245,7 +245,7 @@ fn private_stream(exec: &SeriesEvalExec, ctx: &SessionContext, batch_size: usize
         unreachable!()
     };
     let DataType::List(sample_item) = input_schema
-        .field_with_name(SAMPLES)
+        .field_with_name(FLOATS)
         .unwrap()
         .data_type()
         .clone()
@@ -322,7 +322,7 @@ async fn many_contiguous_series_produce_independent_bounded_arrays_across_batch_
         while let Some(batch) = stream.next().await {
             let batch = batch.unwrap();
             assert!(batch.num_rows() <= 3);
-            let samples = batch.column_by_name(SAMPLES).unwrap().as_list::<i32>();
+            let samples = batch.column_by_name(FLOATS).unwrap().as_list::<i32>();
             assert_eq!(samples.offset(), 0);
             assert_eq!(samples.value_offsets()[0], 0);
             assert!(samples.values().len() <= 3);
@@ -478,7 +478,7 @@ async fn same_id_across_blocks_closes_afresh_and_keeps_empty_rows() {
             .iter()
             .map(|batch| {
                 batch
-                    .column_by_name(SAMPLES)
+                    .column_by_name(FLOATS)
                     .unwrap()
                     .as_list::<i32>()
                     .value_offsets()
@@ -889,7 +889,7 @@ async fn child_replacement_binds_columns_without_restricting_source_operators() 
         .replace_children(vec![input.clone(), input.clone()], options)
         .is_err());
     let reordered = ProjectionExec::try_new(
-        [SERIES_ID, BLOCK_END, SAMPLES, LABELS, BLOCK_START]
+        [SERIES_ID, BLOCK_END, FLOATS, LABELS, BLOCK_START]
             .into_iter()
             .map(|name| {
                 (
@@ -1093,19 +1093,19 @@ async fn aliases_reordering_and_duplicates_remain_native_with_identical_results_
     let base: Arc<dyn ExecutionPlan> =
         Arc::new(SeriesEvalExec::try_new(exec.input.clone(), exec.kernel, exec.grid).unwrap());
     for columns in [
-        vec![(SAMPLES, 1, "values")],
-        vec![(SAMPLES, 1, SAMPLES), (LABELS, 0, LABELS)],
-        vec![(SAMPLES, 1, SAMPLES), (SAMPLES, 1, SAMPLES)],
+        vec![(FLOATS, 1, "values")],
+        vec![(FLOATS, 1, FLOATS), (LABELS, 0, LABELS)],
+        vec![(FLOATS, 1, FLOATS), (FLOATS, 1, FLOATS)],
         vec![
             (BLOCK_END, 3, BLOCK_END),
-            (SAMPLES, 1, SAMPLES),
+            (FLOATS, 1, FLOATS),
             (BLOCK_START, 2, BLOCK_START),
             (LABELS, 0, LABELS),
         ],
         vec![
-            (SAMPLES, 1, "values"),
+            (FLOATS, 1, "values"),
             (BLOCK_START, 2, "start"),
-            (SAMPLES, 1, "values_again"),
+            (FLOATS, 1, "values_again"),
         ],
     ] {
         let projected = project_columns(base.clone(), &columns);
@@ -1135,7 +1135,7 @@ async fn aliases_reordering_and_duplicates_remain_native_with_identical_results_
         let sample_indices: Vec<_> = columns
             .iter()
             .enumerate()
-            .filter_map(|(index, &(name, _, _))| (name == SAMPLES).then_some(index))
+            .filter_map(|(index, &(name, _, _))| (name == FLOATS).then_some(index))
             .collect();
         if sample_indices.len() == 2 {
             assert!(Arc::ptr_eq(
@@ -1205,16 +1205,13 @@ async fn nested_projections_preserve_name_binding_child_replacement_and_optimize
     let exec = lower(&physical);
     let base: Arc<dyn ExecutionPlan> =
         Arc::new(SeriesEvalExec::try_new(exec.input.clone(), exec.kernel, exec.grid).unwrap());
-    let pruned = project_columns(
-        base,
-        &[(SAMPLES, 1, SAMPLES), (BLOCK_START, 2, BLOCK_START)],
-    );
+    let pruned = project_columns(base, &[(FLOATS, 1, FLOATS), (BLOCK_START, 2, BLOCK_START)]);
     let presented = project_columns(
         pruned,
         &[
             (BLOCK_START, 1, "start"),
-            (SAMPLES, 0, "values"),
-            (SAMPLES, 0, "again"),
+            (FLOATS, 0, "values"),
+            (FLOATS, 0, "again"),
         ],
     );
     let nested: Arc<dyn ExecutionPlan> = Arc::new(
@@ -1307,7 +1304,7 @@ async fn label_bearing_projection_keeps_aliases_copied_values_and_nested_metadat
         &[
             (LABELS, 0, "labels_one"),
             (LABELS, 0, "labels_two"),
-            (SAMPLES, 1, "values"),
+            (FLOATS, 1, "values"),
         ],
     );
     assert!(projected.is::<ProjectionExec>());
@@ -1426,7 +1423,7 @@ async fn legal_nested_sample_metadata_matches_canonical_and_projected_output_typ
         let metadata = std::collections::HashMap::from([("source".into(), "preserved".into())]);
         let mut fields = input.schema().fields().to_vec();
         fields[1] = Arc::new(
-            Field::new(SAMPLES, samples.data_type().clone(), false).with_metadata(metadata.clone()),
+            Field::new(FLOATS, samples.data_type().clone(), false).with_metadata(metadata.clone()),
         );
         let mut columns = input.columns().to_vec();
         columns[1] = Arc::new(samples);
@@ -1458,12 +1455,12 @@ async fn legal_nested_sample_metadata_matches_canonical_and_projected_output_typ
             if mode != 0 {
                 let columns = match mode {
                     1 => vec![
-                        (SAMPLES, 1, "values"),
+                        (FLOATS, 1, "values"),
                         (LABELS, 0, "identity"),
-                        (SAMPLES, 1, "again"),
+                        (FLOATS, 1, "again"),
                         (BLOCK_START, 2, "start"),
                     ],
-                    2 => vec![(SAMPLES, 1, "values"), (SAMPLES, 1, "again")],
+                    2 => vec![(FLOATS, 1, "values"), (FLOATS, 1, "again")],
                     3 => vec![(LABELS, 0, "identity")],
                     _ => unreachable!(),
                 };
@@ -1667,7 +1664,7 @@ async fn expression_visitors_leave_pruning_indices_to_the_native_projection() {
     assert_eq!(count, 0);
     let projected = project_columns(
         Arc::new(exec),
-        &[(SAMPLES, 0, "values"), (BLOCK_START, 1, "start")],
+        &[(FLOATS, 0, "values"), (BLOCK_START, 1, "start")],
     );
     projected
         .apply_expressions(&mut |_| {

@@ -8,7 +8,7 @@
 //! `SeriesEval` already carries its kernel/grid; native aggregation and label
 //! functions still need their expressions decoded. This module recognizes
 //! those boundaries, `get_field`, and scans over [`SelectorTable`], rendering
-//! `rate(samples[5m], 600000..1200000 step 30s)` rather than implementation
+//! `rate(floats[5m], 600000..1200000 step 30s)` rather than implementation
 //! details wherever PromQL has syntax for them.
 //!
 //! # Fallthrough is what makes this safe to pin
@@ -142,7 +142,7 @@ fn render_line(plan: &LogicalPlan, single_scan: bool) -> String {
 
 /// Every evaluated series batch carries exactly four columns,
 /// `labels, samples, block_start, block_end` in that order
-/// (`series::LABELS`/`SAMPLES`/`BLOCK_START`/`BLOCK_END` are the schema's
+/// (`series::LABELS`/`FLOATS`/`BLOCK_START`/`BLOCK_END` are the schema's
 /// own names for them, not this module's choice) — so a `Projection`
 /// whose *output* schema is those four fields in that order is restating
 /// an invariant the reader already knows, and its pass-through columns
@@ -183,7 +183,7 @@ fn is_canonical_series_schema(schema: &datafusion::common::DFSchema) -> bool {
 /// The four columns of every series batch, in schema order.
 const SERIES_COLUMNS: [&str; 4] = [
     series::LABELS,
-    series::SAMPLES,
+    series::FLOATS,
     series::BLOCK_START,
     series::BLOCK_END,
 ];
@@ -193,10 +193,10 @@ fn is_series_columns(names: &[&str]) -> bool {
 }
 
 /// `None` for a pass-through reference to its own output name — a bare
-/// `labels`/`samples`/`block_start`/`block_end` column, or one aliased
+/// `labels`/`floats`/`block_start`/`block_end` column, or one aliased
 /// right back to the name it already has — since the schema already says
 /// that's what it is. `Some` for anything else, rendered without the `AS
-/// labels`/`AS samples`/… alias the four-column guard already established
+/// labels`/`AS floats`/… alias the four-column guard already established
 /// as this expression's position in the schema.
 fn render_short_projection_expr(e: &Expr, single_scan: bool) -> Option<String> {
     match e {
@@ -423,8 +423,8 @@ fn render_series_eval(eval: &SeriesEval) -> Option<String> {
     let step = Duration::from_millis(p.step_ms).ok()?;
     let window = Duration::from_millis(p.window_ms).ok()?;
     let mut samples = match eval.kernel {
-        Kernel::Selector(_) => series::SAMPLES.to_string(),
-        Kernel::Range(_) => format!("{}[{window}]", series::SAMPLES),
+        Kernel::Selector(_) => series::FLOATS.to_string(),
+        Kernel::Range(_) => format!("{}[{window}]", series::FLOATS),
     };
     push_offset_and_at(&mut samples, p.offset_ms, p.at_ms)?;
     let call = match eval.kernel {
@@ -648,8 +648,8 @@ fn render_aggregate_function(f: &AggregateFunction, single_scan: bool) -> Option
     render_aggregate_call(f.func.name(), &p.args, single_scan)
 }
 
-/// `promql_absent(samples, start, end, step)` as
-/// `absent(samples, START..END step STEP)`, and `promql_scalar`, which
+/// `promql_absent(floats, start, end, step)` as
+/// `absent(floats, START..END step STEP)`, and `promql_scalar`, which
 /// takes the same arguments, as `scalar(...)`.
 fn render_absent_call<A: Arg>(name: &str, args: &[A], single_scan: bool) -> Option<String> {
     if args.len() != 4 {
@@ -665,8 +665,8 @@ fn render_absent_call<A: Arg>(name: &str, args: &[A], single_scan: bool) -> Opti
     ))
 }
 
-/// `promql_aggregate(samples, '<op>', start, end, step)` as
-/// `<op>(samples, START..END step STEP)`. No `topk`/`quantile` parameter:
+/// `promql_aggregate(floats, '<op>', start, end, step)` as
+/// `<op>(floats, START..END step STEP)`. No `topk`/`quantile` parameter:
 /// `plan.rs`'s `aggregate` rejects an aggregation with a parameter as
 /// unsupported before planning reaches here, so the call has exactly
 /// these five positional arguments.
@@ -685,7 +685,7 @@ fn render_aggregate_op<A: Arg>(args: &[A], single_scan: bool) -> Option<String> 
     ))
 }
 
-/// Native upper aggregation with one `samples` expression and block-leading
+/// Native upper aggregation with one `floats` expression and block-leading
 /// group keys, followed by `labels::group_exprs` keys. `without` has already
 /// been resolved to retained `by` keys. `absent` is the exception with no
 /// grouping. Unrecognized key/alias/call shapes fall through to stock text.
@@ -696,7 +696,7 @@ fn render_aggregate_node(agg: &Aggregate, single_scan: bool) -> Option<String> {
     let Expr::Alias(alias) = &agg.aggr_expr[0] else {
         return None;
     };
-    if alias.name != series::SAMPLES {
+    if alias.name != series::FLOATS {
         return None;
     }
     let Expr::AggregateFunction(f) = alias.expr.as_ref() else {
@@ -987,7 +987,7 @@ pub(crate) fn render_aggregate_exec(a: &AggregateExec) -> Option<String> {
 /// One of this engine's aggregate calls over the columns `reads`.
 ///
 /// In a mode whose input is partial state, the node reads the state
-/// column where the raw call took `samples`, and that column goes in the
+/// column where the raw call took `floats`, and that column goes in the
 /// call's first argument. Only when the call's other arguments are all
 /// literals, which they are for `promql_aggregate`. Other call shapes fall
 /// through rather than printing raw arguments for partial-state reads.
@@ -1063,7 +1063,7 @@ mod tests {
     use super::*;
     use crate::params::Params;
     use crate::range;
-    use crate::series::SAMPLES;
+    use crate::series::FLOATS;
 
     fn raw_schema(names: &[String]) -> datafusion::arrow::datatypes::SchemaRef {
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -1122,7 +1122,7 @@ mod tests {
     fn vector_selector_with_neither_offset_nor_at() {
         let plan = typed_eval(Kernel::Selector(selector::Pick::Value), params(0, None));
         assert_eq!(render_line(&plan, true),
-            "SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block");
+            "SeriesEval: vector_selector(floats, 600000..1200000 step 30s, lookback 5m) per series per block");
     }
 
     #[test]
@@ -1132,14 +1132,14 @@ mod tests {
             params(3_600_000, Some(900_000)),
         );
         assert_eq!(render_line(&plan, true),
-            "SeriesEval: vector_selector(samples offset 1h @ 900000, 600000..1200000 step 30s, lookback 5m) per series per block");
+            "SeriesEval: vector_selector(floats offset 1h @ 900000, 600000..1200000 step 30s, lookback 5m) per series per block");
     }
 
     #[test]
     fn vector_selector_names_the_timestamp_pick() {
         let plan = typed_eval(Kernel::Selector(selector::Pick::Timestamp), params(0, None));
         assert_eq!(render_line(&plan, true),
-            "SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m, timestamp) per series per block");
+            "SeriesEval: vector_selector(floats, 600000..1200000 step 30s, lookback 5m, timestamp) per series per block");
     }
 
     #[test]
@@ -1159,15 +1159,15 @@ mod tests {
         for (kernel, expected) in [
             (
                 Kernel::Selector(selector::Pick::Value),
-                "SeriesEval: vector_selector(samples offset 1h @ 900000, 600000..1200000 step 30s, lookback 5m) per series per block",
+                "SeriesEval: vector_selector(floats offset 1h @ 900000, 600000..1200000 step 30s, lookback 5m) per series per block",
             ),
             (
                 Kernel::Selector(selector::Pick::Timestamp),
-                "SeriesEval: vector_selector(samples offset 1h @ 900000, 600000..1200000 step 30s, lookback 5m, timestamp) per series per block",
+                "SeriesEval: vector_selector(floats offset 1h @ 900000, 600000..1200000 step 30s, lookback 5m, timestamp) per series per block",
             ),
             (
                 Kernel::Range(range::RangeOp::Func(range::Func::Rate)),
-                "SeriesEval: rate(samples[5m] offset 1h @ 900000, 600000..1200000 step 30s) per series per block",
+                "SeriesEval: rate(floats[5m] offset 1h @ 900000, 600000..1200000 step 30s) per series per block",
             ),
         ] {
             let plan = SeriesEval::try_new(
@@ -1199,7 +1199,7 @@ mod tests {
         );
         assert_eq!(
             render_line(&plan, true),
-            "SeriesEval: rate(samples[5m], 600000..1200000 step 30s) per series per block"
+            "SeriesEval: rate(floats[5m], 600000..1200000 step 30s) per series per block"
         );
     }
 
@@ -1210,7 +1210,7 @@ mod tests {
             params(3_600_000, Some(900_000)),
         );
         assert_eq!(render_line(&plan, true),
-            "SeriesEval: rate(samples[5m] offset 1h @ 900000, 600000..1200000 step 30s) per series per block");
+            "SeriesEval: rate(floats[5m] offset 1h @ 900000, 600000..1200000 step 30s) per series per block");
     }
 
     #[test]
@@ -1224,7 +1224,7 @@ mod tests {
     #[test]
     fn aggregate_renders_its_op() {
         let call = aggregate::call(
-            col("samples"),
+            col("floats"),
             aggregate::Op::Sum,
             600_000,
             1_200_000,
@@ -1232,7 +1232,7 @@ mod tests {
         );
         assert_eq!(
             render_expr(&call, true),
-            "sum(samples, 600000..1200000 step 30s)"
+            "sum(floats, 600000..1200000 step 30s)"
         );
     }
 
@@ -1251,8 +1251,8 @@ mod tests {
             .aggregate(
                 group,
                 vec![
-                    aggregate::call(col(SAMPLES), aggregate::Op::Sum, 600_000, 1_200_000, 30_000)
-                        .alias(SAMPLES),
+                    aggregate::call(col(FLOATS), aggregate::Op::Sum, 600_000, 1_200_000, 30_000)
+                        .alias(FLOATS),
                 ],
             )
             .unwrap()
@@ -1265,7 +1265,7 @@ mod tests {
         let plan = aggregate_node(&["job".to_string()]);
         assert_eq!(
             render_line(&plan, true),
-            "Aggregate: sum by (job) (samples, 600000..1200000 step 30s) per block"
+            "Aggregate: sum by (job) (floats, 600000..1200000 step 30s) per block"
         );
     }
 
@@ -1274,12 +1274,12 @@ mod tests {
         let plan = aggregate_node(&[]);
         assert_eq!(
             render_line(&plan, true),
-            "Aggregate: sum(samples, 600000..1200000 step 30s) per block"
+            "Aggregate: sum(floats, 600000..1200000 step 30s) per block"
         );
     }
 
     #[test]
-    fn aggregate_node_falls_through_when_the_alias_is_not_samples() {
+    fn aggregate_node_falls_through_when_the_alias_is_not_floats() {
         let source = Arc::new(LogicalTableSource::new(crate::series::schema(&[
             "job".to_string()
         ])));
@@ -1294,7 +1294,7 @@ mod tests {
             .aggregate(
                 group,
                 vec![
-                    aggregate::call(col(SAMPLES), aggregate::Op::Sum, 600_000, 1_200_000, 30_000)
+                    aggregate::call(col(FLOATS), aggregate::Op::Sum, 600_000, 1_200_000, 30_000)
                         .alias("other"),
                 ],
             )
@@ -1304,7 +1304,7 @@ mod tests {
         assert_eq!(
             render_line(&plan, true),
             "Aggregate: groupBy=[[block_start, block_end, labels.job AS __group__job]], \
-             aggr=[[sum(samples, 600000..1200000 step 30s) AS other]]"
+             aggr=[[sum(floats, 600000..1200000 step 30s) AS other]]"
         );
     }
 
@@ -1325,8 +1325,8 @@ mod tests {
                     mismatched_group,
                 ],
                 vec![
-                    aggregate::call(col(SAMPLES), aggregate::Op::Sum, 600_000, 1_200_000, 30_000)
-                        .alias(SAMPLES),
+                    aggregate::call(col(FLOATS), aggregate::Op::Sum, 600_000, 1_200_000, 30_000)
+                        .alias(FLOATS),
                 ],
             )
             .unwrap()
@@ -1335,7 +1335,7 @@ mod tests {
         assert_eq!(
             render_line(&plan, true),
             "Aggregate: groupBy=[[block_start, block_end, labels.job AS not_a_group_alias]], \
-             aggr=[[sum(samples, 600000..1200000 step 30s) AS samples]]"
+             aggr=[[sum(floats, 600000..1200000 step 30s) AS floats]]"
         );
     }
 
@@ -1351,8 +1351,8 @@ mod tests {
             .aggregate(
                 labels::group_exprs(&keys),
                 vec![
-                    aggregate::call(col(SAMPLES), aggregate::Op::Sum, 600_000, 1_200_000, 30_000)
-                        .alias(SAMPLES),
+                    aggregate::call(col(FLOATS), aggregate::Op::Sum, 600_000, 1_200_000, 30_000)
+                        .alias(FLOATS),
                 ],
             )
             .unwrap()
@@ -1361,7 +1361,7 @@ mod tests {
         assert_eq!(
             render_line(&plan, true),
             "Aggregate: groupBy=[[labels.job AS __group__job, labels.pod AS __group__pod]], \
-             aggr=[[sum(samples, 600000..1200000 step 30s) AS samples]]"
+             aggr=[[sum(floats, 600000..1200000 step 30s) AS floats]]"
         );
     }
 
@@ -1453,7 +1453,7 @@ mod tests {
 
     const CANONICAL_SCHEMA: [&str; 4] = [
         series::LABELS,
-        series::SAMPLES,
+        series::FLOATS,
         series::BLOCK_START,
         series::BLOCK_END,
     ];
@@ -1462,7 +1462,7 @@ mod tests {
     fn projection_short_form_drops_a_regrouped_labels_alias() {
         let mut exprs = vec![
             labels::call(vec![("job".to_string(), col("__group__job"))]).alias(series::LABELS),
-            col(SAMPLES),
+            col(FLOATS),
         ];
         exprs.extend(block_pass_throughs());
         let p = projection_with_schema(exprs, &CANONICAL_SCHEMA);
@@ -1480,14 +1480,14 @@ mod tests {
                 ("pod".to_string(), get_field_of("pod")),
             ])
             .alias(series::LABELS),
-            aggregate::call(col(SAMPLES), aggregate::Op::Sum, 600_000, 1_200_000, 30_000)
-                .alias(series::SAMPLES),
+            aggregate::call(col(FLOATS), aggregate::Op::Sum, 600_000, 1_200_000, 30_000)
+                .alias(series::FLOATS),
         ];
         exprs.extend(block_pass_throughs());
         let p = projection_with_schema(exprs, &CANONICAL_SCHEMA);
         assert_eq!(
             render_projection(&p, true),
-            "Projection: labels{job, pod}, sum(samples, 600000..1200000 step 30s)"
+            "Projection: labels{job, pod}, sum(floats, 600000..1200000 step 30s)"
         );
     }
 
@@ -1495,14 +1495,14 @@ mod tests {
     fn projection_short_form_drops_a_pass_through_labels_column() {
         let mut exprs = vec![
             col(series::LABELS),
-            aggregate::call(col(SAMPLES), aggregate::Op::Sum, 600_000, 1_200_000, 30_000)
-                .alias(series::SAMPLES),
+            aggregate::call(col(FLOATS), aggregate::Op::Sum, 600_000, 1_200_000, 30_000)
+                .alias(series::FLOATS),
         ];
         exprs.extend(block_pass_throughs());
         let p = projection_with_schema(exprs, &CANONICAL_SCHEMA);
         assert_eq!(
             render_projection(&p, true),
-            "Projection: sum(samples, 600000..1200000 step 30s)"
+            "Projection: sum(floats, 600000..1200000 step 30s)"
         );
     }
 
@@ -1510,8 +1510,8 @@ mod tests {
     fn projection_keeps_aliases_with_a_fifth_column() {
         let mut exprs = vec![
             labels::call(vec![("job".to_string(), get_field_of("job"))]).alias(series::LABELS),
-            aggregate::call(col(SAMPLES), aggregate::Op::Sum, 600_000, 1_200_000, 30_000)
-                .alias(series::SAMPLES),
+            aggregate::call(col(FLOATS), aggregate::Op::Sum, 600_000, 1_200_000, 30_000)
+                .alias(series::FLOATS),
         ];
         exprs.extend(block_pass_throughs());
         exprs.push(col("extra"));
@@ -1520,7 +1520,7 @@ mod tests {
         let p = projection_with_schema(exprs, &field_names);
         assert_eq!(
             render_projection(&p, true),
-            "Projection: labels{job} AS labels, sum(samples, 600000..1200000 step 30s) AS samples, \
+            "Projection: labels{job} AS labels, sum(floats, 600000..1200000 step 30s) AS floats, \
              block_start, block_end, extra"
         );
     }
@@ -1529,13 +1529,13 @@ mod tests {
     fn projection_keeps_aliases_with_the_columns_reordered() {
         let p = projection_with_schema(
             vec![
-                col(SAMPLES),
+                col(FLOATS),
                 labels::call(vec![("job".to_string(), get_field_of("job"))]).alias(series::LABELS),
                 col(series::BLOCK_START),
                 col(series::BLOCK_END),
             ],
             &[
-                series::SAMPLES,
+                series::FLOATS,
                 series::LABELS,
                 series::BLOCK_START,
                 series::BLOCK_END,
@@ -1543,7 +1543,7 @@ mod tests {
         );
         assert_eq!(
             render_projection(&p, true),
-            "Projection: samples, labels{job} AS labels, block_start, block_end"
+            "Projection: floats, labels{job} AS labels, block_start, block_end"
         );
     }
 
@@ -1561,12 +1561,12 @@ mod tests {
 
     #[test]
     fn projection_identity_prints_the_stock_form() {
-        let mut exprs = vec![col(series::LABELS), col(series::SAMPLES)];
+        let mut exprs = vec![col(series::LABELS), col(series::FLOATS)];
         exprs.extend(block_pass_throughs());
         let p = projection_with_schema(exprs, &CANONICAL_SCHEMA);
         assert_eq!(
             render_projection(&p, true),
-            "Projection: labels, samples, block_start, block_end"
+            "Projection: labels, floats, block_start, block_end"
         );
     }
 
@@ -1638,7 +1638,7 @@ mod tests {
     #[test]
     fn fallthrough_on_a_udf_with_the_wrong_argument_count() {
         // Well short of upper aggregation's five arguments.
-        let call = aggregate::udaf().call(vec![col("samples"), lit(0i64)]);
+        let call = aggregate::udaf().call(vec![col("floats"), lit(0i64)]);
         assert_eq!(render_expr(&call, true), call.to_string());
     }
 
@@ -1825,7 +1825,7 @@ mod tests {
         );
         assert_ne!(cast("a", DataType::Utf8), cast("a", DataType::LargeUtf8));
         assert_ne!(
-            shape_of(&physical(col(series::SAMPLES), &["a"]), None),
+            shape_of(&physical(col(series::FLOATS), &["a"]), None),
             shape_of(&physical(lit("a"), &["a"]), None)
         );
     }
@@ -1849,7 +1849,7 @@ mod tests {
         let shown = projection(
             vec![
                 (labels::call(vec![]), series::LABELS),
-                (col(series::SAMPLES), series::SAMPLES),
+                (col(series::FLOATS), series::FLOATS),
                 (col(series::BLOCK_START), series::BLOCK_START),
                 (col(series::BLOCK_END), series::BLOCK_END),
             ],
@@ -1857,7 +1857,7 @@ mod tests {
         );
         assert_eq!(
             shown,
-            "ProjectionExec: expr=[labels{}, samples@1, block_start@2, block_end@3]"
+            "ProjectionExec: expr=[labels{}, floats@1, block_start@2, block_end@3]"
         );
     }
 
@@ -1865,15 +1865,12 @@ mod tests {
     fn physical_projection_keeps_a_series_alias_out_of_series_order() {
         let shown = projection(
             vec![
-                (col(series::SAMPLES), series::SAMPLES),
+                (col(series::FLOATS), series::FLOATS),
                 (labels::call(vec![]), series::LABELS),
             ],
             &[],
         );
-        assert_eq!(
-            shown,
-            "ProjectionExec: expr=[samples@1, labels{} as labels]"
-        );
+        assert_eq!(shown, "ProjectionExec: expr=[floats@1, labels{} as labels]");
     }
 
     #[test]
@@ -1887,12 +1884,12 @@ mod tests {
         let names = many(FOLD_MIN);
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
         let mut exprs: Vec<(Expr, &str)> = names.iter().map(|n| (get_field_of(n), *n)).collect();
-        exprs.push((col(series::SAMPLES), series::SAMPLES));
+        exprs.push((col(series::FLOATS), series::FLOATS));
         let last = names[FOLD_MIN - 1];
         assert_eq!(
             projection(exprs, &names),
             format!(
-                "ProjectionExec: expr=[labels@0.l0 as l0 … as {last} ({FOLD_MIN} alike), samples@1]"
+                "ProjectionExec: expr=[labels@0.l0 as l0 … as {last} ({FOLD_MIN} alike), floats@1]"
             )
         );
     }

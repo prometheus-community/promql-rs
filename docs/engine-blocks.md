@@ -21,7 +21,7 @@ One `select` yields blocks, a block arrives as batches, a batch holds series, an
 
 ```
 labels       Struct<__name__: Utf8View, ...>
-samples      List<Struct<timestamp: Timestamp(Millisecond), value: Float64>>
+floats       List<Struct<timestamp: Timestamp(Millisecond), value: Float64>>
 block_start  Timestamp(Millisecond)
 block_end    Timestamp(Millisecond)
 series_id    UInt64 | FixedSizeBinary(n>0)   mandatory at the source
