@@ -260,3 +260,27 @@ fn scalar_of_a_vector() {
     let query = r#"scalar(temperature{city="oslo"})"#;
     assert_snapshot!("scalar_of_a_vector", case.plan(query), query);
 }
+
+/// label_replace rebuilds the labels struct with its kernel in the
+/// destination's slot. The store hears `func=label_replace` and no `by`:
+/// the `by (region)` above names a label only the call creates.
+#[test]
+fn label_replace_under_a_grouping() {
+    let case = Case::new(RANGE, &[r#"temperature{city="oslo"} 0"#]);
+    let query = r#"sum by (region) (label_replace(temperature, "region", "$1", "city", "(.*)"))"#;
+    assert_snapshot!("label_replace_under_a_grouping", case.plan(query), query);
+    assert_snapshot!(
+        "label_replace_under_a_grouping_physical",
+        case.physical(query),
+        query
+    );
+}
+
+/// label_join is `concat_ws` over the source fields, "" for one the input
+/// lacks.
+#[test]
+fn label_join_over_a_selector() {
+    let case = Case::new(RANGE, &[r#"temperature{city="oslo"} 0"#]);
+    let query = r#"label_join(temperature, "id", "/", "city", "nowhere")"#;
+    assert_snapshot!("label_join_over_a_selector", case.plan(query), query);
+}
