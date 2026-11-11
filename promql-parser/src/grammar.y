@@ -268,8 +268,8 @@ label_set_list -> Result<Vec<LabelMatcher>, ()>:
   ;
 
 label_set_item -> Result<LabelMatcher, ()>:
-    'IDENT' 'EQ' 'STRING' { actions::label_from_ident($lexer, $span, $1, $3) }
-  | string_identifier 'EQ' 'STRING' { actions::label_from_string_ident($lexer, $span, $1?, $3) }
+    'IDENT' 'EQ' 'STRING' { actions::label_from_ident(p, $lexer, $span, $1, $3) }
+  | string_identifier 'EQ' 'STRING' { actions::label_from_string_ident(p, $lexer, $span, $1?, $3) }
   | string_identifier { actions::label_metric_name($span, $1?) }
   ;
 

@@ -39,9 +39,8 @@ use std::time::Duration;
 use datafusion::catalog::Session;
 use datafusion::common::{Column, ScalarValue};
 use datafusion::datasource::{provider_as_source, MemTable};
-use datafusion::functions::core::expr_fn::get_field;
 use datafusion::functions::string::expr_fn::concat_ws;
-use datafusion::logical_expr::{col, lit, Expr as DfExpr, LogicalPlan, LogicalPlanBuilder};
+use datafusion::logical_expr::{col, lit, LogicalPlan, LogicalPlanBuilder};
 use promql_parser::ast::{
     AggregateExpr, AtModifier, BinaryExpr, Call, Expr, MatrixSelector, UnaryExpr,
     VectorMatchCardinality, VectorSelector,
@@ -707,8 +706,8 @@ impl Planner<'_> {
         if let Some(func) = sort::Func::parse(name) {
             return self.sort(call, func).await;
         }
-        if name == "label_replace" || name == "label_join" {
-            return self.relabel(call).await;
+        if let Some(func) = relabel::Func::parse(name) {
+            return self.relabel(call, func).await;
         }
         self.range_function(call, above).await
     }
@@ -853,7 +852,7 @@ impl Planner<'_> {
     /// `label_replace` and `label_join`: upstream's `evalLabelReplace`
     /// and `evalLabelJoin` (`promql/functions.go` at 83962c35). Both
     /// rebuild `labels` with a computed destination; "" deletes it.
-    async fn relabel(&mut self, call: &Call) -> Result<Planned, EngineError> {
+    async fn relabel(&mut self, call: &Call, func: relabel::Func) -> Result<Planned, EngineError> {
         let name = call.func.name.as_str();
         let mut strings = Vec::with_capacity(call.args.len() - 1);
         for arg in &call.args[1..] {
@@ -861,19 +860,38 @@ impl Planner<'_> {
                 EngineError::Unsupported(format!("the {name} function over {}", describe(arg)))
             })?);
         }
+        enum Value<'s> {
+            Replace {
+                replacement: &'s str,
+                src: &'s str,
+                regex: regex::Regex,
+            },
+            Join {
+                separator: &'s str,
+                sources: &'s [&'s str],
+            },
+        }
         // Checked in upstream's order and before the input is planned, as
         // upstream panics before `ev.eval` reads a series.
         let invalid = |what: &str, label: &str| {
             EngineError::Query(format!("invalid {what} label name in {name}(): {label}"))
         };
-        let dst = strings[0];
-        let regex = if name == "label_replace" {
-            Some(relabel::compile(strings[3])?)
-        } else {
-            if let Some(src) = strings[2..].iter().find(|s| s.is_empty()) {
-                return Err(invalid("source", src));
+        let (dst, value) = match (func, &strings[..]) {
+            (relabel::Func::Replace, &[dst, replacement, src, regex]) => (
+                dst,
+                Value::Replace {
+                    replacement,
+                    src,
+                    regex: relabel::compile(regex)?,
+                },
+            ),
+            (relabel::Func::Join, [dst, separator, sources @ ..]) => {
+                if let Some(src) = sources.iter().find(|s| s.is_empty()) {
+                    return Err(invalid("source", src));
+                }
+                (*dst, Value::Join { separator, sources })
             }
-            None
+            _ => unreachable!("check_call holds {name} to its arity"),
         };
         if dst.is_empty() {
             return Err(invalid("destination", dst));
@@ -890,29 +908,24 @@ impl Planner<'_> {
                 },
             )
             .await?;
+        let read = |label: &str| labels::field(&input.label_names, label);
+        let dst_value = match value {
+            Value::Replace {
+                replacement,
+                src,
+                regex,
+            } => relabel::call(read(src), read(dst), regex, replacement),
+            // `concat_ws` wants a value to join; `strings.Join` of nothing
+            // is "".
+            Value::Join { sources: [], .. } => lit(""),
+            Value::Join { separator, sources } => {
+                concat_ws(lit(separator), sources.iter().map(|s| read(s)).collect())
+            }
+        };
         let mut label_names = input.label_names.clone();
         label_names.push(dst.to_string());
         label_names.sort();
         label_names.dedup();
-        // `get_field` on a label the input lacks is a plan error; upstream
-        // reads it as "".
-        let read = |label: &str| -> DfExpr {
-            if input.label_names.iter().any(|have| have == label) {
-                get_field(col(LABELS), label)
-            } else {
-                lit("")
-            }
-        };
-        let dst_value = match regex {
-            Some(regex) => relabel::call(read(strings[2]), read(dst), regex, strings[1]),
-            // `concat_ws` wants a value to join; `strings.Join` of nothing
-            // is "".
-            None if strings.len() == 2 => lit(""),
-            None => concat_ws(
-                lit(strings[1]),
-                strings[2..].iter().map(|s| read(s)).collect(),
-            ),
-        };
         let labels_expr = labels::call(
             label_names
                 .iter()

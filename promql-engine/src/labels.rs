@@ -97,7 +97,7 @@ fn value_type_ok(t: &DataType) -> bool {
 }
 
 /// One value column as the canonical leaf, NULLs as `""`.
-fn canonical(values: &ArrayRef) -> Result<ArrayRef> {
+pub(crate) fn canonical(values: &ArrayRef) -> Result<ArrayRef> {
     let views = if values.data_type() == &series::label_type() {
         Arc::clone(values)
     } else {
@@ -256,19 +256,18 @@ pub fn regroup(keys: &[String]) -> Expr {
 /// how the shape spells absent — so a series without it matches one
 /// whose value is empty, exactly as two label sets compare upstream.
 pub fn widen(input: &[String], names: &[String]) -> Expr {
-    call(
-        names
-            .iter()
-            .map(|n| {
-                let value = if input.iter().any(|have| have == n) {
-                    get_field(col(LABELS), n.as_str())
-                } else {
-                    lit("")
-                };
-                (n.clone(), value)
-            })
-            .collect(),
-    )
+    call(names.iter().map(|n| (n.clone(), field(input, n))).collect())
+}
+
+/// Label `name` of the `labels` column, or `""` where `input` does not
+/// carry it: `get_field` on a missing field is a plan error, and upstream
+/// reads a missing label as empty.
+pub fn field(input: &[String], name: &str) -> Expr {
+    if input.iter().any(|have| have == name) {
+        get_field(col(LABELS), name)
+    } else {
+        lit("")
+    }
 }
 
 /// The `labels` struct with only the names passing `keep`, read from the

@@ -5,11 +5,10 @@
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, ArrayRef, AsArray, StringViewBuilder};
-use datafusion::arrow::compute::cast;
+use datafusion::arrow::array::{AsArray, StringViewBuilder};
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion::common::plan_err;
-use datafusion::error::{DataFusionError, Result};
+use datafusion::error::Result;
 use datafusion::logical_expr::{
     lit, ColumnarValue, Expr, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
     Signature, Volatility,
@@ -17,9 +16,25 @@ use datafusion::logical_expr::{
 use regex::Regex;
 
 use crate::error::EngineError;
-use crate::series;
+use crate::{labels, series};
 
 pub const NAME: &str = "promql_label_replace";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Func {
+    Replace,
+    Join,
+}
+
+impl Func {
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "label_replace" => Some(Self::Replace),
+            "label_join" => Some(Self::Join),
+            _ => None,
+        }
+    }
+}
 
 /// Compiled at plan time, so an invalid pattern is refused before the
 /// store is asked for anything, as upstream refuses it before `ev.eval`.
@@ -69,15 +84,6 @@ pub fn call(src: Expr, dst: Expr, regex: Regex, replacement: &str) -> Expr {
     udf.call(vec![src, dst, lit(pattern), lit(replacement)])
 }
 
-/// One label column as views; a literal stands for every row.
-fn views(value: &ColumnarValue, rows: usize) -> Result<ArrayRef> {
-    let array = value.to_array(rows)?;
-    if array.data_type() == &series::label_type() {
-        return Ok(array);
-    }
-    Ok(cast(array.as_ref(), &series::label_type())?)
-}
-
 impl ScalarUDFImpl for LabelReplace {
     fn name(&self) -> &str {
         NAME
@@ -109,14 +115,9 @@ impl ScalarUDFImpl for LabelReplace {
     /// deleted label, which is what `lb.Set(dst, "")` does upstream.
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let rows = args.number_rows;
-        let src = views(&args.args[0], rows)?;
-        let dst = views(&args.args[1], rows)?;
+        let src = labels::canonical(&args.args[0].to_array(rows)?)?;
+        let dst = labels::canonical(&args.args[1].to_array(rows)?)?;
         let (src, dst) = (src.as_string_view(), dst.as_string_view());
-        if src.null_count() + dst.null_count() > 0 {
-            return Err(DataFusionError::Execution(format!(
-                "{NAME}: label values are never null in the canonical shape"
-            )));
-        }
         let mut out = StringViewBuilder::with_capacity(rows);
         let mut expanded = String::new();
         for row in 0..rows {

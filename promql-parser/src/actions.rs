@@ -95,9 +95,9 @@ pub fn duration_literal<'l, 'i: 'l>(lexer: &'l L<'l, 'i>, lx: Lx) -> Result<Expr
     }))
 }
 
-/// The value of a STRING token. A malformed escape is a parse error, as
-/// upstream's `lexEscape` makes it; the raw text stands in so parsing can
-/// go on and report anything else.
+/// The value of a STRING token, for every grammar rule that reads one.
+/// The lrlex lexer accepts any `\.`, so this is where upstream's
+/// `lexEscape` errors surface; the raw text stands in so parsing goes on.
 fn unquote_token(p: &ParserCtx, lexer: &L, span: Span) -> String {
     let raw = lexer.span_str(span);
     unquote_string(raw).unwrap_or_else(|message| {
@@ -891,17 +891,18 @@ pub fn push_label(mut acc: Vec<LabelMatcher>, item: LabelMatcher) -> Result<Vec<
 /// `label_set_item : IDENTIFIER EQL STRING`. Unlike `label_matcher`,
 /// a label set only ever has `=`.
 pub fn label_from_ident<'l, 'i: 'l>(
+    p: &ParserCtx,
     lexer: &'l L<'l, 'i>,
     span: Span,
     name: Result<Lx, Lx>,
     value: Result<Lx, Lx>,
 ) -> Result<LabelMatcher, ()> {
     let name = lexer.span_str(name.map_err(|_| ())?.span()).to_string();
-    let raw = lexer.span_str(value.map_err(|_| ())?.span());
+    let value = unquote_token(p, lexer, value.map_err(|_| ())?.span());
     Ok(LabelMatcher {
         name,
         op: MatchOp::Equal,
-        value: unquote_string(raw).map_err(|_| ())?,
+        value,
         pos_range: to_pos_range(span),
     })
 }
@@ -909,16 +910,17 @@ pub fn label_from_ident<'l, 'i: 'l>(
 /// `label_set_item : string_identifier EQL STRING` — quoted UTF-8
 /// label name.
 pub fn label_from_string_ident<'l, 'i: 'l>(
+    p: &ParserCtx,
     lexer: &'l L<'l, 'i>,
     span: Span,
     name: String,
     value: Result<Lx, Lx>,
 ) -> Result<LabelMatcher, ()> {
-    let raw = lexer.span_str(value.map_err(|_| ())?.span());
+    let value = unquote_token(p, lexer, value.map_err(|_| ())?.span());
     Ok(LabelMatcher {
         name,
         op: MatchOp::Equal,
-        value: unquote_string(raw).map_err(|_| ())?,
+        value,
         pos_range: to_pos_range(span),
     })
 }
@@ -1110,7 +1112,7 @@ pub(crate) fn unquote_string(raw: &str) -> Result<String, String> {
         return Err(malformed());
     }
     let inner = &raw[1..raw.len() - 1];
-    if open == b'`' {
+    if open == b'`' || !inner.contains('\\') {
         return Ok(inner.to_string());
     }
     let mut out: Vec<u8> = Vec::with_capacity(inner.len());
@@ -1122,7 +1124,9 @@ pub(crate) fn unquote_string(raw: &str) -> Result<String, String> {
             continue;
         }
         let first = chars.next().ok_or("escape sequence not terminated")?;
-        let (n, radix, max) = match first {
+        // `\xNN` and octal are one byte each; `\u` and `\U` a code point.
+        // An octal escape's first digit is the one already read.
+        let (digits, radix, seed, is_byte) = match first {
             'a' | 'b' | 'f' | 'n' | 'r' | 't' | 'v' | '\\' => {
                 out.push(match first {
                     'a' => 0x07,
@@ -1136,37 +1140,27 @@ pub(crate) fn unquote_string(raw: &str) -> Result<String, String> {
                 });
                 continue;
             }
-            quote if quote as u32 == u32::from(open) => {
+            quote if quote == char::from(open) => {
                 out.push(open);
                 continue;
             }
-            '0'..='7' => (3, 8, 255),
-            'x' => (2, 16, 255),
-            'u' => (4, 16, 0x0010_FFFF),
-            'U' => (8, 16, 0x0010_FFFF),
+            '0'..='7' => (2, 8, u32::from(first) - u32::from('0'), true),
+            'x' => (2, 16, 0, true),
+            'u' => (4, 16, 0, false),
+            'U' => (8, 16, 0, false),
             other => return Err(format!("unknown escape sequence {}", go_rune(other))),
         };
-        // An octal escape's first digit is the one just read.
-        let mut value = if radix == 8 {
-            first.to_digit(8).unwrap_or(0)
-        } else {
-            0
-        };
-        let mut remaining = if radix == 8 { n - 1 } else { n };
-        while remaining > 0 {
+        let mut value = seed;
+        for _ in 0..digits {
             let c = chars.next().ok_or("escape sequence not terminated")?;
             let digit = c
                 .to_digit(radix)
                 .ok_or_else(|| format!("illegal character {} in escape sequence", go_rune(c)))?;
             value = value * radix + digit;
-            remaining -= 1;
         }
         let invalid = || "escape sequence is an invalid Unicode code point".to_string();
-        if value > max {
-            return Err(invalid());
-        }
-        if max == 255 {
-            out.push(value as u8);
+        if is_byte {
+            out.push(u8::try_from(value).map_err(|_| invalid())?);
         } else {
             let c = char::from_u32(value).ok_or_else(invalid)?;
             out.extend_from_slice(c.encode_utf8(&mut utf8).as_bytes());
@@ -1184,11 +1178,6 @@ fn go_rune(c: char) -> String {
 mod tests {
     use super::*;
 
-    /// `parse_duration_seconds` delegates to `Duration::parse`, which
-    /// stops at `ms` (see `promql_common::model::time`'s `unit_info_basic`
-    /// doc comment) — the PromQL grammar has never had a sub-millisecond
-    /// duration unit, so `rate(x[5us])` is rejected the same way upstream
-    /// rejects it.
     /// Go's `strconv.Unquote`: `\x` and octal are bytes, `\u` and `\U`
     /// are code points, and bytes that are not UTF-8 have no `String`.
     #[test]
@@ -1222,7 +1211,7 @@ mod tests {
         );
     }
 
-    /// The grammar's lexer accepts any `\\.`, so the parse is where a bad
+    /// The grammar's lexer accepts any `\.`, so the parse is where a bad
     /// escape surfaces, wherever the string sits.
     #[test]
     fn a_bad_escape_fails_the_parse_with_its_message() {
@@ -1237,12 +1226,24 @@ mod tests {
                 "{query}: {err}"
             );
         }
+        for series in [r#"up{a="\xff"} 1"#, r#"up{"a"="\xff"} 1"#] {
+            let err = crate::parse_series_desc(series).unwrap_err().to_string();
+            assert!(
+                err.contains("invalid UTF-8 in string after unescaping"),
+                "{series}: {err}"
+            );
+        }
         assert!(crate::parse_expr(r#"up{a="\d"}"#)
             .unwrap_err()
             .to_string()
             .contains("unknown escape sequence U+0064 'd'"));
     }
 
+    /// `parse_duration_seconds` delegates to `Duration::parse`, which
+    /// stops at `ms` (see `promql_common::model::time`'s `unit_info_basic`
+    /// doc comment) — the PromQL grammar has never had a sub-millisecond
+    /// duration unit, so `rate(x[5us])` is rejected the same way upstream
+    /// rejects it.
     #[test]
     fn duration_literal_rejects_sub_millisecond_unit() {
         assert!(parse_duration_seconds("5us").is_err());
