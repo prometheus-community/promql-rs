@@ -26,9 +26,8 @@
 //!
 //! Upstream `rangeQueryCases()` expressions that exercise features listed in
 //! `promql-conformance/testdata/prometheus/UNSUPPORTED.md` (`smoothed`,
-//! `double_exponential_smoothing`, `label_replace`, `label_join`, `count_values`,
-//! `topk`, `limitk`, `limit_ratio`, and `histogram_quantile`) are omitted until
-//! implemented.
+//! `double_exponential_smoothing`, `count_values`, `topk`, `limitk`,
+//! `limit_ratio`, and `histogram_quantile`) are omitted until implemented.
 //!
 //! Recommended CLI invocation:
 //! ```sh
@@ -420,6 +419,8 @@ fn supported_range_query_cases() -> Vec<BenchCase> {
         ("a_X unless b_X{l=~'.*[0-4]$'}", 0),
         ("a_X and b_X{l='notfound'}", 0),
         ("abs(a_X)", 0),
+        ("label_replace(a_X, 'l2', '$1', 'l', '(.*)')", 0),
+        ("label_join(a_X, 'l2', '-', 'l', 'l')", 0),
         ("sum(a_X)", 0),
         ("avg(a_X)", 0),
         ("sum without (l)(h_X)", 0),
