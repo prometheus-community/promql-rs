@@ -1100,7 +1100,7 @@ pub fn parse_duration_seconds(raw: &str) -> Result<f64, ()> {
 /// takes single-quoted strings, with `lexEscape`'s messages. `\xNN` and
 /// octal escapes are bytes, so the result can be invalid UTF-8, which Go
 /// keeps and a Rust `String` cannot hold.
-pub(crate) fn unquote_string(raw: &str) -> Result<String, String> {
+fn unquote_string(raw: &str) -> Result<String, String> {
     let malformed = || "malformed string literal".to_string();
     if raw.len() < 2 {
         return Err(malformed());
@@ -1152,7 +1152,9 @@ pub(crate) fn unquote_string(raw: &str) -> Result<String, String> {
         };
         let mut value = seed;
         for _ in 0..digits {
-            let c = chars.next().ok_or("escape sequence not terminated")?;
+            // `inner` lost the closing quote, which upstream's `lexEscape`
+            // reads as the next digit and reports as the illegal character.
+            let c = chars.next().unwrap_or(char::from(open));
             let digit = c
                 .to_digit(radix)
                 .ok_or_else(|| format!("illegal character {} in escape sequence", go_rune(c)))?;
@@ -1205,6 +1207,12 @@ mod tests {
             unquote_string(r#""\xg0""#).unwrap_err(),
             "illegal character U+0067 'g' in escape sequence"
         );
+        for short in [r#""\x4""#, r#""\0""#] {
+            assert_eq!(
+                unquote_string(short).unwrap_err(),
+                "illegal character U+0022 '\"' in escape sequence"
+            );
+        }
         assert_eq!(
             unquote_string(r#""\400""#).unwrap_err(),
             "escape sequence is an invalid Unicode code point"
