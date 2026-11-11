@@ -289,12 +289,59 @@ series_item -> Result<Vec<SequenceValue>, ()>:
   | series_value { Ok(vec![SequenceValue::value($1?)]) }
   | series_value 'TIMES' uint { Ok(actions::series_repeat($1?, 0.0, $3?)) }
   | series_value signed_number 'TIMES' uint { Ok(actions::series_repeat($1?, $2?, $4?)) }
+  | histogram_series_value { Ok(vec![actions::histogram_value($1?)]) }
+  | histogram_series_value 'TIMES' uint { Ok(actions::histogram_repeat($1?, $3?)) }
+  | histogram_series_value 'ADD' histogram_series_value 'TIMES' uint { actions::histogram_series($1?, $3?, $5?, false) }
+  | histogram_series_value 'SUB' histogram_series_value 'TIMES' uint { actions::histogram_series($1?, $3?, $5?, true) }
   ;
 
 series_value -> Result<f64, ()>:
     'IDENT' { actions::stale_value($lexer, $1) }
   | number { $1 }
   | signed_number { $1 }
+  ;
+
+histogram_series_value -> Result<actions::DescribedHistogram, ()>:
+    'OPEN_HIST' histogram_desc_map 'SPACE' 'CLOSE_HIST' { Ok(actions::build_histogram($2?)) }
+  | 'OPEN_HIST' histogram_desc_map 'CLOSE_HIST' { Ok(actions::build_histogram($2?)) }
+  | 'OPEN_HIST' 'SPACE' 'CLOSE_HIST' { Ok(actions::build_histogram(actions::HistogramDesc::default())) }
+  | 'OPEN_HIST' 'CLOSE_HIST' { Ok(actions::build_histogram(actions::HistogramDesc::default())) }
+  ;
+
+histogram_desc_map -> Result<actions::HistogramDesc, ()>:
+    histogram_desc_map 'SPACE' histogram_desc_item { actions::merge_histogram_desc($1?, $3?) }
+  | histogram_desc_item { $1 }
+  ;
+
+histogram_desc_item -> Result<actions::HistogramDesc, ()>:
+    'SCHEMA_DESC' 'COLON' int { Ok(actions::HistogramDesc { schema: Some($3?), ..Default::default() }) }
+  | 'SUM_DESC' 'COLON' signed_or_unsigned_number { Ok(actions::HistogramDesc { sum: Some($3?), ..Default::default() }) }
+  | 'COUNT_DESC' 'COLON' signed_or_unsigned_number { Ok(actions::HistogramDesc { count: Some($3?), ..Default::default() }) }
+  | 'ZERO_BUCKET_DESC' 'COLON' signed_or_unsigned_number { Ok(actions::HistogramDesc { zero_count: Some($3?), ..Default::default() }) }
+  | 'ZERO_BUCKET_WIDTH_DESC' 'COLON' number { Ok(actions::HistogramDesc { zero_threshold: Some($3?), ..Default::default() }) }
+  | 'CUSTOM_VALUES_DESC' 'COLON' bucket_set { Ok(actions::HistogramDesc { custom_values: Some($3?), ..Default::default() }) }
+  | 'BUCKETS_DESC' 'COLON' bucket_set { Ok(actions::HistogramDesc { buckets: Some($3?), ..Default::default() }) }
+  | 'OFFSET_DESC' 'COLON' int { Ok(actions::HistogramDesc { offset: Some($3?), ..Default::default() }) }
+  | 'NEGATIVE_BUCKETS_DESC' 'COLON' bucket_set { Ok(actions::HistogramDesc { negative_buckets: Some($3?), ..Default::default() }) }
+  | 'NEGATIVE_OFFSET_DESC' 'COLON' int { Ok(actions::HistogramDesc { negative_offset: Some($3?), ..Default::default() }) }
+  | 'COUNTER_RESET_HINT_DESC' 'COLON' counter_reset_hint { Ok(actions::HistogramDesc { counter_reset_hint: Some($3?), ..Default::default() }) }
+  ;
+
+bucket_set -> Result<Vec<f64>, ()>:
+    'LBRACKET' bucket_set_list 'SPACE' 'RBRACKET' { $2 }
+  | 'LBRACKET' bucket_set_list 'RBRACKET' { $2 }
+  ;
+
+bucket_set_list -> Result<Vec<f64>, ()>:
+    bucket_set_list 'SPACE' signed_or_unsigned_number { actions::push_bucket($1?, $3?) }
+  | signed_or_unsigned_number { Ok(vec![$1?]) }
+  ;
+
+counter_reset_hint -> Result<CounterResetHint, ()>:
+    'UNKNOWN_COUNTER_RESET' { Ok(CounterResetHint::Unknown) }
+  | 'COUNTER_RESET' { Ok(CounterResetHint::Reset) }
+  | 'NOT_COUNTER_RESET' { Ok(CounterResetHint::NotReset) }
+  | 'GAUGE_TYPE' { Ok(CounterResetHint::Gauge) }
   ;
 
 aggregate_op -> Result<ItemType, ()>:
@@ -389,6 +436,11 @@ uint -> Result<u64, ()>:
     'NUMBER' { actions::parse_uint($lexer, $1) }
   ;
 
+int -> Result<i64, ()>:
+    'SUB' uint { actions::negative_int($2?) }
+  | uint { Ok($1? as i64) }
+  ;
+
 string_literal -> Result<Expr, ()>:
     'STRING' { actions::string_literal($lexer, $1.map_err(|_| ())?) }
   ;
@@ -443,4 +495,5 @@ paren_duration_expr -> Result<Expr, ()>:
 
 use crate::ast::{AtModifier, Expr, LabelMatcher, MatchOp, SequenceValue, SeriesDescription};
 use crate::token::ItemType;
+use promql_histogram::CounterResetHint;
 use crate::actions;

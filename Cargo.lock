@@ -3005,6 +3005,7 @@ dependencies = [
  "lrlex",
  "lrpar",
  "promql-common",
+ "promql-histogram",
  "serde",
  "serde_json",
  "thiserror",

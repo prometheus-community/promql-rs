@@ -417,10 +417,13 @@ drops the alternatives that reference it.
 
 ### Series descriptions
 
-The `series_*` rules are generated from upstream like every other rule.
-The native-histogram alternatives of `series_item` fall out on their
-own, because they reference `histogram_series_value`, which is still on
-`skip_rules`.
+The `series_*` rules are generated from upstream like every other rule,
+the native-histogram alternatives of `series_item` and the
+`histogram_*`, `bucket_set*` and `counter_reset_hint` rules behind them
+included. A descriptor's keys are collected into `actions::HistogramDesc`
+where upstream uses a `map[string]any`, and
+`lastHistogramCounterResetHintSet`, parser state upstream, travels with
+the built histogram as `actions::DescribedHistogram`.
 
 The lexer side is a known divergence. Upstream lexes series
 descriptions with the *same* lexer under a `seriesDesc bool`
@@ -435,6 +438,8 @@ whose start conditions mirror upstream's state functions:
 | `INITIAL`  | `lexStatements`    |
 | `BRACES`   | `lexInsideBraces`  |
 | `SERIES`   | `lexValueSequence` |
+| `HIST`     | `lexHistogram`, `lexHistogramDescriptor` |
+| `BUCKETS`  | `lexBuckets`       |
 
 Because lrlex requires rule names to be unique per file, tokens
 produced from more than one start condition are spelled differently in
@@ -453,12 +458,11 @@ limitation back into upstream's single-lexer-with-a-flag shape.
   forces the question: modal lexing is exactly what a regex/DFA lexer
   cannot express, and the workarounds it needs (a second file, token-id
   aliases) get more expensive every time upstream touches `lex.go`.
-- Port native-histogram descriptors (`{{schema:1 …}}`): the
-  `histogram_*` and `bucket_set*` rules, upstream's second lexer mode
-  (`histogramState` / `lexHistogram` / `lexBuckets`), and a native
-  histogram type in `ast.rs`. They are 228 of the 1015 distinct series
-  lines in upstream's `promqltest/testdata`, so this is a substantial
-  share of that corpus rather than an edge case.
+- Cross-check native-histogram descriptors (`{{schema:1 …}}`) against
+  Go's `parser.ParseSeriesDesc`, as the 787 float lines of upstream's
+  `promqltest/testdata` were. The 228 histogram lines parse and the
+  conformance corpus evaluates over them, but their values are checked
+  by hand-written tests, not against upstream's parser output.
 - Extend structural recognizers with per-release "known-quirks" entries
   (e.g. upstream-v3.5 reshuffled duration expression rules; recognizer
   knows to treat that transition specially). Only needed if we see the

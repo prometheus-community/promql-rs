@@ -34,6 +34,7 @@ use crate::ast::{
 use crate::context::ParserCtx;
 use crate::posrange::{Pos, PositionRange};
 use crate::token::ItemType;
+use promql_histogram::{CounterResetHint, FloatHistogram};
 
 /// Two-lifetime trait-object alias for the lexer trait grmtools passes
 /// into every action. `'l` is the borrow lifetime (the `&'l dyn …`),
@@ -998,6 +999,151 @@ pub fn stale_value<'l, 'i: 'l>(lexer: &'l L<'l, 'i>, lx: Result<Lx, Lx>) -> Resu
         return Err(());
     }
     Ok(f64::from_bits(STALE_NAN))
+}
+
+/// The keys of one `{{...}}` descriptor, upstream's `map[string]any`
+/// typed. A key given twice is a parse error there
+/// (`mergeMaps`), and here.
+#[derive(Debug, Default)]
+pub struct HistogramDesc {
+    pub schema: Option<i64>,
+    pub sum: Option<f64>,
+    pub count: Option<f64>,
+    pub zero_count: Option<f64>,
+    pub zero_threshold: Option<f64>,
+    pub custom_values: Option<Vec<f64>>,
+    pub buckets: Option<Vec<f64>>,
+    pub offset: Option<i64>,
+    pub negative_buckets: Option<Vec<f64>>,
+    pub negative_offset: Option<i64>,
+    pub counter_reset_hint: Option<CounterResetHint>,
+}
+
+/// A built histogram and upstream's `lastHistogramCounterResetHintSet`,
+/// which is parser state there and travels with the value here.
+#[derive(Debug, Clone)]
+pub struct DescribedHistogram {
+    pub histogram: FloatHistogram,
+    pub counter_reset_hint_set: bool,
+}
+
+/// Upstream `mergeMaps`.
+pub fn merge_histogram_desc(
+    mut left: HistogramDesc,
+    right: HistogramDesc,
+) -> Result<HistogramDesc, ()> {
+    macro_rules! merge {
+        ($($field:ident),*) => {$(
+            if right.$field.is_some() {
+                if left.$field.is_some() {
+                    return Err(());
+                }
+                left.$field = right.$field;
+            }
+        )*};
+    }
+    merge!(
+        schema,
+        sum,
+        count,
+        zero_count,
+        zero_threshold,
+        custom_values,
+        buckets,
+        offset,
+        negative_buckets,
+        negative_offset,
+        counter_reset_hint
+    );
+    Ok(left)
+}
+
+/// Upstream `buildHistogramFromMap` and `buildHistogramBucketsAndSpans`:
+/// each side's buckets are one span starting at its offset.
+pub fn build_histogram(desc: HistogramDesc) -> DescribedHistogram {
+    fn side(
+        buckets: Option<Vec<f64>>,
+        offset: Option<i64>,
+    ) -> (Vec<f64>, Vec<promql_histogram::Span>) {
+        let buckets = buckets.unwrap_or_default();
+        let spans = if buckets.is_empty() {
+            Vec::new()
+        } else {
+            vec![promql_histogram::Span {
+                // Go's `int32(val)` conversion wraps the same way.
+                offset: offset.unwrap_or(0) as i32,
+                length: buckets.len() as u32,
+            }]
+        };
+        (buckets, spans)
+    }
+    let (positive_buckets, positive_spans) = side(desc.buckets, desc.offset);
+    let (negative_buckets, negative_spans) = side(desc.negative_buckets, desc.negative_offset);
+    DescribedHistogram {
+        counter_reset_hint_set: desc.counter_reset_hint.is_some(),
+        histogram: FloatHistogram {
+            counter_reset_hint: desc.counter_reset_hint.unwrap_or_default(),
+            schema: desc.schema.unwrap_or(0) as i32,
+            count: desc.count.unwrap_or(0.0),
+            sum: desc.sum.unwrap_or(0.0),
+            zero_threshold: desc.zero_threshold.unwrap_or(0.0),
+            zero_count: desc.zero_count.unwrap_or(0.0),
+            negative_spans,
+            negative_buckets,
+            positive_spans,
+            positive_buckets,
+            custom_values: desc.custom_values.unwrap_or_default(),
+        },
+    }
+}
+
+/// Upstream `newHistogramSequenceValue`.
+pub fn histogram_value(h: DescribedHistogram) -> SequenceValue {
+    SequenceValue::histogram(h.histogram, h.counter_reset_hint_set)
+}
+
+/// `{{...}}x<count>`: `count + 1` copies, as [`series_repeat`].
+pub fn histogram_repeat(h: DescribedHistogram, count: u64) -> Vec<SequenceValue> {
+    vec![histogram_value(h); count as usize + 1]
+}
+
+/// `{{...}}+{{...}}x<count>` and its `-` form: upstream
+/// `histogramsIncreaseSeries` / `histogramsDecreaseSeries`. The hint
+/// flag is the increment's, the last histogram built, as upstream reads
+/// it off the parser after both.
+pub fn histogram_series(
+    base: DescribedHistogram,
+    inc: DescribedHistogram,
+    count: u64,
+    decrease: bool,
+) -> Result<Vec<SequenceValue>, ()> {
+    let hint_set = inc.counter_reset_hint_set;
+    let mut out = Vec::with_capacity(count as usize + 1);
+    let mut cur = base.histogram;
+    out.push(SequenceValue::histogram(cur.clone(), hint_set));
+    for _ in 0..count {
+        if cur.schema > inc.histogram.schema {
+            return Err(());
+        }
+        if decrease {
+            cur.sub(&inc.histogram).map_err(|_| ())?;
+        } else {
+            cur.add(&inc.histogram).map_err(|_| ())?;
+        }
+        out.push(SequenceValue::histogram(cur.clone(), hint_set));
+    }
+    Ok(out)
+}
+
+/// `bucket_set_list : bucket_set_list SPACE signed_or_unsigned_number`.
+pub fn push_bucket(mut list: Vec<f64>, value: f64) -> Result<Vec<f64>, ()> {
+    list.push(value);
+    Ok(list)
+}
+
+/// `int : SUB uint`.
+pub fn negative_int(value: u64) -> Result<i64, ()> {
+    Ok(-(value as i64))
 }
 
 /// Upper bound on an `x<count>` repetition.

@@ -5,9 +5,11 @@
 //! `parser.ParseSeriesDesc` over the full
 //! `promql/promqltest/testdata` corpus: of 1015 distinct series lines,
 //! all 787 non-histogram lines produce identical labels and values.
-//! The 228 native-histogram lines are the known gap (see
-//! `rejects_native_histograms`).
+//! The 228 native-histogram lines were not part of that cross-check;
+//! their coverage here is hand-written against `buildHistogramFromMap`
+//! and `histogramsSeries` in upstream `parse.go`.
 
+use promql_histogram::{CounterResetHint, Span};
 use promql_parser::{parse_series_desc, SeriesDescription};
 
 fn parse(input: &str) -> SeriesDescription {
@@ -148,10 +150,103 @@ fn special_floats() {
 }
 
 #[test]
-fn rejects_native_histograms() {
-    // The `{{...}}` alternatives of `series_item` reference rules still
-    // on the sidecar's skip list, so they are not parsed yet.
-    assert!(parse_series_desc("metric {{schema:1 sum:3 count:2}}").is_err());
+fn native_histogram_descriptor() {
+    let sd = parse(
+        "h {{schema:1 sum:-3.5 count:6 z_bucket:1 z_bucket_w:0.001 buckets:[1 2] offset:-2 \
+         n_buckets:[3] n_offset:4 counter_reset_hint:gauge}}",
+    );
+    assert_eq!(sd.values.len(), 1);
+    let v = &sd.values[0];
+    assert!(v.counter_reset_hint_set && !v.omitted);
+    let h = v.histogram.as_ref().expect("a histogram");
+    assert_eq!(h.counter_reset_hint, CounterResetHint::Gauge);
+    assert_eq!((h.schema, h.sum, h.count), (1, -3.5, 6.0));
+    assert_eq!((h.zero_count, h.zero_threshold), (1.0, 0.001));
+    assert_eq!(h.positive_buckets, [1.0, 2.0]);
+    assert_eq!(
+        h.positive_spans,
+        [Span {
+            offset: -2,
+            length: 2
+        }]
+    );
+    assert_eq!(h.negative_buckets, [3.0]);
+    assert_eq!(
+        h.negative_spans,
+        [Span {
+            offset: 4,
+            length: 1
+        }]
+    );
+}
+
+#[test]
+fn native_histogram_runs_and_mixed_sequences() {
+    // `x2` is three points, as for floats; an unspelled hint is "don't care".
+    let sd = parse("h {{schema:0 sum:1 count:1}}x2 _ 5 stale {{}} {{ }}");
+    assert_eq!(sd.values.len(), 8);
+    assert!(sd.values[..3]
+        .iter()
+        .all(|v| v.histogram.is_some() && !v.counter_reset_hint_set));
+    assert!(sd.values[3].omitted);
+    assert_eq!(sd.values[4].value, 5.0);
+    assert!(sd.values[4].histogram.is_none() && sd.values[5].histogram.is_none());
+    assert_eq!(
+        sd.values[6].histogram,
+        Some(promql_histogram::FloatHistogram::default())
+    );
+    assert_eq!(sd.values[6], sd.values[7]);
+}
+
+#[test]
+fn native_histogram_arithmetic_series() {
+    let sd = parse(
+        "h {{schema:0 sum:1 count:2 buckets:[1 1]}}+{{schema:0 sum:2 count:1 buckets:[0 1]}}x2",
+    );
+    let sums: Vec<_> = sd
+        .values
+        .iter()
+        .map(|v| {
+            let h = v.histogram.as_ref().unwrap();
+            (h.sum, h.count, h.positive_buckets.clone())
+        })
+        .collect();
+    assert_eq!(
+        sums,
+        [
+            (1.0, 2.0, vec![1.0, 1.0]),
+            (3.0, 3.0, vec![1.0, 2.0]),
+            (5.0, 4.0, vec![1.0, 3.0]),
+        ]
+    );
+
+    let sd = parse("h {{sum:5 count:5 buckets:[5]}}-{{sum:1 count:1 buckets:[1]}}x1");
+    let last = sd.values[1].histogram.as_ref().unwrap();
+    assert_eq!((last.sum, last.count), (4.0, 4.0));
+    assert_eq!(last.positive_buckets, [4.0]);
+}
+
+#[test]
+fn native_histogram_custom_buckets_and_special_numbers() {
+    let sd = parse("h {{schema:-53 sum:Inf count:NaN custom_values:[5 10] buckets:[1 4 0]}}");
+    let h = sd.values[0].histogram.as_ref().unwrap();
+    assert_eq!(h.schema, -53);
+    assert!(h.sum.is_infinite() && h.count.is_nan());
+    assert_eq!(h.custom_values[..2], [5.0, 10.0]);
+}
+
+#[test]
+fn rejects_malformed_native_histograms() {
+    for bad in [
+        "h {{sum:1 sum:2}}",
+        "h {{bogus:1}}",
+        "h {{schema:1.5}}",
+        "h {{sum:1",
+        // Upstream `histogramsSeries`: the increment cannot be coarser.
+        "h {{schema:1}}+{{schema:0}}x2",
+    ] {
+        assert!(parse_series_desc(bad).is_err(), "{bad}");
+    }
 }
 
 #[test]

@@ -318,6 +318,10 @@ mod tests {
             "series_item",
             "metric",
             "label_set",
+            // Native-histogram descriptors, reached through `series_item`.
+            "histogram_series_value",
+            "histogram_desc_map",
+            "bucket_set",
         ] {
             assert!(
                 result.rules_emitted.iter().any(|r| r == rule),
@@ -325,21 +329,14 @@ mod tests {
             );
         }
 
-        // Skip-list rules must not appear.
-        for rule in &["histogram_desc_map", "bucket_set"] {
-            assert!(
-                !result.rules_emitted.iter().any(|r| r == rule),
-                "rule {rule} should have been skipped"
-            );
-        }
-
-        // `series_item`'s histogram alternatives reference skipped
-        // rules, so they must have been filtered out of the emitted
-        // rule while the float alternatives survive.
+        // `series_item` keeps its float alternatives and its histogram
+        // ones, the latter reaching the histogram rules above.
         assert!(result
             .text
             .contains("series_value signed_number 'TIMES' uint"));
-        assert!(!result.text.contains("histogram_series_value"));
+        assert!(result
+            .text
+            .contains("histogram_series_value 'ADD' histogram_series_value 'TIMES' uint"));
 
         // Upstream's `EOF` token has no id on our side; alts using it
         // are dropped via `skip_tokens`.

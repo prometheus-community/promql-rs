@@ -14,6 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // stops being watched altogether.
     println!("cargo:rerun-if-changed=src/grammar.y");
     println!("cargo:rerun-if-changed=src/lexer.l");
+    println!("cargo:rerun-if-changed=src/series.l");
 
     // The PromQL grammar carries the same inherent shift/reduce
     // conflicts as upstream's goyacc grammar: one per binary operator
@@ -99,6 +100,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("IDENT_LABEL", "IDENT"),
         ("STALE", "IDENT"),
         ("LBRACE_AFTER_NAME", "LBRACE"),
+        ("HIST_SPACE", "SPACE"),
+        ("HIST_SUB", "SUB"),
+        ("HIST_NUMBER", "NUMBER"),
+        ("BUCKETS_SPACE", "SPACE"),
+        ("BUCKETS_SUB", "SUB"),
+        ("BUCKETS_NUMBER", "NUMBER"),
     ] {
         let id = *series_tokens
             .get(token)

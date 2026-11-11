@@ -484,7 +484,12 @@ fn parse_eval(file: &str, lines: &[&str], i: usize) -> Result<(usize, Eval), Err
         // that `ordered` positions stay faithful to the source text.
         pos += 1;
 
-        let Ok(desc) = promql_parser::parse_series_desc(row) else {
+        // The grammar reads native-histogram descriptors, but nothing
+        // past it does yet: a row holding one stays the known gap.
+        let desc = promql_parser::parse_series_desc(row)
+            .ok()
+            .filter(|d| d.values.iter().all(|v| v.histogram.is_none()));
+        let Some(desc) = desc else {
             // A native-histogram descriptor is a known gap, not a
             // broken corpus. Anything else is a parser bug worth
             // seeing, so the two are kept apart.
@@ -721,8 +726,9 @@ fn parse_load_block(file: &str, line: usize, raw: &str) -> Result<LoadBlock, Err
 
     let series = lines
         .map(|l| match promql_parser::parse_series_desc(l) {
-            Ok(sd) => SeriesLine::Parsed(sd),
-            Err(_) => SeriesLine::Unsupported(UnsupportedLine {
+            // As for expected rows: read, but not yet loadable.
+            Ok(sd) if sd.values.iter().all(|v| v.histogram.is_none()) => SeriesLine::Parsed(sd),
+            _ => SeriesLine::Unsupported(UnsupportedLine {
                 text: l.to_string(),
                 reason: if l.contains("{{") {
                     Unsupported::NativeHistogram

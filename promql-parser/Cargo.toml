@@ -16,6 +16,7 @@ lrpar = { workspace = true }
 lrlex = { workspace = true }
 cfgrammar = { workspace = true }
 promql-common = { path = "../promql-common" }
+promql-histogram = { path = "../promql-histogram" }
 thiserror = { workspace = true }
 
 [build-dependencies]

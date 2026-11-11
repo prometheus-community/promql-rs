@@ -38,7 +38,9 @@ struct Case {
 /// yet ported:
 ///   - Vector-matching modifiers (bool, on, ignoring, group_left,
 ///     group_right).
-///   - Series descriptions and histogram descriptors.
+///   - Series descriptions, in the corpus generator rather than the
+///     parser: they parse, native-histogram descriptors included, but
+///     this fixture holds expressions.
 ///   - Experimental productions (fill/trim_upper/_lower/anchored/
 ///     smoothed/duration-expr arithmetic) — tracked against upstream.
 ///

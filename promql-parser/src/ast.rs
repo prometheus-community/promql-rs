@@ -11,6 +11,7 @@ use std::fmt;
 
 use crate::posrange::{Pos, PositionRange};
 use crate::token::ItemType;
+use promql_histogram::FloatHistogram;
 
 /// Value classification, mirroring upstream `ValueType`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -177,28 +178,41 @@ fn is_go_print(r: char) -> bool {
 /// One point of a series description's value sequence. Mirrors
 /// upstream `parse.go`'s `SequenceValue`.
 ///
-/// Upstream also carries an optional `Histogram`; native-histogram
-/// descriptors (`{{schema:1 ...}}`) aren't ported yet, so this is
-/// float-only for now.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+/// A point is a float, a native histogram (`{{schema:1 ...}}`) or a gap.
+/// `value` is meaningless when `histogram` is set, as upstream's `Value`
+/// is when its `Histogram` is non-nil.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct SequenceValue {
     pub value: f64,
     pub omitted: bool,
+    pub histogram: Option<FloatHistogram>,
+    /// Upstream's `CounterResetHintSet`: the descriptor spelled a
+    /// `counter_reset_hint`, so a comparison must match it. An unspelled
+    /// hint is "don't care", not `unknown`.
+    pub counter_reset_hint_set: bool,
 }
 
 impl SequenceValue {
     pub fn value(value: f64) -> Self {
         Self {
             value,
-            omitted: false,
+            ..Self::default()
         }
     }
 
     /// The `_` placeholder: a gap in the sequence.
     pub fn omitted() -> Self {
         Self {
-            value: 0.0,
             omitted: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn histogram(histogram: FloatHistogram, counter_reset_hint_set: bool) -> Self {
+        Self {
+            histogram: Some(histogram),
+            counter_reset_hint_set,
+            ..Self::default()
         }
     }
 }
