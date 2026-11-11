@@ -26,4 +26,6 @@ pub mod prometheus;
 pub mod result;
 
 pub use datafusion::DataFusionEngine;
-pub use result::{Engine, EngineError, Labels, Point, QueryResult, Sample, Series, Unimplemented};
+pub use result::{
+    Engine, EngineError, HPoint, Labels, Point, QueryResult, Sample, Series, Unimplemented,
+};

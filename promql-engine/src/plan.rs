@@ -39,6 +39,7 @@ use std::time::Duration;
 use datafusion::catalog::Session;
 use datafusion::common::{Column, ScalarValue};
 use datafusion::datasource::{provider_as_source, MemTable};
+use datafusion::functions::core::expr_fn::get_field;
 use datafusion::logical_expr::{col, lit, LogicalPlan, LogicalPlanBuilder};
 use promql_parser::ast::{
     AggregateExpr, AtModifier, BinaryExpr, Call, Expr, MatrixSelector, UnaryExpr,
@@ -49,9 +50,14 @@ use promql_parser::token::ItemType;
 use crate::absent;
 use crate::aggregate::{self, Op};
 use crate::binary;
+use crate::binary::histograms::Operator;
 use crate::buffer::Kernel;
 use crate::elementwise;
 use crate::error::EngineError;
+use crate::histogram::HISTOGRAMS;
+use crate::histogram_agg;
+use crate::histogram_classic::{self, BUCKET_LABEL};
+use crate::histogram_fn::{self, Map, ToFloat};
 use crate::labels;
 use crate::matcher::{effective_matchers, METRIC_NAME};
 use crate::matrix;
@@ -388,6 +394,11 @@ fn pair_column(field: &str) -> Column {
 fn binary_op(b: &BinaryExpr) -> Result<(binary::Op, bool, binary::Matching), EngineError> {
     let op = binary::Op::from_token(b.op)
         .ok_or_else(|| EngineError::Unsupported(format!("the {} operator", b.op)))?;
+    Ok((op, b.return_bool, matching_of(b)))
+}
+
+/// The matching modifiers of a binary expression between two vectors.
+fn matching_of(b: &BinaryExpr) -> binary::Matching {
     let mut out = binary::Matching::default();
     if let Some(matching) = &b.vector_matching {
         out.card = match matching.card {
@@ -408,7 +419,7 @@ fn binary_op(b: &BinaryExpr) -> Result<(binary::Op, bool, binary::Matching), Eng
         out.labels = sorted(&matching.matching_labels);
         out.include = sorted(&matching.include);
     }
-    Ok((op, b.return_bool, out))
+    out
 }
 
 /// Label names as the engine holds them everywhere: sorted and unique,
@@ -433,10 +444,55 @@ fn grid_of(query: &RangeQuery) -> Params {
     }
 }
 
-/// A planned subexpression: the plan and the label names in its schema.
+/// A planned subexpression: the plan, the label names in its schema, and
+/// which sample types its series can hold.
 struct Planned {
     plan: LogicalPlan,
     label_names: Vec<String>,
+    /// Whether a sample of this vector can be a float. False only below a
+    /// store that selected no `floats` column, through the operators that
+    /// answer a histogram with a histogram. `histogram_quantile` reads it
+    /// to know no classic bucket can be among its input.
+    floats: bool,
+    /// Whether the plan has a `histograms` column. A plan without one
+    /// carries nothing for native histograms, and every operator that
+    /// reads only floats plans as it did before they existed.
+    histograms: bool,
+}
+
+impl Planned {
+    /// A vector of floats: what every expression was before histograms,
+    /// and what most still are.
+    fn floats(plan: LogicalPlan, label_names: Vec<String>) -> Self {
+        Self {
+            plan,
+            label_names,
+            floats: true,
+            histograms: false,
+        }
+    }
+
+    /// `floats` with a float for every histogram merged in, the vector
+    /// an operator sees that asks only whether a sample is there: `count`,
+    /// `group` and `absent`. `labels` and the block pass through.
+    fn with_histograms_as(self, value: f64) -> Result<Self, EngineError> {
+        if !self.histograms {
+            return Ok(self);
+        }
+        let plan = LogicalPlanBuilder::from(self.plan)
+            .project(vec![
+                col(LABELS),
+                histogram_fn::merge(
+                    col(FLOATS),
+                    histogram_fn::to_floats(col(HISTOGRAMS), ToFloat::Constant(value)),
+                )
+                .alias(FLOATS),
+                col(BLOCK_START),
+                col(BLOCK_END),
+            ])?
+            .build()?;
+        Ok(Self::floats(plan, self.label_names))
+    }
 }
 
 struct Planner<'a> {
@@ -531,6 +587,8 @@ impl Planner<'_> {
                 Expr::NumberLiteral(_) => Ok(Planned {
                     plan: self.scalar_series(|ts| scalar::fold(expr, ts))?,
                     label_names: Vec::new(),
+                    floats: true,
+                    histograms: false,
                 }),
                 other => Err(EngineError::Unsupported(describe(other))),
             }
@@ -606,8 +664,10 @@ impl Planner<'_> {
         check_selector_bounds(params.at_ms, params.offset_ms)?;
         let hints = self.hints(&params, None, above);
         let (builder, label_names) = self.scan(vs, hints).await?;
-        let eval =
-            SeriesEval::try_new(builder.build()?, Kernel::Selector(pick), params)?.into_plan();
+        let source = builder.build()?;
+        let floats = pick == selector::Pick::Timestamp || has_column(&source, FLOATS);
+        let eval = SeriesEval::try_new(source, Kernel::Selector(pick), params)?.into_plan();
+        let histograms = has_column(&eval, HISTOGRAMS);
         let builder = LogicalPlanBuilder::from(eval);
         let (labels_expr, label_names) = match pick {
             selector::Pick::Value => (col(LABELS), label_names),
@@ -619,8 +679,15 @@ impl Planner<'_> {
                 (expr.alias(LABELS), names)
             }
         };
-        let plan = builder.project(canonical(labels_expr))?.build()?;
-        Ok(Planned { plan, label_names })
+        let plan = builder
+            .project(canonical(labels_expr, histograms))?
+            .build()?;
+        Ok(Planned {
+            plan,
+            label_names,
+            floats,
+            histograms,
+        })
     }
 
     /// `timestamp(v)`, which upstream evaluates two ways (the `Call` arm
@@ -663,6 +730,8 @@ impl Planner<'_> {
             return Ok(Planned {
                 plan: self.scalar_series(|ts| scalar::fold(&call.args[0], ts))?,
                 label_names: Vec::new(),
+                floats: true,
+                histograms: false,
             });
         }
         if name == "absent" {
@@ -693,10 +762,31 @@ impl Planner<'_> {
             return Ok(Planned {
                 plan: self.scalar_series(|ts| scalar::call(call, ts))?,
                 label_names: Vec::new(),
+                floats: true,
+                histograms: false,
             });
         }
         if name == "timestamp" {
             return self.timestamp(call, above).await;
+        }
+        if let Some(what) = ToFloat::parse(name) {
+            return self
+                .histogram_function(name, &call.args[0], what, above)
+                .await;
+        }
+        if name == "histogram_quantile" {
+            let q = self.constant(&call.args[0], "the histogram_quantile function")?;
+            return self
+                .histogram_function(name, &call.args[1], ToFloat::Quantile(q), above)
+                .await;
+        }
+        if name == "histogram_fraction" {
+            let what = "the histogram_fraction function";
+            let lower = self.constant(&call.args[0], what)?;
+            let upper = self.constant(&call.args[1], what)?;
+            return self
+                .histogram_function(name, &call.args[2], ToFloat::Fraction(lower, upper), above)
+                .await;
         }
         if let Some(func) = elementwise::Func::parse(name) {
             return self.elementwise(call, func, above).await;
@@ -708,6 +798,95 @@ impl Planner<'_> {
         // do they must stop `grouping`: they rewrite labels, so a `by`
         // can name a label the input lacks while its source goes unnamed.
         self.range_function(call, above).await
+    }
+
+    /// A function of each histogram: `histogram_count` and its family
+    /// (`simpleHistogramFunc`), which read native histograms alone, and
+    /// `histogram_quantile` and `histogram_fraction`, which read native
+    /// and classic ones. The name is dropped either way.
+    ///
+    /// A native histogram is one sample, so its float is computed where
+    /// the sample is, row by row. A classic histogram is the float series
+    /// that differ only in `le`, so a vector that can hold one is grouped
+    /// by every other label instead ([`histogram_classic`]), native
+    /// histograms and all: the grouping is what sees a label set that is
+    /// both at once, which upstream answers nothing for.
+    async fn histogram_function(
+        &mut self,
+        name: &str,
+        vector: &Expr,
+        what: ToFloat,
+        above: Above<'_>,
+    ) -> Result<Planned, EngineError> {
+        let input = self
+            .expr(
+                vector,
+                Above {
+                    func: Some(name),
+                    grouping: above.grouping,
+                },
+            )
+            .await?;
+        let classic = match what {
+            ToFloat::Quantile(q) => Some(histogram_classic::Func::Quantile(q)),
+            ToFloat::Fraction(lower, upper) => {
+                Some(histogram_classic::Func::Fraction(lower, upper))
+            }
+            _ => None,
+        }
+        // A float without `le` is not a bucket, and a vector without
+        // floats holds none.
+        .filter(|_| input.floats && input.label_names.iter().any(|n| n == BUCKET_LABEL));
+        let Some(classic) = classic else {
+            let (labels_expr, label_names) = labels::keep(&input.label_names, |n| n != METRIC_NAME);
+            let floats = match input.histograms {
+                true => histogram_fn::to_floats(col(HISTOGRAMS), what),
+                // No histogram can be among the input, so every series
+                // answers nothing: its floats less themselves.
+                false => histogram_fn::without(col(FLOATS), col(FLOATS)),
+            };
+            let stage = self.stage(name);
+            let plan = LogicalPlanBuilder::from(input.plan)
+                .alias(stage)?
+                .project(vec![
+                    labels_expr.alias(LABELS),
+                    floats.alias(FLOATS),
+                    col(BLOCK_START),
+                    col(BLOCK_END),
+                ])?
+                .build()?;
+            return Ok(Planned::floats(plan, label_names));
+        };
+
+        // `signatureToMetricWithBuckets` keys on the label set without
+        // `le`, the name included, and answers without either.
+        let keys: Vec<String> = input
+            .label_names
+            .iter()
+            .filter(|n| *n != BUCKET_LABEL)
+            .cloned()
+            .collect();
+        let answered: Vec<String> = keys.iter().filter(|n| *n != METRIC_NAME).cloned().collect();
+        let mut group = vec![col(BLOCK_START), col(BLOCK_END)];
+        group.extend(labels::group_exprs(&keys));
+        let histograms = match input.histograms {
+            true => col(HISTOGRAMS),
+            false => histogram_fn::no_histograms(),
+        };
+        let plan = LogicalPlanBuilder::from(input.plan)
+            .aggregate(
+                group,
+                vec![histogram_classic::call(
+                    col(FLOATS),
+                    histograms,
+                    get_field(col(LABELS), BUCKET_LABEL),
+                    classic,
+                )
+                .alias(FLOATS)],
+            )?
+            .project(canonical(labels::regroup(&answered).alias(LABELS), false))?
+            .build()?;
+        Ok(Planned::floats(plan, answered))
     }
 
     /// `scalar(v)`: upstream's `funcScalar` over the instant vector `arg`,
@@ -729,6 +908,8 @@ impl Planner<'_> {
                 },
             )
             .await?;
+        // `funcScalar` passes over histogram elements: it reads the one
+        // float among them, which is what reading `floats` alone does.
         let plan = LogicalPlanBuilder::from(input.plan)
             .aggregate(
                 Vec::<datafusion::logical_expr::Expr>::new(),
@@ -748,6 +929,8 @@ impl Planner<'_> {
         Ok(Planned {
             plan,
             label_names: Vec::new(),
+            floats: true,
+            histograms: false,
         })
     }
 
@@ -763,6 +946,8 @@ impl Planner<'_> {
     /// samples, and the output drops it as it drops any other empty
     /// series.
     fn absent(&mut self, arg: &Expr, input: Planned) -> Result<Planned, EngineError> {
+        // A series is present where it has a sample of either type.
+        let input = input.with_histograms_as(1.0)?;
         let pairs = absent::labels_for(arg);
         let label_names = pairs.iter().map(|(n, _)| n.clone()).collect();
         let labels_expr = labels::call(pairs.into_iter().map(|(n, v)| (n, lit(v))).collect());
@@ -779,7 +964,7 @@ impl Planner<'_> {
             )?
             .project(whole_grid(labels_expr.alias(LABELS), col(FLOATS)))?
             .build()?;
-        Ok(Planned { plan, label_names })
+        Ok(Planned::floats(plan, label_names))
     }
 
     /// A function applied to one sample at a time: `abs(x)` and its
@@ -818,6 +1003,8 @@ impl Planner<'_> {
             None => Planned {
                 plan: self.scalar_series(|ts| Ok(scalar::time(ts)))?,
                 label_names: Vec::new(),
+                floats: true,
+                histograms: false,
             },
         };
         let (labels_expr, label_names) = labels::keep(&input.label_names, |n| {
@@ -829,22 +1016,32 @@ impl Planner<'_> {
         // this one's plain `labels` — the same column under two names,
         // which DataFusion resolves as ambiguous.
         let stage = self.stage(func.as_str());
+        let mut floats = elementwise::call(
+            col(FLOATS),
+            func,
+            args.first().copied(),
+            args.get(1).copied(),
+        );
+        // `funcTimestamp` reads `el.T` of every element, a histogram's
+        // too. Every other function here is `simpleFloatFunc` or a
+        // sibling that passes over an element with a histogram, which
+        // is what not reading the column does.
+        if func == elementwise::Func::Timestamp && input.histograms {
+            floats = histogram_fn::merge(
+                floats,
+                histogram_fn::to_floats(col(HISTOGRAMS), ToFloat::Timestamp),
+            );
+        }
         let plan = LogicalPlanBuilder::from(input.plan)
             .alias(stage)?
             .project(vec![
                 labels_expr.alias(LABELS),
-                elementwise::call(
-                    col(FLOATS),
-                    func,
-                    args.first().copied(),
-                    args.get(1).copied(),
-                )
-                .alias(FLOATS),
+                floats.alias(FLOATS),
                 col(BLOCK_START),
                 col(BLOCK_END),
             ])?
             .build()?;
-        Ok(Planned { plan, label_names })
+        Ok(Planned::floats(plan, label_names))
     }
 
     /// `-x` and `+x`: upstream's `UnaryExpr` arm of `eval`
@@ -864,6 +1061,8 @@ impl Planner<'_> {
             return Ok(Planned {
                 plan: self.scalar_series(|ts| scalar::fold(expr, ts))?,
                 label_names: Vec::new(),
+                floats: true,
+                histograms: false,
             });
         }
         match u.op {
@@ -883,22 +1082,35 @@ impl Planner<'_> {
         let (labels_expr, label_names) = labels::keep(&input.label_names, |n| n != METRIC_NAME);
         // Named for the reason `elementwise` names its stage.
         let stage = self.stage(func.as_str());
+        let mut columns = vec![
+            labels_expr.alias(LABELS),
+            elementwise::call(col(FLOATS), func, None, None).alias(FLOATS),
+            col(BLOCK_START),
+            col(BLOCK_END),
+        ];
+        // `mat[i].Histograms[j].H.Mul(-1)`, in the same `UnaryExpr` arm.
+        if input.histograms {
+            columns.push(histogram_fn::map(col(HISTOGRAMS), Map::Mul(-1.0)).alias(HISTOGRAMS));
+        }
         let plan = LogicalPlanBuilder::from(input.plan)
             .alias(stage)?
-            .project(vec![
-                labels_expr.alias(LABELS),
-                elementwise::call(col(FLOATS), func, None, None).alias(FLOATS),
-                col(BLOCK_START),
-                col(BLOCK_END),
-            ])?
+            .project(columns)?
             .build()?;
-        Ok(Planned { plan, label_names })
+        Ok(Planned {
+            plan,
+            label_names,
+            floats: input.floats,
+            histograms: input.histograms,
+        })
     }
 
     /// One binary operator, sent to the shape its operand types call
     /// for. `expr` is `b` again, for the scalar fold that needs the
     /// whole node.
     async fn binary(&mut self, expr: &Expr, b: &BinaryExpr) -> Result<Planned, EngineError> {
+        if matches!(b.op, ItemType::TrimUpper | ItemType::TrimLower) {
+            return self.trim(b).await;
+        }
         let (op, return_bool, matching) = binary_op(b)?;
         match (value_type(&b.lhs), value_type(&b.rhs)) {
             (ValueType::Vector, ValueType::Scalar) => {
@@ -910,15 +1122,77 @@ impl Planner<'_> {
                     .await
             }
             (ValueType::Vector, ValueType::Vector) => {
-                self.vector_vector(b, op, return_bool, matching).await
+                self.vector_vector(b, Operator::Op(op, return_bool), matching)
+                    .await
             }
             // Two scalars are a value per step and nothing else, which
             // is the table [`Planner::scalar_series`] already builds.
             _ => Ok(Planned {
                 plan: self.scalar_series(|ts| scalar::fold(expr, ts))?,
                 label_names: Vec::new(),
+                floats: true,
+                histograms: false,
             }),
         }
+    }
+
+    /// The histogram trim operators, `h </ x` and `h >/ x`
+    /// (`TRIM_UPPER` and `TRIM_LOWER` in `vectorElemBinop`): a histogram
+    /// on the left and a float on the right is the histogram without the
+    /// observations above or at-and-below it, and every other pairing of
+    /// types is left out of the result. They are not in
+    /// `changesMetricSchema`, so the name stays.
+    ///
+    /// Against a scalar the trim is a function of each histogram. Between
+    /// two vectors it is one more operator of the histogram pairing.
+    async fn trim(&mut self, b: &BinaryExpr) -> Result<Planned, EngineError> {
+        let what = format!("the {} operator", b.op);
+        match (value_type(&b.lhs), value_type(&b.rhs)) {
+            (ValueType::Vector, ValueType::Scalar) => {}
+            (ValueType::Vector, ValueType::Vector) => {
+                let operator = match b.op {
+                    ItemType::TrimUpper => Operator::TrimUpper,
+                    _ => Operator::TrimLower,
+                };
+                return self.vector_vector(b, operator, matching_of(b)).await;
+            }
+            // A scalar on the left has no histogram to trim. What
+            // upstream answers such a query with is not settled here.
+            _ => {
+                return Err(EngineError::Unsupported(format!(
+                    "{what} with a scalar on the left"
+                )))
+            }
+        }
+        let x = self.constant(&b.rhs, &what)?;
+        let input = self.expr(&b.lhs, Above::default()).await?;
+        // Rebuilt for the reason `vector_scalar` rebuilds its labels.
+        let (labels_expr, label_names) = labels::keep(&input.label_names, |_| true);
+        let mut columns = vec![
+            labels_expr.alias(LABELS),
+            // A float trimmed is no sample: the floats less themselves.
+            histogram_fn::without(col(FLOATS), col(FLOATS)).alias(FLOATS),
+            col(BLOCK_START),
+            col(BLOCK_END),
+        ];
+        if input.histograms {
+            let by = match b.op {
+                ItemType::TrimUpper => Map::TrimUpper(x),
+                _ => Map::TrimLower(x),
+            };
+            columns.push(histogram_fn::map(col(HISTOGRAMS), by).alias(HISTOGRAMS));
+        }
+        let stage = self.stage(BINARY_STAGE);
+        let plan = LogicalPlanBuilder::from(input.plan)
+            .alias(stage)?
+            .project(columns)?
+            .build()?;
+        Ok(Planned {
+            plan,
+            label_names,
+            floats: false,
+            histograms: input.histograms,
+        })
     }
 
     /// A vector against a scalar: upstream's `VectorscalarBinop`, which
@@ -955,22 +1229,41 @@ impl Planner<'_> {
         };
         // Named for the same reason `elementwise` names its stage.
         let stage = self.stage(BINARY_STAGE);
+        let mut columns = vec![
+            labels_expr.alias(LABELS),
+            elementwise::call(
+                col(FLOATS),
+                elementwise::Func::Binary { op, return_bool },
+                a,
+                b,
+            )
+            .alias(FLOATS),
+            col(BLOCK_START),
+            col(BLOCK_END),
+        ];
+        // `vectorElemBinop` with a histogram on one side and a float on
+        // the other: a histogram times a scalar, either way round, and a
+        // histogram over a scalar are histograms. Every other operator
+        // leaves the element out, which is what dropping the column does.
+        let scaled = match (op, swap) {
+            (binary::Op::Mul, _) => Some(Map::Mul(value)),
+            (binary::Op::Div, false) => Some(Map::Div(value)),
+            _ => None,
+        }
+        .filter(|_| input.histograms);
+        if let Some(by) = scaled {
+            columns.push(histogram_fn::map(col(HISTOGRAMS), by).alias(HISTOGRAMS));
+        }
         let plan = LogicalPlanBuilder::from(input.plan)
             .alias(stage)?
-            .project(vec![
-                labels_expr.alias(LABELS),
-                elementwise::call(
-                    col(FLOATS),
-                    elementwise::Func::Binary { op, return_bool },
-                    a,
-                    b,
-                )
-                .alias(FLOATS),
-                col(BLOCK_START),
-                col(BLOCK_END),
-            ])?
+            .project(columns)?
             .build()?;
-        Ok(Planned { plan, label_names })
+        Ok(Planned {
+            plan,
+            label_names,
+            floats: input.floats,
+            histograms: scaled.is_some(),
+        })
     }
 
     /// Two vectors, matched on the signature the modifiers name.
@@ -982,8 +1275,7 @@ impl Planner<'_> {
     async fn vector_vector(
         &mut self,
         b: &BinaryExpr,
-        op: binary::Op,
-        return_bool: bool,
+        operator: Operator,
         matching: binary::Matching,
     ) -> Result<Planned, EngineError> {
         let lhs = self.expr(&b.lhs, Above::default()).await?;
@@ -1013,8 +1305,16 @@ impl Planner<'_> {
                 .collect(),
         };
 
-        let left = self.operand(lhs, &names, false)?;
-        let right = self.operand(rhs, &names, true)?;
+        // A trim computes on histograms alone, so it pairs where they
+        // are paired whether or not either side has any.
+        let (op, return_bool) = match operator {
+            Operator::Op(op, return_bool) if !lhs.histograms && !rhs.histograms => {
+                (op, return_bool)
+            }
+            _ => return self.vector_vector_histograms(lhs, rhs, names, keys, operator, matching),
+        };
+        let left = self.operand(lhs, &names, false, false)?;
+        let right = self.operand(rhs, &names, true, false)?;
         let plan = LogicalPlanBuilder::from(left)
             .union(right)?
             .aggregate(
@@ -1051,6 +1351,56 @@ impl Planner<'_> {
         Ok(Planned {
             plan,
             label_names: names,
+            floats: true,
+            histograms: false,
+        })
+    }
+
+    /// [`Planner::vector_vector`] where an operand has a `histograms`
+    /// column: the same union and the same grouping by the match
+    /// signature, paired by [`binary::histograms`], whose arithmetic knows
+    /// both sample types. An operand without the column brings an empty
+    /// list, so the two branches of the union agree.
+    fn vector_vector_histograms(
+        &mut self,
+        lhs: Planned,
+        rhs: Planned,
+        names: Vec<String>,
+        keys: Vec<String>,
+        operator: Operator,
+        matching: binary::Matching,
+    ) -> Result<Planned, EngineError> {
+        let left = self.operand(lhs, &names, false, true)?;
+        let right = self.operand(rhs, &names, true, true)?;
+        let mut columns = whole_grid(
+            col(pair_column(binary::PAIR_LABELS)).alias(LABELS),
+            col(pair_column(binary::PAIR_FLOATS)).alias(FLOATS),
+        );
+        columns.push(col(pair_column(binary::histograms::PAIR_HISTOGRAMS)).alias(HISTOGRAMS));
+        let plan = LogicalPlanBuilder::from(left)
+            .union(right)?
+            .aggregate(
+                labels::group_exprs(&keys),
+                vec![binary::histograms::call(
+                    col(FLOATS),
+                    col(HISTOGRAMS),
+                    col(binary::SIDE),
+                    col(LABELS),
+                    operator,
+                    &matching,
+                )
+                .alias(PAIRS)],
+            )?
+            // Twice, for the reason `vector_vector` unnests twice.
+            .unnest_column(Column::new_unqualified(PAIRS))?
+            .unnest_column(Column::new_unqualified(PAIRS))?
+            .project(columns)?
+            .build()?;
+        Ok(Planned {
+            plan,
+            label_names: names,
+            floats: true,
+            histograms: true,
         })
     }
 
@@ -1061,15 +1411,25 @@ impl Planner<'_> {
         operand: Planned,
         names: &[String],
         is_rhs: bool,
+        histograms: bool,
     ) -> Result<LogicalPlan, EngineError> {
         let stage = self.stage(BINARY_STAGE);
+        let mut columns = vec![
+            labels::widen(&operand.label_names, names).alias(LABELS),
+            col(FLOATS),
+            lit(is_rhs).alias(binary::SIDE),
+        ];
+        if histograms {
+            // The column itself goes bare, for the reason `canonical`
+            // leaves `labels` bare.
+            columns.push(match operand.histograms {
+                true => col(HISTOGRAMS),
+                false => histogram_fn::no_histograms().alias(HISTOGRAMS),
+            });
+        }
         Ok(LogicalPlanBuilder::from(operand.plan)
             .alias(stage)?
-            .project(vec![
-                labels::widen(&operand.label_names, names).alias(LABELS),
-                col(FLOATS),
-                lit(is_rhs).alias(binary::SIDE),
-            ])?
+            .project(columns)?
             .build()?)
     }
 
@@ -1132,15 +1492,24 @@ impl Planner<'_> {
                 },
             )
             .await?;
+        // `funcSort` and `funcSortDesc` order `filterFloats(v)`: a
+        // histogram element is not in the result, at any step.
+        let input = if func.by_label() || !input.histograms {
+            input
+        } else {
+            Planned::floats(
+                LogicalPlanBuilder::from(input.plan)
+                    .project(canonical(col(LABELS), false))?
+                    .build()?,
+                input.label_names,
+            )
+        };
         if self.query.start_ms != self.query.end_ms {
             return Ok(input);
         }
         let keys = sort::exprs(func, &labels, &input.label_names);
         let plan = LogicalPlanBuilder::from(input.plan).sort(keys)?.build()?;
-        Ok(Planned {
-            plan,
-            label_names: input.label_names,
-        })
+        Ok(Planned { plan, ..input })
     }
 
     /// A function of one range selector: `rate(x[5m])` and its family.
@@ -1254,21 +1623,36 @@ impl Planner<'_> {
         );
         let (builder, input_names) = self.scan(vs, hints).await?;
         let drops_metric_name = op.drops_metric_name();
-        let eval = SeriesEval::try_new(builder.build()?, Kernel::Range(op), params)?.into_plan();
+        let kernel = Kernel::Range(op);
+        let source = builder.build()?;
+        // A function that answers histograms with histograms has no float
+        // to give where the store selected none.
+        let floats = has_column(&source, FLOATS) || !kernel.emits_histograms();
+        let eval = SeriesEval::try_new(source, kernel, params)?.into_plan();
+        let histograms = has_column(&eval, HISTOGRAMS);
         let builder = LogicalPlanBuilder::from(eval);
         // `__name__` is dropped above the grouping, not below it: below, two
         // series differing only in their name would fold into one group.
         if !drops_metric_name {
             return Ok(Planned {
-                plan: builder.project(canonical(col(LABELS)))?.build()?,
+                plan: builder
+                    .project(canonical(col(LABELS), histograms))?
+                    .build()?,
                 label_names: input_names,
+                floats,
+                histograms,
             });
         }
         let (labels_expr, label_names) = labels::keep(&input_names, |n| n != METRIC_NAME);
         let plan = builder
-            .project(canonical(labels_expr.alias(LABELS)))?
+            .project(canonical(labels_expr.alias(LABELS), histograms))?
             .build()?;
-        Ok(Planned { plan, label_names })
+        Ok(Planned {
+            plan,
+            label_names,
+            floats,
+            histograms,
+        })
     }
 
     /// A range selector as the whole of an instant query: upstream's
@@ -1313,15 +1697,34 @@ impl Planner<'_> {
             mint: maxt - params.window_ms,
             maxt,
         };
-        let plan = builder
-            .project(vec![
-                col(LABELS),
-                matrix::call(col(FLOATS), window).alias(FLOATS),
-                col(BLOCK_START),
-                col(BLOCK_END),
-            ])?
-            .build()?;
-        Ok(Planned { plan, label_names })
+        let source = builder.build()?;
+        let (floats, histograms) = (has_column(&source, FLOATS), has_column(&source, HISTOGRAMS));
+        let mut columns = vec![
+            col(LABELS),
+            // A store of only histograms has no floats column, and the
+            // result always does: an empty list per row, here the counts
+            // of no histograms.
+            match floats {
+                true => matrix::call(col(FLOATS), window),
+                false => histogram_fn::to_floats(
+                    histogram_fn::without(col(HISTOGRAMS), col(HISTOGRAMS)),
+                    ToFloat::Count,
+                ),
+            }
+            .alias(FLOATS),
+            col(BLOCK_START),
+            col(BLOCK_END),
+        ];
+        if histograms {
+            columns.push(matrix::call(col(HISTOGRAMS), window).alias(HISTOGRAMS));
+        }
+        let plan = LogicalPlanBuilder::from(source).project(columns)?.build()?;
+        Ok(Planned {
+            plan,
+            label_names,
+            floats,
+            histograms,
+        })
     }
 
     async fn aggregate(&mut self, agg: &AggregateExpr) -> Result<Planned, EngineError> {
@@ -1355,23 +1758,69 @@ impl Planner<'_> {
         // and leaves when the block does.
         let mut group = vec![col(BLOCK_START), col(BLOCK_END)];
         group.extend(labels::group_exprs(&keys));
+        let floats = |samples: datafusion::logical_expr::Expr, op: Op| {
+            aggregate::call(
+                samples,
+                op,
+                self.query.start_ms,
+                self.query.end_ms,
+                self.query.step_ms,
+            )
+        };
+        let histogram_op = match op {
+            Op::Sum => Some(histogram_agg::Op::Sum),
+            Op::Avg => Some(histogram_agg::Op::Avg),
+            _ => None,
+        }
+        .filter(|_| input.histograms);
+        let Some(histogram_op) = histogram_op else {
+            // `count` and `group` take a histogram element as one more
+            // element. `min`, `max`, `stddev` and `stdvar` pass over it,
+            // which is what reading `floats` alone does.
+            let input = match op {
+                Op::Count | Op::Group => input.with_histograms_as(1.0)?,
+                _ => input,
+            };
+            let plan = LogicalPlanBuilder::from(input.plan)
+                .aggregate(group, vec![floats(col(FLOATS), op).alias(FLOATS)])?
+                .project(canonical(labels::regroup(&keys).alias(LABELS), false))?
+                .build()?;
+            return Ok(Planned::floats(plan, keys));
+        };
+        // `sum` and `avg` add floats to floats and histograms to
+        // histograms, and a group holding both at a step answers nothing
+        // there (`hasFloat && hasHistogram`). The two sums run side by
+        // side in one grouping. The third aggregate marks the steps a
+        // group held a histogram at all: the histogram sum cannot say,
+        // since it also answers nothing where its histograms would not
+        // add, and the float sum must still give way there.
+        let held = "__histogram_held";
         let plan = LogicalPlanBuilder::from(input.plan)
             .aggregate(
                 group,
-                vec![aggregate::call(
-                    col(FLOATS),
-                    op,
-                    self.query.start_ms,
-                    self.query.end_ms,
-                    self.query.step_ms,
-                )
-                .alias(FLOATS)],
+                vec![
+                    floats(col(FLOATS), op).alias(FLOATS),
+                    histogram_agg::call(col(HISTOGRAMS), histogram_op).alias(HISTOGRAMS),
+                    floats(
+                        histogram_fn::to_floats(col(HISTOGRAMS), ToFloat::Constant(1.0)),
+                        Op::Group,
+                    )
+                    .alias(held),
+                ],
             )?
-            .project(canonical(labels::regroup(&keys).alias(LABELS)))?
+            .project(vec![
+                labels::regroup(&keys).alias(LABELS),
+                histogram_fn::without(col(FLOATS), col(held)).alias(FLOATS),
+                col(BLOCK_START),
+                col(BLOCK_END),
+                histogram_fn::without(col(HISTOGRAMS), col(FLOATS)).alias(HISTOGRAMS),
+            ])?
             .build()?;
         Ok(Planned {
             plan,
             label_names: keys,
+            floats: input.floats,
+            histograms: true,
         })
     }
 }
@@ -1398,8 +1847,19 @@ fn whole_grid(
 /// a computed label set arrives aliased, the column itself bare, since
 /// aliasing `labels` to its own name leaves the optimizer two columns
 /// of that name to choose from.
-fn canonical(labels: datafusion::logical_expr::Expr) -> Vec<datafusion::logical_expr::Expr> {
-    vec![labels, col(FLOATS), col(BLOCK_START), col(BLOCK_END)]
+fn canonical(
+    labels: datafusion::logical_expr::Expr,
+    histograms: bool,
+) -> Vec<datafusion::logical_expr::Expr> {
+    let mut columns = vec![labels, col(FLOATS), col(BLOCK_START), col(BLOCK_END)];
+    if histograms {
+        columns.push(col(HISTOGRAMS));
+    }
+    columns
+}
+
+fn has_column(plan: &LogicalPlan, name: &str) -> bool {
+    plan.schema().has_column_with_unqualified_name(name)
 }
 
 fn offset_ms(vs: &VectorSelector) -> Result<i64, EngineError> {

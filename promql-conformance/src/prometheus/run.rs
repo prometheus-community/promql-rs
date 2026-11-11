@@ -31,6 +31,7 @@
 
 use std::collections::BTreeMap;
 
+use promql_histogram::FloatHistogram;
 use promql_parser::SeriesDescription;
 
 use super::script::{Command, Eval, Expected, LoadBlock, Range, Script, Timing, Unsupported};
@@ -143,6 +144,7 @@ pub struct Outcome {
 struct Block {
     series: Vec<SeriesDescription>,
     interval_secs: f64,
+    with_nhcb: bool,
     /// Label sets of the series lines in this block that did not load,
     /// native-histogram descriptors today; `None` for a line whose labels
     /// could not be read. An eval selecting one is skipped: the data it
@@ -171,6 +173,7 @@ pub fn run_script(engine: &dyn Engine, script: &Script) -> Vec<Outcome> {
             Command::Load(load) => active.push(Block {
                 series: load.block.parsed().cloned().collect(),
                 interval_secs: load.block.interval_secs,
+                with_nhcb: load.block.with_nhcb,
                 unloaded: load
                     .block
                     .unsupported()
@@ -206,9 +209,17 @@ pub fn run_script(engine: &dyn Engine, script: &Script) -> Vec<Outcome> {
 }
 
 fn has_histograms(eval: &Eval, active: &[Block]) -> bool {
-    eval.unsupported
-        .iter()
-        .any(|u| u.reason == Unsupported::NativeHistogram)
+    let expects_one = match &eval.expected {
+        Expected::Series(rows) => rows
+            .iter()
+            .any(|row| row.desc.values.iter().any(|v| v.histogram.is_some())),
+        _ => false,
+    };
+    expects_one
+        || eval
+            .unsupported
+            .iter()
+            .any(|u| u.reason == Unsupported::NativeHistogram)
         || selects(&eval.query, active.iter().flat_map(|b| &b.histograms))
 }
 
@@ -222,6 +233,12 @@ fn histogram_series(block: &LoadBlock) -> Vec<Option<Labels>> {
         .unsupported()
         .filter(|u| u.reason == Unsupported::NativeHistogram)
         .map(|u| series_labels(&u.text))
+        .chain(
+            block
+                .parsed()
+                .filter(|desc| desc.values.iter().any(|v| v.histogram.is_some()))
+                .map(|desc| Some(labels_of(desc))),
+        )
         .collect();
     if block.with_nhcb {
         for desc in block.parsed() {
@@ -455,6 +472,7 @@ fn evaluate(engine: &dyn Engine, eval: &Eval, active: &[Block]) -> Verdict {
         .map(|b| LoadedSeries {
             series: &b.series,
             interval_secs: b.interval_secs,
+            with_nhcb: b.with_nhcb,
         })
         .collect();
 
@@ -556,7 +574,16 @@ fn verify(eval: &Eval, actual: QueryResult) -> Result<(), String> {
 struct Expected1 {
     labels: Labels,
     points: Vec<Point>,
+    histograms: Vec<ExpectedHistogram>,
     pos: usize,
+}
+
+/// Upstream's `expectedHPoint`: the histogram and whether the script
+/// spelled its counter reset hint, which is the only case it is compared.
+struct ExpectedHistogram {
+    t: i64,
+    h: FloatHistogram,
+    hint_set: bool,
 }
 
 fn expected_rows(eval: &Eval, start_ms: i64, step_ms: i64) -> Vec<Expected1> {
@@ -571,10 +598,23 @@ fn expected_rows(eval: &Eval, start_ms: i64, step_ms: i64) -> Vec<Expected1> {
                 .values
                 .iter()
                 .enumerate()
-                .filter(|(_, v)| !v.omitted)
+                .filter(|(_, v)| !v.omitted && v.histogram.is_none())
                 .map(|(i, v)| Point {
                     t: start_ms + i as i64 * step_ms,
                     v: v.value,
+                })
+                .collect(),
+            histograms: row
+                .desc
+                .values
+                .iter()
+                .enumerate()
+                .filter_map(|(i, v)| {
+                    Some(ExpectedHistogram {
+                        t: start_ms + i as i64 * step_ms,
+                        h: v.histogram.clone()?,
+                        hint_set: v.counter_reset_hint_set,
+                    })
                 })
                 .collect(),
             pos: row.pos,
@@ -605,16 +645,24 @@ fn normalise_vector(actual: QueryResult) -> Result<Vec<Sample>, String> {
         }
     };
     let mut out = Vec::with_capacity(series.len());
-    for s in series {
-        match s.floats.len() {
+    for mut s in series {
+        match s.floats.len() + s.histograms.len() {
             // A series with no point at the eval time simply is not in
             // the instant result.
             0 => continue,
-            1 => out.push(Sample {
-                labels: s.labels,
-                t: s.floats[0].t,
-                v: s.floats[0].v,
-                histogram: false,
+            1 => out.push(match s.histograms.pop() {
+                Some(p) => Sample {
+                    labels: s.labels,
+                    t: p.t,
+                    v: 0.0,
+                    histogram: Some(p.h),
+                },
+                None => Sample {
+                    labels: s.labels,
+                    t: s.floats[0].t,
+                    v: s.floats[0].v,
+                    histogram: None,
+                },
             }),
             n => {
                 return Err(format!(
@@ -631,7 +679,7 @@ fn normalise_scalar(actual: QueryResult) -> Result<f64, String> {
     match actual {
         QueryResult::Scalar { v, .. } => Ok(v),
         QueryResult::Matrix(series) => match series.as_slice() {
-            [s] if s.floats.len() == 1 => Ok(s.floats[0].v),
+            [s] if s.floats.len() == 1 && s.histograms.is_empty() => Ok(s.floats[0].v),
             [] => Err("expected a scalar, got an empty result".to_string()),
             _ => Err(format!("expected a scalar, got {} series", series.len())),
         },
@@ -667,10 +715,7 @@ fn compare_vector(want: &[Expected1], got: &[Sample], ordered: bool) -> Result<(
                     g.labels
                 ));
             }
-            let wv = w.points.first().map(|p| p.v).unwrap_or(f64::NAN);
-            if !almost_equal(wv, g.v, EPSILON) {
-                return Err(format!("position {}: expected {wv}, got {}", i + 1, g.v));
-            }
+            compare_sample(w, g).map_err(|e| format!("position {}: {e}", i + 1))?;
         }
         return Ok(());
     }
@@ -680,12 +725,73 @@ fn compare_vector(want: &[Expected1], got: &[Sample], ordered: bool) -> Result<(
         let Some(g) = by_labels.get(&w.labels) else {
             return Err(format!("expected metric {:?} not in the result", w.labels));
         };
-        let wv = w.points.first().map(|p| p.v).unwrap_or(f64::NAN);
-        if !almost_equal(wv, g.v, EPSILON) {
-            return Err(format!("{:?}: expected {wv}, got {}", w.labels, g.v));
-        }
+        compare_sample(w, g).map_err(|e| format!("{:?}: {e}", w.labels))?;
     }
     Ok(())
+}
+
+/// One vector element against its expected row: a float against a float,
+/// a histogram against a histogram, and never one against the other.
+fn compare_sample(want: &Expected1, got: &Sample) -> Result<(), String> {
+    match (want.histograms.first(), &got.histogram) {
+        (Some(w), Some(g)) => compare_histogram(w, g),
+        (Some(w), None) => Err(format!("expected histogram {:?}, got float {}", w.h, got.v)),
+        (None, Some(g)) => Err(format!(
+            "expected float {}, got histogram {g:?}",
+            want.points.first().map(|p| p.v).unwrap_or(f64::NAN)
+        )),
+        (None, None) => {
+            let wv = want.points.first().map(|p| p.v).unwrap_or(f64::NAN);
+            if almost_equal(wv, got.v, EPSILON) {
+                Ok(())
+            } else {
+                Err(format!("expected {wv}, got {}", got.v))
+            }
+        }
+    }
+}
+
+/// Upstream's `compareNativeHistogram` over `Compact(0)` of both sides
+/// (`promql/promqltest/test.go` at 83962c35): schema, zero threshold,
+/// custom bounds and spans exactly, every count within the tolerance
+/// floats get, and the counter reset hint only where the script spelled
+/// one.
+fn compare_histogram(want: &ExpectedHistogram, got: &FloatHistogram) -> Result<(), String> {
+    let (mut exp, mut cur) = (want.h.clone(), got.clone());
+    exp.compact();
+    cur.compact();
+    let close = |a: f64, b: f64| almost_equal(a, b, EPSILON);
+    let buckets =
+        |a: &[f64], b: &[f64]| a.len() == b.len() && a.iter().zip(b).all(|(a, b)| close(*a, *b));
+    // `spansMatch`: the same bucket indices, however the spans cut them.
+    let indices = |spans: &[promql_histogram::Span]| -> Vec<i64> {
+        let mut at = 0i64;
+        let mut out = Vec::new();
+        for span in spans {
+            at += i64::from(span.offset);
+            out.extend(at..at + i64::from(span.length));
+            at += i64::from(span.length);
+        }
+        out
+    };
+    // `CustomBucketBoundsMatch`.
+    let bounds = !exp.uses_custom_buckets() || exp.custom_values == cur.custom_values;
+    let same = exp.schema == cur.schema
+        && close(exp.count, cur.count)
+        && close(exp.sum, cur.sum)
+        && bounds
+        && exp.zero_threshold == cur.zero_threshold
+        && close(exp.zero_count, cur.zero_count)
+        && indices(&exp.negative_spans) == indices(&cur.negative_spans)
+        && buckets(&exp.negative_buckets, &cur.negative_buckets)
+        && indices(&exp.positive_spans) == indices(&cur.positive_spans)
+        && buckets(&exp.positive_buckets, &cur.positive_buckets)
+        && (!want.hint_set || exp.counter_reset_hint == cur.counter_reset_hint);
+    if same {
+        Ok(())
+    } else {
+        Err(format!("expected histogram {exp:?}, got {cur:?}"))
+    }
 }
 
 fn compare_matrix(want: &[Expected1], got: &[Series]) -> Result<(), String> {
@@ -706,13 +812,24 @@ fn compare_matrix(want: &[Expected1], got: &[Series]) -> Result<(), String> {
         let Some(g) = by_labels.get(&w.labels) else {
             return Err(format!("expected metric {:?} not in the result", w.labels));
         };
-        if w.points.len() != g.floats.len() {
+        if w.points.len() != g.floats.len() || w.histograms.len() != g.histograms.len() {
             return Err(format!(
-                "{:?}: expected {} point(s), got {}",
+                "{:?}: expected {} float and {} histogram point(s), got {} and {}",
                 w.labels,
                 w.points.len(),
-                g.floats.len()
+                w.histograms.len(),
+                g.floats.len(),
+                g.histograms.len()
             ));
+        }
+        for (wp, gp) in w.histograms.iter().zip(&g.histograms) {
+            if wp.t != gp.t {
+                return Err(format!(
+                    "{:?}: expected a histogram at {}, got one at {}",
+                    w.labels, wp.t, gp.t
+                ));
+            }
+            compare_histogram(wp, &gp.h).map_err(|e| format!("{:?} @{}: {e}", w.labels, wp.t))?;
         }
         for (wp, gp) in w.points.iter().zip(&g.floats) {
             if wp.t != gp.t {
@@ -755,7 +872,10 @@ fn unexpected_labels<'a>(
 fn describe(result: &QueryResult) -> String {
     match result {
         QueryResult::Matrix(series) => {
-            let samples: usize = series.iter().map(|s| s.floats.len()).sum();
+            let samples: usize = series
+                .iter()
+                .map(|s| s.floats.len() + s.histograms.len())
+                .sum();
             format!("a matrix of {} series, {samples} samples", series.len())
         }
         QueryResult::Vector(samples) => format!("a vector of {} samples", samples.len()),
@@ -849,7 +969,7 @@ mod tests {
                         .map(|(k, v)| (k.to_string(), v.to_string()))
                         .collect(),
                     floats: points.iter().map(|&(t, v)| Point { t, v }).collect(),
-                    histograms: 0,
+                    histograms: Vec::new(),
                 })
                 .collect(),
         )
@@ -942,7 +1062,7 @@ mod tests {
             labels: [("job".to_string(), "a".to_string())].into(),
             t: 0,
             v,
-            histogram: false,
+            histogram: None,
         };
         let vector = Typed(QueryResult::Vector(vec![sample(7.0)]));
         assert_eq!(
@@ -1179,9 +1299,12 @@ mod tests {
     }
 
     /// The name check this replaces skipped `some_metric_with_stale_marker`
-    /// for a histogram named `some_metric`, and any nameless selector.
+    /// for a histogram named `some_metric`, and any nameless selector. The
+    /// series that does not load is a descriptor the grammar refuses;
+    /// every descriptor of the vendored corpus loads.
     #[test]
     fn only_an_eval_selecting_a_series_that_did_not_load_is_skipped() {
+        const HIST: &str = "{{no_such_key:1}}";
         let engine = Stub(|_: &str| Ok(matrix(&[])));
         let script = format!(
             "load 1m\n  h{{job=\"y\"}} {HIST}\n  h_total{{job=\"x\"}} 1\n\n\

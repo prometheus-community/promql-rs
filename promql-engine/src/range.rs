@@ -2,13 +2,17 @@
 //! `instantValue` and the `*_over_time` functions in Prometheus's
 //! `promql/functions.go` and `engine.go` at 83962c35. [`crate::series_eval`]
 //! drives one ID's chunks; `advance_range` answers its block-local steps.
-//! Floats only; native histograms are a later slice.
+//! The folds here are over floats; a window holding a native histogram is
+//! [`crate::mixed`]'s.
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::Arc;
 
-use crate::buffer::{EvalContext, WindowBuffer, WorkBudget};
+use crate::buffer::{Emit, EvalContext, FloatSink, HistogramSink, WindowBuffer, WorkBudget};
+use crate::histogram::Value;
 use crate::math;
+use crate::mixed::{self, Histograms};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Hash)]
 pub enum Func {
@@ -139,6 +143,7 @@ impl fmt::Debug for RangeOp {
 
 /// One step's window: the samples with `range_start < t <= range_end`,
 /// StaleNaN already removed, plus the bounds the extrapolation needs.
+#[derive(Clone, Copy)]
 pub struct Window<'a> {
     pub ts: &'a [i64],
     pub vs: &'a [f64],
@@ -516,14 +521,21 @@ impl Sweep {
 /// already be free of StaleNaN entries, and a `Sweep`, if any, must have
 /// seen only this series. `emit` receives `(step_timestamp, value)` in
 /// step order, each step at most once.
+///
+/// `hs` is empty for a series of floats and otherwise parallel to `vs`,
+/// holding each histogram sample. A window with one in it is folded by
+/// [`mixed::evaluate`]; the buffer drops its `Sweep` at the first
+/// histogram, so only the refolding loop below ever sees one.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn advance_range(
     it: &mut WindowBuffer,
     context: &EvalContext,
     ts: &[i64],
     vs: &[f64],
+    hs: &Histograms,
     func: Func,
     budget: &mut WorkBudget,
-    mut emit: impl FnMut(i64, f64),
+    emit: &mut Emit<impl FloatSink, impl HistogramSink>,
 ) {
     let WindowBuffer {
         sweep,
@@ -554,6 +566,15 @@ pub(crate) fn advance_range(
         range_end,
         range_ms: p.window_ms,
     };
+    // The float fold. A series that has shown a histogram asks `mixed`
+    // instead, window by window.
+    let value = |l: usize, h: usize, range_end: i64| -> Option<Value> {
+        let w = window(l, h, range_end);
+        match hs.is_empty() {
+            true => evaluate(func, &w).map(Value::Float),
+            false => mixed::evaluate(func, &w, &hs[l..h]),
+        }
+    };
 
     // `@` pins the window: it is evaluated once, when it is ready, and
     // repeated across the whole grid.
@@ -565,16 +586,20 @@ pub(crate) fn advance_range(
         if budget.exhausted() {
             return;
         }
-        let value = *pinned_value.get_or_insert_with(|| {
+        let pinned = pinned_value.get_or_insert_with(|| {
             let l = ts.partition_point(|t| *t <= range_end - p.window_ms);
             let h = ts.partition_point(|t| *t <= range_end);
-            let value = evaluate(func, &window(l, h, range_end));
+            let pinned = value(l, h, range_end);
             budget.account_kernel(func.value_work(h - l));
-            value
+            pinned
         });
         while *next_step < steps && budget.take() {
-            if let Some(v) = value {
-                emit(context.step_at(*next_step), v);
+            let step = context.step_at(*next_step);
+            // Matched by reference: repeating a float clones nothing.
+            match pinned {
+                Some(Value::Float(v)) => emit.float(step, *v),
+                Some(Value::Histogram(h)) => emit.histogram(step, Arc::clone(h)),
+                None => {}
             }
             *next_step += 1;
         }
@@ -614,8 +639,14 @@ pub(crate) fn advance_range(
                 if !budget.take() {
                     break;
                 }
-                if let Some(v) = evaluate(func, &window(l, h, range_end)) {
-                    emit(step, v);
+                // A float answer goes out as a float: wrapped in a `Value`
+                // and matched again it cost the refolding functions 10%.
+                if hs.is_empty() {
+                    if let Some(v) = evaluate(func, &window(l, h, range_end)) {
+                        emit.float(step, v);
+                    }
+                } else if let Some(v) = value(l, h, range_end) {
+                    emit.value(step, v);
                 }
                 budget.account_kernel(func.value_work(h - l));
                 next += 1;
@@ -651,7 +682,7 @@ pub(crate) fn advance_range(
                     break;
                 }
                 if let Some(v) = sweep.value(&window(l, h, range_end), base + l) {
-                    emit(step, v);
+                    emit.float(step, v);
                 }
                 budget.account_kernel(sweep.value_work());
                 next += 1;
@@ -668,14 +699,19 @@ pub(crate) fn advance_range(
 /// function, but folds with the step timestamp as the regression
 /// intercept (`enh.Ts`). Under `@` the samples stay pinned while each
 /// step still gets its own intercept, so the value is not replayed.
+///
+/// `funcPredictLinear` reads the floats of a range and ignores its
+/// histograms, so a window holding one is fitted over what remains.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn advance_predict_linear(
     it: &mut WindowBuffer,
     context: &EvalContext,
     ts: &[i64],
     vs: &[f64],
+    hs: &Histograms,
     seconds: f64,
     budget: &mut WorkBudget,
-    mut emit: impl FnMut(i64, f64),
+    emit: &mut Emit<impl FloatSink, impl HistogramSink>,
 ) {
     let WindowBuffer {
         base,
@@ -700,6 +736,22 @@ pub(crate) fn advance_predict_linear(
         range_end,
         range_ms: p.window_ms,
     };
+    let predict = |l: usize, h: usize, range_end: i64, step: i64| -> Option<f64> {
+        let w = window(l, h, range_end);
+        if hs.is_empty() {
+            return predict_linear(&w, seconds, step);
+        }
+        let (ts, vs) = mixed::floats_of(&w, &hs[l..h]);
+        predict_linear(
+            &Window {
+                ts: &ts,
+                vs: &vs,
+                ..w
+            },
+            seconds,
+            step,
+        )
+    };
     if let Some(at) = p.at_ms {
         let range_end = at - p.offset_ms;
         if range_end > ready {
@@ -707,7 +759,6 @@ pub(crate) fn advance_predict_linear(
         }
         let l = ts.partition_point(|t| *t <= range_end - p.window_ms);
         let h = ts.partition_point(|t| *t <= range_end);
-        let w = window(l, h, range_end);
         while *next_step < steps {
             if budget.exhausted() {
                 return;
@@ -716,8 +767,8 @@ pub(crate) fn advance_predict_linear(
             if !budget.take() {
                 return;
             }
-            if let Some(value) = predict_linear(&w, seconds, step) {
-                emit(step, value);
+            if let Some(value) = predict(l, h, range_end, step) {
+                emit.float(step, value);
             }
             budget.account_kernel(h - l);
             *next_step += 1;
@@ -754,8 +805,8 @@ pub(crate) fn advance_predict_linear(
         }
         // Intercept is the evaluation step, not `range_end`: with an
         // offset those differ, and upstream still passes `enh.Ts`.
-        if let Some(value) = predict_linear(&window(l, h, range_end), seconds, step) {
-            emit(step, value);
+        if let Some(value) = predict(l, h, range_end, step) {
+            emit.float(step, value);
         }
         budget.account_kernel(h - l);
         next += 1;
@@ -1347,9 +1398,10 @@ mod tests {
                 &context,
                 &bts,
                 &bvs,
+                &[],
                 func,
                 &mut WorkBudget::new(usize::MAX),
-                |t, v| out.push((t, v)),
+                &mut Emit::floats(|t, v| out.push((t, v))),
             );
             let dead = it.lo - it.base;
             it.ts.drain(..dead);
@@ -1363,9 +1415,10 @@ mod tests {
             &context,
             &bts,
             &bvs,
+            &[],
             func,
             &mut WorkBudget::new(usize::MAX),
-            |t, v| out.push((t, v)),
+            &mut Emit::floats(|t, v| out.push((t, v))),
         );
         out
     }

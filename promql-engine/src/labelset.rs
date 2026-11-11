@@ -22,6 +22,7 @@
 //! of all timestamps. Arrow output retains separate buffer-sharing rows;
 //! matrix consumers must merge interleaved spans within a label run.
 
+use std::borrow::Cow;
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::sync::Arc;
@@ -30,6 +31,7 @@ use datafusion::arrow::array::{AsArray, RecordBatch, StringViewArray};
 use datafusion::arrow::datatypes::TimestampMillisecondType;
 
 use crate::error::EngineError;
+use crate::histogram::HISTOGRAMS;
 use crate::series::{self, BLOCK_START, FLOATS, LABELS, TIMESTAMP};
 
 /// Prometheus's own sentence, word for word: the conformance suite
@@ -74,6 +76,10 @@ struct OrderedRows<'a> {
     columns: Vec<Vec<&'a StringViewArray>>,
     timestamps: Vec<&'a [i64]>,
     offsets: Vec<&'a [i32]>,
+    /// Offsets and timestamps of each batch's histograms, where it has
+    /// the column. A series is at a timestamp with a sample of either
+    /// type, so two rows collide on a float against a histogram too.
+    histograms: Vec<Option<(&'a [i32], &'a [i64])>>,
     order: Vec<(usize, usize)>,
     already_sorted: bool,
 }
@@ -85,6 +91,7 @@ impl<'a> OrderedRows<'a> {
         let mut starts = Vec::with_capacity(batches.len());
         let mut timestamps = Vec::with_capacity(batches.len());
         let mut offsets = Vec::with_capacity(batches.len());
+        let mut histograms = Vec::with_capacity(batches.len());
         for batch in batches {
             // `compare` pairs fields by position across batches.
             if batch.schema_ref() != batches[0].schema_ref() {
@@ -111,6 +118,16 @@ impl<'a> OrderedRows<'a> {
                 .expect("validated")
                 .as_list::<i32>();
             offsets.push(samples.value_offsets());
+            histograms.push(batch.column_by_name(HISTOGRAMS).map(|column| {
+                let list = column.as_list::<i32>();
+                let timestamps = list
+                    .values()
+                    .as_struct()
+                    .column(0)
+                    .as_primitive::<TimestampMillisecondType>()
+                    .values();
+                (list.value_offsets(), timestamps.as_ref())
+            }));
             timestamps.push(
                 samples
                     .values()
@@ -139,14 +156,29 @@ impl<'a> OrderedRows<'a> {
             columns,
             timestamps,
             offsets,
+            histograms,
             order,
             already_sorted,
         })
     }
 
-    fn timestamps_at(&self, (batch, row): (usize, usize)) -> &'a [i64] {
+    /// The row's sample timestamps, ascending. Borrowed unless the row
+    /// holds both floats and histograms, which interleave.
+    fn timestamps_at(&self, (batch, row): (usize, usize)) -> Cow<'a, [i64]> {
         let offsets = self.offsets[batch];
-        &self.timestamps[batch][offsets[row] as usize..offsets[row + 1] as usize]
+        let floats = &self.timestamps[batch][offsets[row] as usize..offsets[row + 1] as usize];
+        let histograms = self.histograms[batch].map_or(&[][..], |(offsets, timestamps)| {
+            &timestamps[offsets[row] as usize..offsets[row + 1] as usize]
+        });
+        match (floats.is_empty(), histograms.is_empty()) {
+            (_, true) => Cow::Borrowed(floats),
+            (true, false) => Cow::Borrowed(histograms),
+            (false, false) => {
+                let mut merged = [floats, histograms].concat();
+                merged.sort_unstable();
+                Cow::Owned(merged)
+            }
+        }
     }
 
     fn reject_same_labelset(&self) -> Result<(), EngineError> {
@@ -172,7 +204,7 @@ impl<'a> OrderedRows<'a> {
                 // Ordinary block-local results need only first/last
                 // timestamp bounds, not a copy or a sample walk.
                 if !disjoint {
-                    let mut spans: Vec<&[i64]> = self.order[from..to]
+                    let mut spans: Vec<Cow<[i64]>> = self.order[from..to]
                         .iter()
                         .map(|&at| self.timestamps_at(at))
                         .filter(|s| !s.is_empty())
@@ -228,7 +260,7 @@ impl<'a> OrderedRows<'a> {
 /// Only connected overlapping bounds reach this walk. Evaluated timestamps
 /// ascend within each row, so one borrowed head per span detects exact
 /// duplicates without an owned timestamp vector for the whole label set.
-fn reject_overlapping_timestamps(spans: &[&[i64]]) -> Result<(), EngineError> {
+fn reject_overlapping_timestamps(spans: &[Cow<[i64]>]) -> Result<(), EngineError> {
     let mut heads: BinaryHeap<_> = spans
         .iter()
         .enumerate()

@@ -2,7 +2,11 @@
 //! 83962c35. [`crate::series_eval`] is the sole raw-source driver; this module
 //! owns only the per-series numerical walk and its timestamp/staleness rules.
 
-use crate::buffer::{EvalContext, WindowBuffer, WorkBudget};
+use std::sync::Arc;
+
+use crate::buffer::{Emit, EvalContext, FloatSink, HistogramSink, WindowBuffer, WorkBudget};
+use crate::histogram::Value;
+use crate::mixed::Histograms;
 
 /// Prometheus's staleness marker: a NaN with this exact payload. It must
 /// be compared by bits, since every NaN compares unequal to everything.
@@ -42,15 +46,21 @@ impl Pick {
 /// Stale markers stay in the buffer: one that is the latest sample hides
 /// the series, which dropping it would undo.
 ///
-/// `ts`/`vs` are the series' samples from ordinal `it.base` on.
+/// `ts`/`vs` are the series' samples from ordinal `it.base` on. `hs` is
+/// empty for a series of floats, and otherwise holds the histogram of
+/// each sample that is one; such a sample's `vs` entry is its sum, so the
+/// staleness check reads the same bits for both types. A picked histogram
+/// is the answer itself, or its time under [`Pick::Timestamp`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn advance_selector(
     it: &mut WindowBuffer,
     context: &EvalContext,
     ts: &[i64],
     vs: &[f64],
+    hs: &Histograms,
     pick: Pick,
     budget: &mut WorkBudget,
-    mut emit: impl FnMut(i64, f64),
+    emit: &mut Emit<impl FloatSink, impl HistogramSink>,
 ) {
     let Some(last_t) = it.last_t else {
         return;
@@ -67,14 +77,23 @@ pub(crate) fn advance_selector(
         if budget.exhausted() {
             return;
         }
-        let value = *it.pinned_value.get_or_insert_with(|| {
-            ts.last()
-                .zip(vs.last())
-                .and_then(|(&t, &v)| (!is_stale(v)).then(|| pick.of(t, v)))
+        let value = it.pinned_value.get_or_insert_with(|| {
+            let (&t, &v) = ts.last().zip(vs.last())?;
+            if is_stale(v) {
+                return None;
+            }
+            Some(match hs.last() {
+                Some(Some(h)) if pick == Pick::Value => Value::Histogram(Arc::clone(h)),
+                _ => Value::Float(pick.of(t, v)),
+            })
         });
         while it.next_step < steps && budget.take() {
-            if let Some(v) = value {
-                emit(context.step_at(it.next_step), v);
+            let step = context.step_at(it.next_step);
+            // Matched by reference: repeating a float clones nothing.
+            match value {
+                Some(Value::Float(v)) => emit.float(step, *v),
+                Some(Value::Histogram(h)) => emit.histogram(step, Arc::clone(h)),
+                None => {}
             }
             it.next_step += 1;
         }
@@ -105,7 +124,13 @@ pub(crate) fn advance_selector(
         if h > 0 {
             let (t, v) = (ts[h - 1], vs[h - 1]);
             if t > ref_time - p.window_ms && !is_stale(v) {
-                emit(step, pick.of(t, v));
+                // `hs` is empty for a series of floats.
+                match hs.get(h - 1) {
+                    Some(Some(histogram)) if pick == Pick::Value => {
+                        emit.histogram(step, Arc::clone(histogram))
+                    }
+                    _ => emit.float(step, pick.of(t, v)),
+                }
             }
         }
         next += 1;

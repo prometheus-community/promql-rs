@@ -63,7 +63,9 @@ or pass through `SeriesEval`; `series::coalesce` joins its evaluated result rows
 
 Evaluation retains raw labels, samples, both block edges and ID even when a
 consumer projects labels away. It binds fields by name and emits canonical
-`labels, samples, block_start, block_end`, retaining metadata without raw IDs
+`labels, floats, block_start, block_end`, then `histograms` where the source
+has them and the kernel can answer with one
+([native histograms](#native-histograms)), retaining metadata without raw IDs
 or uniqueness constraints. Predicates and limits remain above evaluation: a
 raw chunk is not a result row. Direct column projections can prune unused
 evaluation outputs, including labels for floats-only output. The evaluator
@@ -174,10 +176,90 @@ because reach-back repeats samples intentionally. Prometheus's block merge
 instead unions samples and drops only duplicates (`storage/merge.go:653-656`);
 they agree on duplicates, not interleaved nonduplicate timestamps.
 
+## Native histograms
+
+A series' samples are floats, native histograms, or both over time. The store
+hands the two types over as sibling list columns
+([`series-source.md`](series-source.md#sample-types)), and that split holds
+between every pair of operators: `floats` is always there, `histograms` only
+where the expression below can answer with one. The planner tracks which, so a
+query over floats alone has no `histograms` column anywhere, reads no histogram
+code, and plans to the plan it had before the column existed. The plan pins
+did not move.
+
+Upstream is the same two-sided shape. `promql.Series` keeps `Floats` and
+`Histograms` apart, and every function of `promql/functions.go` opens by
+asking which it was given. The Thanos engine's `StepVector` carries
+`Samples` and `Histograms` side by side for the same reason
+(`execution/model/vector.go`), and merges them where this engine does: inside
+the window buffer, and nowhere else.
+
+**One fold, one series.** Evaluation is where the two lists become one series
+again. A raw row's floats and histograms are pushed into the fold as
+alternating chronological runs, each the longest prefix of one list that
+precedes the other's next sample; a row of one type is one run, which is the
+float path unchanged. The window buffer holds a histogram's `sum` where a
+float's value would be, so staleness is the same bits for both and the
+readiness, trimming and overlap logic, which read timestamps, did not change.
+Beside it is one more vector, the histogram of each buffered sample, empty
+until the series shows one. A float series in a selection that also has
+histograms asks once per walk whether that vector is empty, and then runs the
+loop a float-only selection runs.
+
+A histogram is copied out of its batch when it enters the buffer, never before:
+dead prefixes and future tails are skipped by timestamp, and a selector passes
+over every histogram that a later sample of the same run supersedes before any
+step's lookup, since such a sample cannot answer. With a 15 s scrape under a
+5 m step that is nineteen of twenty.
+
+The sweeps (`rate`, `increase`, the extrema) fold floats. The first histogram
+of a series drops its sweep, and windows refold from the same cursors, so a
+histogram `rate` costs the histograms in its window at every step rather than
+those entering and leaving it. Only a window that holds a histogram goes to `mixed::evaluate`, which ports what each
+function does once `samples.Histograms` is not empty. That is one of three
+things: compute on the histograms (`rate`, `sum_over_time`, `last_over_time`,
+`changes`, …), compute on the floats and pass over the histograms
+(`max_over_time`, `stddev_over_time`, `deriv`, `predict_linear`), or answer
+nothing for a window holding both (`rate`, `sum_over_time`, `avg_over_time`).
+
+**Above evaluation.** Each operator reads the columns it has semantics for:
+
+| operator | histograms |
+|---|---|
+| `abs` and the other `simpleFloatFunc`s, `clamp*`, `round`, the date functions, `sort`, `sort_desc`, `scalar`, `min`, `max`, `stddev`, `stdvar` | Passed over: the operator reads `floats`, and its output has no `histograms` column. |
+| `histogram_count`, `_sum`, `_avg`, `_stddev`, `_stdvar` | One float per histogram, row by row. Count, sum and average read two scalars and no bucket. |
+| `histogram_quantile`, `histogram_fraction` | Native histograms row by row. Where the vector can hold a classic bucket, a float with an `le`, it is grouped by every other label instead, and a label set that is both at one step answers nothing. |
+| `timestamp`, `count`, `group`, `absent` | A histogram is one more sample: its float is merged into `floats` first. |
+| unary minus, `* scalar`, `/ scalar`, `</`, `>/` | One histogram per histogram. |
+| `sum`, `avg` | A Kahan sum of histograms per group and step beside the float sum, and nothing for either where a group holds both types at a step. `avg` switches to a running mean where upstream does, when the sum would overflow. |
+| vector-to-vector binary operators | Paired by `binary::histograms`, the same grouping as for floats with upstream's `vectorElemBinop` in full. |
+| a range selector as an instant query's result | Both lists, filtered by the same window. |
+
+The histogram aggregation and pairing are ordinary accumulators over maps, not
+lanes over the step grid: a histogram is buckets behind a pointer either way.
+They are planned only where an operand has the column, and that is also what a
+float series pays for sharing a selection with histograms: `sum by` over such a
+selection runs the histogram sum and the which-steps-held-a-histogram mark
+beside the float sum, over lists that are empty.
+
+**Not ported.**
+
+- *Annotations.* Upstream attaches a warning or an info to most of the cases
+  above that answer nothing or pass a sample over, and to arithmetic that
+  reconciles custom bucket bounds or meets conflicting counter reset hints.
+  The engine has no annotation channel for any query, so the values are
+  upstream's and the annotations are absent. `promql-histogram` already
+  returns the findings (`ArithmeticOutcome`).
+- *Operators the engine lacks for floats too:* `topk`, `bottomk`, `quantile`,
+  `count_values`, `quantile_over_time`, subqueries, `label_replace`,
+  `label_join`, and `scalar()` as an operand. Histograms do not change that.
+- *Two native histograms that differ only in `le`* under `histogram_quantile`
+  over a vector that also holds classic buckets: the second is passed over.
+
 ## Memory and output ownership
 
-Numerical iteration emits `(timestamp, value)` pairs; the executor owns Arrow
-row boundaries. The current fold's empty/singleton results stay inline and
+Numerical iteration emits `(timestamp, value)` pairs, a value being a float or
+a histogram; the executor owns Arrow row boundaries. The current fold's empty/singleton results stay inline and
 larger results use compact timestamp/value vectors without list offsets.
 Ordinary output builders bulk-append them and finish one row per identity per
 block. There is no per-fold Arrow result array.
@@ -211,6 +293,14 @@ fold. Output builds ordinary Arrow string arrays. Samples-only output skips
 label capture. This avoids pinning unrelated labels but costs string
 allocations/copies; it is not a label-demand API for the store, which retains
 full raw identity.
+
+A histogram in the window is charged its spans and buckets as it enters and
+credited as it leaves, so history is **O((H + 256) × buckets)** for a
+histogram series: the bound is the same window, weighed by what its samples
+hold. Evaluated histograms are owned by the fold until the output builder has
+copied them, and the builder is charged for every leaf, buckets included. A
+selector repeats one sample over many steps as clones of one `Arc`; each is
+charged, an overestimate rather than an omission.
 
 A DataFusion reservation charges owned ID/label capacities, numerical state,
 compact results and output construction. Raw input and canonical output use
@@ -319,6 +409,5 @@ not a numerical expectation change.
 
 ## Non-goals
 
-Native histograms remain unsupported: kernels branch on f64. Series crossing
-partitions would require a distributed merge. This work adds neither
+Series crossing partitions would require a distributed merge. This work adds neither
 aggregation fusion, cardinality tables nor runtime source validators.

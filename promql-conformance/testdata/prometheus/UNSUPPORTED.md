@@ -8,9 +8,9 @@ PROMQL_PROMQLTEST_BLESS=1 cargo test -p promql-conformance --test promqltest
 
 Nothing here gates CI. This file is the roadmap, and the core line below is the target: it reads 100% when the engine passes every eval that is neither native histograms, subquery nor experimental syntax. An eval is flag-gated if a stock parser refuses its query at a feature gate, or by its file where the grammar has no productions to reach the gate with (`docs/feature-flags.md`, Conformance). An eval is native-histogram if an expected row is a native histogram sample or a selector in its query matches, by its label matchers, a series the active load blocks load with native histogram samples (`{{…}}`, or derived by `load_with_nhcb`). Each eval is in exactly one category, first match wins: flag-gated, native histograms, subquery, core. The category comes from the eval, never from whether it passes, so the denominators hold still.
 
-**Core: 700 of 871 evals pass (80.4%).**
+**Core: 778 of 871 evals pass (89.3%).**
 
-- Native histograms: 2 of 805 pass.
+- Native histograms: 754 of 805 pass.
 - Subqueries: 0 of 65 pass.
 - Experimental (flag-gated): 65 of 357 pass, run with every gate open and never in `SUPPORTED.toml`; `docs/feature-flags.md` lists the flags.
   - `promql-experimental-functions`: 13 of 174
@@ -18,15 +18,15 @@ Nothing here gates CI. This file is the roadmap, and the core line below is the 
   - `promql-extended-range-selectors`: 8 of 88
   - `promql-binop-fill-modifiers`: 44 of 44
 
-All but the flag-gated: **702 of 1741 evals pass** (40.3%).
+All but the flag-gated: **1532 of 1741 evals pass** (88.0%).
 
 ## Core evals
 
 | | evals |
 |---|---:|
 | total | 871 |
-| passing | 700 |
-| not passing | 171 |
+| passing | 778 |
+| not passing | 93 |
 
 The not-passing ones are the missing features and the unattributed failures below. Fixing those is what takes the core to 100%.
 
@@ -36,16 +36,14 @@ Each failing core eval is filed under a missing feature the engine names, or lef
 
 | failing evals | reason |
 |---:|---|
-| 151 | missing features |
+| 73 | missing features |
 | 20 | unattributed |
-| 171 | **total** |
+| 93 | **total** |
 
 ## Missing features
 
 | evals blocked | feature |
 |---:|---|
-| 49 | the histogram_quantile function |
-| 29 | the histogram_fraction function |
 | 21 | the label_replace function |
 | 19 | the topk aggregation |
 | 12 | the label_join function |
@@ -90,24 +88,24 @@ Core evals the engine does not name a missing feature for: wrong results, panics
 
 | file | evals | native histograms | subquery | flag-gated | passing | passing core | |
 |---|---:|---:|---:|---:|---:|---:|---|
-| operators | 213 | 72 | 0 | 0 | 143 (67%) | 141 of 141 (100%) | core green |
+| operators | 213 | 72 | 0 | 0 | 213 (100%) | 141 of 141 (100%) | core green |
+| histograms | 167 | 84 | 0 | 18 | 165 (99%) | 83 of 83 (100%) | core green |
 | selectors | 31 | 0 | 0 | 0 | 31 (100%) | 31 of 31 (100%) | core green |
 | extended_vectors | 30 | 0 | 0 | 88 | 30 (100%) | 30 of 30 (100%) | core green |
 | literals | 25 | 0 | 0 | 0 | 25 (100%) | 25 of 25 (100%) | core green |
 | trig_functions | 19 | 0 | 0 | 0 | 19 (100%) | 19 of 19 (100%) | core green |
 | staleness | 17 | 0 | 0 | 0 | 17 (100%) | 17 of 17 (100%) | core green |
-| range_queries | 16 | 2 | 0 | 2 | 14 (88%) | 14 of 14 (100%) | core green |
+| range_queries | 16 | 2 | 0 | 2 | 16 (100%) | 14 of 14 (100%) | core green |
 | duration_expression | 8 | 0 | 0 | 51 | 8 (100%) | 8 of 8 (100%) | core green |
+| native_histograms | 514 | 511 | 0 | 7 | 492 (96%) | 3 of 3 (100%) | core green |
 | collision | 2 | 0 | 0 | 0 | 2 (100%) | 2 of 2 (100%) | core green |
 | subquery | 34 | 2 | 30 | 0 | 2 (6%) | 2 of 2 (100%) | core green |
 | fill-modifier | 1 | 0 | 0 | 44 | 1 (100%) | 1 of 1 (100%) | core green |
 | at_modifier | 69 | 0 | 29 | 2 | 35 (51%) | 35 of 40 (88%) |  |
-| functions | 350 | 99 | 5 | 63 | 213 (61%) | 213 of 246 (87%) |  |
-| aggregators | 158 | 35 | 0 | 2 | 93 (59%) | 93 of 123 (76%) |  |
+| functions | 350 | 99 | 5 | 63 | 307 (88%) | 213 of 246 (87%) |  |
+| aggregators | 158 | 35 | 0 | 2 | 108 (68%) | 93 of 123 (76%) |  |
 | type_and_unit | 58 | 0 | 0 | 0 | 43 (74%) | 43 of 58 (74%) |  |
 | name_label_dropping | 29 | 0 | 1 | 1 | 18 (62%) | 18 of 28 (64%) |  |
-| histograms | 167 | 84 | 0 | 18 | 8 (5%) | 8 of 83 (10%) |  |
-| native_histograms | 514 | 511 | 0 | 7 | 0 (0%) | 0 of 3 (0%) |  |
 | info | 0 | 0 | 0 | 42 | 0 (0%) | 0 of 0 (0%) | no core evals |
 | limit | 0 | 0 | 0 | 37 | 0 (0%) | 0 of 0 (0%) | no core evals |
 

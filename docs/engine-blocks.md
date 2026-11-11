@@ -27,7 +27,7 @@ block_end    Timestamp(Millisecond)
 series_id    UInt64 | FixedSizeBinary(n>0)   mandatory at the source
 ```
 
-One series is one Arrow row: a label set and one chunk of its samples, in one block the store cut its answer into. `block_start` and `block_end` name that block on every series. The fixture is one block, so the two columns are the same on every series and stay out of view until section 4. `x` arrives twice and `y` once, in two batches. Batch A holds `x`'s first chunk. Batch B holds `x`'s second chunk, then the one chunk of `y`, which closes `x`. For illustration `x` has ID 41 and `y` ID 7: the order is neither numeric ID order nor a required label order. The counter resets inside B.0, from 16 to 3. Evaluation removes `series_id`, leaving the canonical four-column result.
+One series is one Arrow row: a label set and one chunk of its samples, in one block the store cut its answer into. The fixture is floats; a store with native histograms hands them over in a sibling `histograms` list, which the same walk folds into the same windows ([`engine.md`](engine.md#native-histograms)). `block_start` and `block_end` name that block on every series. The fixture is one block, so the two columns are the same on every series and stay out of view until section 4. `x` arrives twice and `y` once, in two batches. Batch A holds `x`'s first chunk. Batch B holds `x`'s second chunk, then the one chunk of `y`, which closes `x`. For illustration `x` has ID 41 and `y` ID 7: the order is neither numeric ID order nor a required label order. The counter resets inside B.0, from 16 to 3. Evaluation removes `series_id`, leaving the canonical four-column result.
 
 ```
 batch A

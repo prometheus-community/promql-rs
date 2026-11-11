@@ -93,13 +93,15 @@ Extra source columns are allowed and dropped during evaluation.
 | Column | Arrow type | Meaning |
 |---|---|---|
 | `labels` | `Struct<{name}: Utf8View, …>` | Sorted, non-null fields for the selection's label names. An absent label has value `""`. |
-| `floats` | `List<Struct<timestamp: Timestamp(ms), value: Float64>>` | Float samples in a chunk. |
+| `floats` | `List<Struct<timestamp: Timestamp(ms), value: Float64>>` | Float samples in a chunk. Optional where the selection has `histograms`. |
+| `histograms` | `List<Struct<timestamp: Timestamp(ms), …>>` | Native histogram samples in a chunk; see `histogram::histograms_type`. Optional: a store without native histograms omits the column. |
 | `block_start` | `Timestamp(ms)` | Inclusive start of the block's window-end range. |
 | `block_end` | `Timestamp(ms)` | Exclusive end of the block's window-end range. |
 | `series_id` | `UInt64` or `FixedSizeBinary(n > 0)` | Opaque ID corresponding one-to-one with the full label set. |
 
-One row is one chunk of one series in one block. Every row matches every
-selector matcher. Within a block, chunks of an ID are consecutive and ordered
+One row is one chunk of one series in one block. A selection supplies `floats`,
+`histograms`, or both, and a timestamp of a series is in one of them. Every row
+matches every selector matcher. Within a block, chunks of an ID are consecutive and ordered
 by first sample timestamp. Blocks arrive in time order, and an ID never crosses
 a partition. Order between IDs is unspecified. The engine trusts these source
 requirements. It does not audit each source row.
@@ -120,14 +122,17 @@ The `series` module defines the raw and evaluated Arrow shapes:
 
 | Item | Contract |
 |---|---|
-| `series::schema`, `labels_type`, `samples_type`, `Block`, `SERIES_ID` | Schema definitions, block bounds, and the raw ID column name. |
+| `series::schema`, `schema_with_histograms`, `labels_type`, `floats_type`, `Block`, `SERIES_ID` | Schema definitions, block bounds, and the raw ID column name. |
+| `histogram::histograms_type`, `histogram_fields`, `encode_row`, `decode_row`, `HISTOGRAMS` | The histograms column, and conversion between one row of it and `(timestamp, FloatHistogram)` pairs. |
 | `series::encode`, `series::decode` | Conversion between Arrow batches and decoded `Series` rows. `encode` rejects duplicate label sets. |
 | `series::coalesce` | One decoded `Series` per label set across result rows. |
 | `series::clip`, `drop_empty`, `drop_unused_labels`, `validate` | Sample clipping, empty-row removal, label-schema reduction, and schema checks. |
-| `Series` | Decoded row with `labels()`, `label(name)`, `timestamps()`, and `values()`. |
+| `Series` | Decoded row with `labels()`, `label(name)`, `timestamps()` and `values()` for its floats, and `histograms()`. |
 
-Evaluated results keep `labels`, `floats`, `block_start`, and `block_end`.
-`series_id` does not appear in results.
+Evaluated results keep `labels`, `floats`, `block_start`, and `block_end`, then
+`histograms` where the query's expression can answer with a native histogram.
+A query over floats alone has no such column. `series_id` does not appear in
+results.
 
 ## Implementation references
 

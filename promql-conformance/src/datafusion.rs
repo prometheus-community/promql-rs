@@ -13,8 +13,11 @@ use std::num::{NonZeroU64, NonZeroUsize};
 
 use promql_engine::series::{coalesce, decode};
 use promql_engine::{InstantResult, MemorySeriesSource, RangeQuery, SeriesIdEncoding};
+use promql_histogram::{CounterResetHint, FloatHistogram};
 
-use crate::result::{Engine, EngineError, LoadedSeries, Point, QueryResult, Sample, Series};
+use crate::result::{
+    Engine, EngineError, HPoint, LoadedSeries, Point, QueryResult, Sample, Series,
+};
 
 pub struct DataFusionEngine {
     inner: promql_engine::Engine,
@@ -146,34 +149,43 @@ fn engine_options() -> promql_engine::EngineOptions {
 /// them back: the store's own accessor is test-only *within the engine*
 /// and invisible from here.
 fn merge(load: &[LoadedSeries<'_>]) -> Vec<promql_engine::Series> {
-    let mut merged: BTreeMap<Vec<(&str, &str)>, BTreeMap<i64, f64>> = BTreeMap::new();
+    let mut merged: BTreeMap<Vec<(String, String)>, BTreeMap<i64, Value>> = BTreeMap::new();
 
     for block in load {
         let interval_ms = (block.interval_secs * 1000.0).round() as i64;
+        let mut classic: BTreeMap<Vec<(String, String)>, BTreeMap<i64, Classic>> = BTreeMap::new();
         for sd in block.series {
-            // The parser keeps labels as written, possibly with a name
-            // repeated; sorted by name, the last value wins. `""` values
-            // drop out because `Series::new` drops them: keeping them
-            // here would key `x{env=""}` apart from `x` and then have the
-            // two collide once built, which the store rejects.
-            let mut pairs: Vec<(&str, &str)> = sd
-                .labels
-                .iter()
-                .map(|l| (l.name.as_str(), l.value.as_str()))
-                .filter(|(_, v)| !v.is_empty())
-                .collect();
-            pairs.sort_by(|a, b| a.0.cmp(b.0));
-            let mut labels: Vec<(&str, &str)> = Vec::with_capacity(pairs.len());
-            for p in pairs {
-                match labels.last_mut() {
-                    Some(last) if last.0 == p.0 => last.1 = p.1,
-                    _ => labels.push(p),
-                }
-            }
-
+            let labels = label_set(sd);
+            let part = block.with_nhcb.then(|| classic_part(&labels)).flatten();
             let samples = merged.entry(labels).or_default();
             for (i, v) in sd.values.iter().enumerate().filter(|(_, v)| !v.omitted) {
-                samples.insert(i as i64 * interval_ms, v.value);
+                let t = i as i64 * interval_ms;
+                match &v.histogram {
+                    Some(h) => {
+                        samples.insert(t, Value::Histogram(h.clone()));
+                    }
+                    None => {
+                        samples.insert(t, Value::Float(v.value));
+                        if let Some((base, part)) = &part {
+                            classic
+                                .entry(base.clone())
+                                .or_default()
+                                .entry(t)
+                                .or_default()
+                                .set(*part, v.value);
+                        }
+                    }
+                }
+            }
+        }
+        // `appendCustomHistogram`: after the block's own series, the native
+        // histograms its classic ones convert to.
+        for (labels, by_time) in classic {
+            let samples = merged.entry(labels).or_default();
+            for (t, classic) in by_time {
+                if let Some(h) = classic.convert() {
+                    samples.insert(t, Value::Histogram(h));
+                }
             }
         }
     }
@@ -181,12 +193,240 @@ fn merge(load: &[LoadedSeries<'_>]) -> Vec<promql_engine::Series> {
     merged
         .into_iter()
         .map(|(labels, samples)| {
-            let (timestamps, values) = samples.into_iter().unzip();
-            promql_engine::Series::new(&labels, timestamps, values)
-                .expect("a sorted map yields ascending timestamps and unique names")
+            let labels: Vec<(&str, &str)> = labels
+                .iter()
+                .map(|(n, v)| (n.as_str(), v.as_str()))
+                .collect();
+            let mut floats = (Vec::new(), Vec::new());
+            let mut histograms = Vec::new();
+            for (t, value) in samples {
+                match value {
+                    Value::Float(v) => {
+                        floats.0.push(t);
+                        floats.1.push(v);
+                    }
+                    Value::Histogram(h) => histograms.push((t, h)),
+                }
+            }
+            stored_hints(&floats.0, &mut histograms);
+            promql_engine::Series::new(&labels, floats.0, floats.1)
+                .and_then(|series| series.with_histograms(histograms))
+                .expect("a sorted map yields ascending, distinct timestamps and unique names")
         })
         .collect()
 }
+
+enum Value {
+    Float(f64),
+    Histogram(FloatHistogram),
+}
+
+/// A description's label set as the store keys it.
+///
+/// The parser keeps labels as written, possibly with a name repeated;
+/// sorted by name, the last value wins. `""` values drop out because
+/// `Series::new` drops them: keeping them here would key `x{env=""}`
+/// apart from `x` and then have the two collide once built, which the
+/// store rejects.
+fn label_set(sd: &promql_parser::SeriesDescription) -> Vec<(String, String)> {
+    let mut pairs: Vec<(&str, &str)> = sd
+        .labels
+        .iter()
+        .map(|l| (l.name.as_str(), l.value.as_str()))
+        .filter(|(_, v)| !v.is_empty())
+        .collect();
+    pairs.sort_by(|a, b| a.0.cmp(b.0));
+    let mut labels: Vec<(String, String)> = Vec::with_capacity(pairs.len());
+    for (name, value) in pairs {
+        match labels.last_mut() {
+            Some(last) if last.0 == name => last.1 = value.to_string(),
+            _ => labels.push((name.to_string(), value.to_string())),
+        }
+    }
+    labels
+}
+
+/// Which part of a classic histogram a float series is, and the label set
+/// of the native histogram it converts into: upstream's
+/// `GetHistogramMetricBaseName` and `GetHistogramMetricBase`.
+#[derive(Clone, Copy)]
+enum Part {
+    Bucket(f64),
+    Count,
+    Sum,
+}
+
+fn classic_part(labels: &[(String, String)]) -> Option<(Vec<(String, String)>, Part)> {
+    let get = |name: &str| {
+        labels
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    };
+    let name = get("__name__")?;
+    // The first suffix that cuts wins, in upstream's order.
+    let (base, part) = if let Some(base) = name.strip_suffix("_bucket") {
+        // `strconv.ParseFloat`; a bucket without a readable `le` is not one.
+        let le = get("le")?.parse::<f64>().ok().filter(|le| !le.is_nan())?;
+        (base, Part::Bucket(le))
+    } else if let Some(base) = name.strip_suffix("_sum") {
+        (base, Part::Sum)
+    } else if let Some(base) = name.strip_suffix("_count") {
+        (base, Part::Count)
+    } else {
+        return None;
+    };
+    let mut labels: Vec<(String, String)> = labels
+        .iter()
+        .filter(|(n, _)| n != "le" && n != "__name__")
+        .cloned()
+        .collect();
+    labels.push(("__name__".to_string(), base.to_string()));
+    labels.sort();
+    Some((labels, part))
+}
+
+/// One classic histogram at one timestamp, collected from its float
+/// series: upstream's `convertnhcb.TempHistogram`.
+#[derive(Default)]
+struct Classic {
+    /// `(upper bound, cumulative count)`, in the order given.
+    buckets: Vec<(f64, f64)>,
+    count: Option<f64>,
+    sum: f64,
+}
+
+impl Classic {
+    fn set(&mut self, part: Part, v: f64) {
+        match part {
+            // A bound given twice keeps its first count, as upstream does.
+            Part::Bucket(le) => {
+                if !self.buckets.iter().any(|(bound, _)| *bound == le) {
+                    self.buckets.push((le, v));
+                }
+            }
+            Part::Count => self.count = Some(v),
+            Part::Sum => self.sum = v,
+        }
+    }
+
+    /// `TempHistogram.Convert`: the cumulative buckets as absolute counts
+    /// under custom bounds, the last bucket `+Inf`. `None` where upstream
+    /// returns an error: a negative or non-cumulative count, or a count
+    /// that disagrees with the `+Inf` bucket.
+    fn convert(self) -> Option<FloatHistogram> {
+        let mut buckets = self.buckets;
+        buckets.sort_by(|a, b| a.0.total_cmp(&b.0));
+        if buckets.iter().any(|(_, count)| *count < 0.0)
+            || buckets.windows(2).any(|w| w[1].1 < w[0].1)
+            || self.count.is_some_and(|count| count < 0.0)
+        {
+            return None;
+        }
+        let count = self
+            .count
+            .or_else(|| buckets.last().map(|(_, count)| *count))
+            .unwrap_or(0.0);
+        if buckets.last().is_none_or(|(le, _)| *le != f64::INFINITY) {
+            buckets.push((f64::INFINITY, count));
+        }
+        if buckets.last().is_some_and(|(_, last)| *last != count) {
+            return None;
+        }
+        let mut previous = 0.0;
+        let absolute: Vec<f64> = buckets
+            .iter()
+            .map(|(_, cumulative)| {
+                let own = cumulative - previous;
+                previous = *cumulative;
+                own
+            })
+            .collect();
+        let mut h = FloatHistogram {
+            schema: promql_histogram::CUSTOM_SCHEMA,
+            count,
+            sum: self.sum,
+            positive_spans: vec![promql_histogram::Span {
+                offset: 0,
+                length: absolute.len() as u32,
+            }],
+            positive_buckets: absolute,
+            // The `+Inf` bound is implied, not stored.
+            custom_values: buckets[..buckets.len() - 1]
+                .iter()
+                .map(|(le, _)| *le)
+                .collect(),
+            ..FloatHistogram::default()
+        };
+        h.compact();
+        Some(h)
+    }
+}
+
+/// Rewrite each histogram's counter reset hint to the one a TSDB read
+/// returns for it.
+///
+/// Upstream's `load` appends to a real head, and what a query reads back
+/// is the chunk's view of resets, not the hint the sample was written
+/// with: a gauge histogram stays a gauge, the first sample of a chunk
+/// reads as `unknown` whatever opened the chunk, and every later one as
+/// `not_reset` (`counterResetHint` in `tsdb/chunkenc/histogram_meta.go`
+/// at 83962c35). The corpus expects those hints, so the fixture has to
+/// hold them; an engine reading a real store is handed them by it.
+///
+/// A sample opens a chunk where `FloatHistogramAppender.appendable`
+/// (`tsdb/chunkenc/float_histogram.go`) refuses it the open one: after a
+/// float or a gauge, on an explicit or a detected counter reset, and on a
+/// change of schema, zero threshold or custom bounds. Chunks cut for
+/// their size are not modelled.
+fn stored_hints(float_times: &[i64], histograms: &mut [(i64, FloatHistogram)]) {
+    let stale = |h: &FloatHistogram| h.sum.to_bits() == STALE_NAN_BITS;
+    // The last histogram of the open chunk, `None` where the next sample
+    // opens one.
+    let mut open: Option<FloatHistogram> = None;
+    let mut last_t = i64::MIN;
+    for (t, h) in histograms.iter_mut() {
+        // A float between two histograms is a chunk of another encoding.
+        let float_between = float_times
+            .binary_search(&last_t)
+            .map_or_else(|i| i, |i| i + 1);
+        if float_times.get(float_between).is_some_and(|ft| ft < t) {
+            open = None;
+        }
+        last_t = *t;
+        if h.counter_reset_hint == CounterResetHint::Gauge {
+            // Gauge chunks hold only gauges, so the next counter opens one.
+            open = None;
+            continue;
+        }
+        let joins = match &open {
+            None => false,
+            Some(_) if h.counter_reset_hint == CounterResetHint::Reset => false,
+            // A stale sample joins the chunk; nothing joins after one.
+            Some(_) if stale(h) => true,
+            Some(prev) if stale(prev) => false,
+            Some(prev) => {
+                // What remains of `appendable` once the layouts agree is
+                // the zero bucket and each bucket against its predecessor,
+                // which `DetectReset` does when no hint decides.
+                let mut unhinted = h.clone();
+                unhinted.counter_reset_hint = CounterResetHint::Unknown;
+                h.count >= prev.count
+                    && h.schema == prev.schema
+                    && h.zero_threshold == prev.zero_threshold
+                    && (!h.uses_custom_buckets() || h.custom_values == prev.custom_values)
+                    && !unhinted.detect_reset(prev)
+            }
+        };
+        h.counter_reset_hint = match joins {
+            true => CounterResetHint::NotReset,
+            false => CounterResetHint::Unknown,
+        };
+        open = Some(h.clone());
+    }
+}
+
+const STALE_NAN_BITS: u64 = 0x7ff0_0000_0000_0002;
 
 impl DataFusionEngine {
     /// A store that cannot be built is a broken fixture, not a verdict
@@ -231,7 +471,11 @@ fn series_of(
                 .zip(s.values())
                 .map(|(&t, &v)| Point { t, v })
                 .collect(),
-            histograms: 0,
+            histograms: s
+                .histograms()
+                .into_iter()
+                .map(|(t, h)| HPoint { t, h })
+                .collect(),
         })
         .collect())
 }
@@ -250,16 +494,22 @@ impl Engine for DataFusionEngine {
                 // time, whatever time the point it came from carried.
                 let samples = series_of(decode(&batches))?
                     .into_iter()
-                    .map(|s| match s.floats.as_slice() {
-                        [p] => Ok(Sample {
+                    .map(|s| match (s.floats.as_slice(), s.histograms.as_slice()) {
+                        ([p], []) => Ok(Sample {
                             labels: s.labels,
                             t: at_ms,
                             v: p.v,
-                            histogram: false,
+                            histogram: None,
                         }),
-                        points => Err(EngineError::Other(format!(
+                        ([], [p]) => Ok(Sample {
+                            labels: s.labels,
+                            t: at_ms,
+                            v: 0.0,
+                            histogram: Some(p.h.clone()),
+                        }),
+                        (floats, histograms) => Err(EngineError::Other(format!(
                             "an instant vector series carried {} points",
-                            points.len()
+                            floats.len() + histograms.len()
                         ))),
                     })
                     .collect::<Result<_, _>>()?;
@@ -318,10 +568,12 @@ mod tests {
             LoadedSeries {
                 series: &slow,
                 interval_secs: 60.0,
+                with_nhcb: false,
             },
             LoadedSeries {
                 series: &fast,
                 interval_secs: 10.0,
+                with_nhcb: false,
             },
         ]);
 
@@ -337,10 +589,12 @@ mod tests {
             LoadedSeries {
                 series: &first,
                 interval_secs: 60.0,
+                with_nhcb: false,
             },
             LoadedSeries {
                 series: &second,
                 interval_secs: 60.0,
+                with_nhcb: false,
             },
         ]);
         assert_eq!(stored.len(), 2);
@@ -356,10 +610,12 @@ mod tests {
             LoadedSeries {
                 series: &first,
                 interval_secs: 60.0,
+                with_nhcb: false,
             },
             LoadedSeries {
                 series: &second,
                 interval_secs: 60.0,
+                with_nhcb: false,
             },
         ]);
         assert_eq!(stored.len(), 1);
@@ -437,6 +693,7 @@ mod tests {
         let load = [LoadedSeries {
             series: &[desc("x 1 2 3"), desc(r#"y 4 5 6"#)],
             interval_secs: 30.0,
+            with_nhcb: false,
         }];
         // Parses under fill; the result itself is not the question.
         engine
@@ -454,10 +711,12 @@ mod tests {
             LoadedSeries {
                 series: &a,
                 interval_secs: 30.0,
+                with_nhcb: false,
             },
             LoadedSeries {
                 series: &b,
                 interval_secs: 60.0,
+                with_nhcb: false,
             },
         ];
         let run = |mode| {

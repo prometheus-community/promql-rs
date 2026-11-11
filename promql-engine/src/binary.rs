@@ -66,6 +66,8 @@ use crate::aggregate::Grid;
 use crate::matcher::METRIC_NAME;
 use crate::series;
 
+pub mod histograms;
+
 pub const NAME: &str = "promql_binary";
 
 /// The column telling the aggregation which operand a row came from.

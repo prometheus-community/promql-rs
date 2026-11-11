@@ -50,12 +50,16 @@ use datafusion::physical_plan::{
 use futures::{Stream, StreamExt};
 
 use super::state;
-use crate::buffer::{EvalContext, Kernel, PushCursor, WorkBudget};
+use crate::buffer::{EvalContext, Kernel, PushCursor, Values, WorkBudget};
+use crate::histogram::{HistogramColumns, HistogramsBuilder, HISTOGRAMS};
 use crate::params::Params;
 use crate::series::{
     self, Block, SamplesBuilder, BLOCK_END, BLOCK_START, FLOATS, LABELS, SERIES_ID,
 };
 
+/// Where `histograms` sits among the evaluated columns, after the four
+/// every evaluation has.
+const HISTOGRAMS_AT: usize = 4;
 const BATCH_SAMPLES: usize = 1 << 20;
 const INPUT_ROWS: usize = 8192;
 // Shared by ingestion, sample-edge movement, sweep pops, and remaining steps.
@@ -82,15 +86,13 @@ impl SeriesEvalExec {
         grid: Params,
     ) -> Result<Self> {
         let input_schema = input.schema();
-        let fields = [LABELS, FLOATS, BLOCK_START, BLOCK_END]
-            .into_iter()
-            .map(|name| input_schema.field_with_name(name).cloned().map(Arc::new))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let fields = super::evaluated_fields(&input_schema, kernel)?;
         match input_schema.field_with_name(SERIES_ID)?.data_type() {
             DataType::UInt64 => {}
             DataType::FixedSizeBinary(width) if *width > 0 => {}
             dtype => return plan_err!("series evaluation does not support series_id type {dtype}"),
         }
+        let schema_len = fields.len();
         let schema = Arc::new(Schema::new_with_metadata(
             fields,
             input_schema.metadata().clone(),
@@ -113,7 +115,7 @@ impl SeriesEvalExec {
             grid,
             kernel,
             metrics: ExecutionPlanMetricsSet::new(),
-            projection: vec![0, 1, 2, 3],
+            projection: (0..schema_len).collect(),
         })
     }
 
@@ -270,20 +272,29 @@ impl ExecutionPlan for SeriesEvalExec {
         let DataType::Struct(fields) = schema.field_with_name(LABELS)?.data_type() else {
             return internal_err!("series evaluation needs canonical labels");
         };
-        let DataType::List(sample_item) = schema.field_with_name(FLOATS)?.data_type() else {
-            unreachable!("trusted source samples shape");
+        // A source of only histograms has no floats column; the evaluated
+        // one is then the canonical type, holding what a kernel computes.
+        let sample_item = match schema.column_with_name(FLOATS) {
+            Some((_, field)) => match field.data_type() {
+                DataType::List(item) => item.clone(),
+                _ => unreachable!("trusted source samples shape"),
+            },
+            None => series::sample_item(),
         };
         Ok(Box::pin(cooperative(SeriesStream {
             input: Some(input),
             schema: self.schema(),
             fields: fields.clone(),
-            sample_item: sample_item.clone(),
+            sample_item,
+            // Only where a consumer reads them: a projection that kept
+            // floats alone builds no histograms.
+            emits_histograms: self.projection.contains(&HISTOGRAMS_AT),
             projection: self.projection.clone(),
             grid: self.grid,
             kernel: self.kernel,
             batch_size: context.session_config().batch_size().min(i32::MAX as usize),
             pending: None,
-            push_cursor: PushCursor::default(),
+            row: RowCursor::default(),
             input_bytes: 0,
             block: None,
             current: None,
@@ -361,14 +372,18 @@ struct CurrentBlock {
 struct Output {
     bounds: Block,
     samples: SamplesBuilder,
+    /// Present when the evaluated schema has a histograms column, and
+    /// then finished row for row with `samples`.
+    histograms: Option<HistogramsBuilder>,
     sample_count: usize,
     labels: Option<Vec<StringViewBuilder>>,
 }
 impl Output {
-    fn new(bounds: Block, fields: &Fields, needs_labels: bool) -> Self {
+    fn new(bounds: Block, fields: &Fields, needs_labels: bool, histograms: bool) -> Self {
         Self {
             bounds,
             samples: SamplesBuilder::default(),
+            histograms: histograms.then(HistogramsBuilder::default),
             sample_count: 0,
             labels: needs_labels.then(|| {
                 fields
@@ -392,6 +407,9 @@ impl Output {
         })?;
         (self.samples.size() - std::mem::size_of::<SamplesBuilder>())
             .checked_add(labels)
+            .and_then(|bytes| {
+                bytes.checked_add(self.histograms.as_ref().map_or(0, HistogramsBuilder::size))
+            })
             .ok_or_else(charge_overflow)
     }
     fn rows(&self) -> usize {
@@ -430,11 +448,22 @@ fn samples_with_declared_fields(samples: ListArray, item: &FieldRef) -> Result<L
     )?)
 }
 
+/// Position in one raw row whose floats and histograms are pushed as
+/// alternating chronological runs. The counts are samples of each list
+/// already handed over in completed runs; `push` is the open run's.
+#[derive(Default)]
+struct RowCursor {
+    floats: usize,
+    histograms: usize,
+    push: PushCursor,
+}
+
 struct SeriesStream {
     input: Option<SendableRecordBatchStream>,
     schema: SchemaRef,
     fields: Fields,
     sample_item: FieldRef,
+    emits_histograms: bool,
     projection: Vec<usize>,
     grid: Params,
     kernel: Kernel,
@@ -442,7 +471,7 @@ struct SeriesStream {
     // The complete arrays remain charged until the last raw row is consumed,
     // even while a finished output prefix waits for downstream demand.
     pending: Option<(RecordBatch, usize)>,
-    push_cursor: PushCursor,
+    row: RowCursor,
     input_bytes: usize,
     block: Option<CurrentBlock>,
     current: Option<CurrentSeries>,
@@ -476,7 +505,7 @@ impl SeriesStream {
     fn release(&mut self) {
         self.input = None;
         self.pending = None;
-        self.push_cursor = PushCursor::default();
+        self.row = RowCursor::default();
         self.input_bytes = 0;
         self.current = None;
         self.block = None;
@@ -524,7 +553,7 @@ impl SeriesStream {
             self.charge(0)?;
         }
         let current = self.current.as_ref().expect("sealed series");
-        let count = current.fold.out.len();
+        let count = current.fold.len();
         let existing = self.output.as_ref().map_or(0, |output| output.sample_count);
         if self.has_output() && existing.saturating_add(count) > BATCH_SAMPLES {
             self.output_ready = true;
@@ -536,12 +565,17 @@ impl SeriesStream {
                 self.block.as_ref().expect("open block").bounds,
                 &self.fields,
                 self.needs_labels(),
+                self.emits_histograms,
             ));
         }
         let output = self.output.as_mut().expect("output builders");
         let current = self.current.as_ref().expect("sealed series");
         current.fold.out.append_to(&mut output.samples);
         output.samples.finish_row();
+        if let Some(histograms) = &mut output.histograms {
+            current.fold.append_histograms_to(histograms);
+            histograms.finish_row();
+        }
         output.sample_count = total;
         if let Some(builders) = &mut output.labels {
             for (builder, value) in builders
@@ -571,12 +605,22 @@ impl SeriesStream {
         from: usize,
         budget: &mut WorkBudget,
     ) -> Result<usize> {
-        let samples = batch
-            .column_by_name(FLOATS)
-            .expect("bound source column")
-            .as_list::<i32>();
-        let (ts, vs) = series::sample_slices(samples.values().as_struct());
-        let offsets = samples.value_offsets();
+        // Either sample column may be absent, but not both. A row's bounds
+        // in an absent one are empty.
+        let floats = batch.column_by_name(FLOATS).map(|c| c.as_list::<i32>());
+        let (float_ts, float_vs) = floats.map_or((&[][..], &[][..]), |list| {
+            series::sample_slices(list.values().as_struct())
+        });
+        let histograms = batch.column_by_name(HISTOGRAMS).map(|c| c.as_list::<i32>());
+        let histogram_columns =
+            histograms.map(|list| HistogramColumns::new(list.values().as_struct()));
+        let histogram_ts = histogram_columns.as_ref().map_or(&[][..], |c| c.timestamps);
+        let bounds_of = |list: Option<&ListArray>, row: usize| {
+            list.map_or((0, 0), |list| {
+                let offsets = list.value_offsets();
+                (offsets[row] as usize, offsets[row + 1] as usize)
+            })
+        };
         let starts = batch
             .column_by_name(BLOCK_START)
             .expect("bound source column")
@@ -641,26 +685,70 @@ impl SeriesStream {
                     sealed: false,
                 });
             }
-            let (a, b) = (offsets[row] as usize, offsets[row + 1] as usize);
-            if a != b && !samples.is_null(row) {
-                let finished = self
-                    .current
-                    .as_mut()
-                    .expect("open series")
-                    .fold
-                    .push_budgeted(
-                        &self.block.as_ref().expect("open block").context,
-                        &ts[a..b],
-                        &vs[a..b],
-                        &mut self.push_cursor,
-                        budget,
-                    );
+            let (float_from, float_to) = bounds_of(floats, row);
+            let (histogram_from, histogram_to) = bounds_of(histograms, row);
+            // The two lists are one series in time order. Each run is the
+            // longest prefix of one list that precedes the other's next
+            // sample; a row of one type is a single run. A float at a
+            // histogram's timestamp goes first, and the overlap rule then
+            // drops the histogram: one timestamp, one sample.
+            loop {
+                let f = float_from + self.row.floats;
+                let h = histogram_from + self.row.histograms;
+                let floats_run = match (f < float_to, h < histogram_to) {
+                    (false, false) => break,
+                    (true, false) => Some(float_to - f),
+                    (false, true) => None,
+                    (true, true) if float_ts[f] <= histogram_ts[h] => {
+                        Some(float_ts[f..float_to].partition_point(|t| *t <= histogram_ts[h]))
+                    }
+                    (true, true) => None,
+                };
+                let fold = &mut self.current.as_mut().expect("open series").fold;
+                let context = &self.block.as_ref().expect("open block").context;
+                let finished = match floats_run {
+                    Some(n) => {
+                        let finished = fold.push_budgeted(
+                            context,
+                            &float_ts[f..f + n],
+                            Values::Floats(&float_vs[f..f + n]),
+                            &mut self.row.push,
+                            budget,
+                        );
+                        if finished {
+                            self.row.floats += n;
+                        }
+                        finished
+                    }
+                    None => {
+                        let n = if f < float_to {
+                            histogram_ts[h..histogram_to].partition_point(|t| *t < float_ts[f])
+                        } else {
+                            histogram_to - h
+                        };
+                        let finished = fold.push_budgeted(
+                            context,
+                            &histogram_ts[h..h + n],
+                            Values::Histograms {
+                                columns: histogram_columns.as_ref().expect("a histogram run"),
+                                start: h,
+                            },
+                            &mut self.row.push,
+                            budget,
+                        );
+                        if finished {
+                            self.row.histograms += n;
+                        }
+                        finished
+                    }
+                };
                 if !finished {
                     self.charge(0)?;
                     return Ok(row);
                 }
+                self.row.push = PushCursor::default();
             }
-            self.push_cursor = PushCursor::default();
+            self.row = RowCursor::default();
         }
         self.charge(0)?;
         Ok(until)
@@ -674,6 +762,10 @@ impl SeriesStream {
             output.samples.take_all(),
             &self.sample_item,
         )?);
+        let histograms: Option<ArrayRef> = output
+            .histograms
+            .as_mut()
+            .map(|builder| Arc::new(builder.take_all()) as ArrayRef);
         let [start, end] = output.bounds.columns(n);
         let labels: Option<ArrayRef> = if let Some(builders) = &mut output.labels {
             Some(if builders.is_empty() {
@@ -690,19 +782,25 @@ impl SeriesStream {
         };
         // Canonical locals stay live even when projected away.
         let live = [
-            samples.as_ref(),
-            start.as_ref(),
-            end.as_ref(),
-            labels.as_deref().unwrap_or(samples.as_ref()),
+            Some(&samples),
+            Some(&start),
+            Some(&end),
+            labels.as_ref(),
+            histograms.as_ref(),
         ];
-        let live = &live[..if labels.is_some() { 4 } else { 3 }];
-        let output_bytes = live.iter().try_fold(0usize, |bytes, array| {
+        let output_bytes = live.iter().flatten().try_fold(0usize, |bytes, array| {
             bytes
                 .checked_add(array.get_array_memory_size())
                 .ok_or_else(charge_overflow)
         })?;
         self.charge(output_bytes)?;
-        let canonical = [labels.as_ref(), Some(&samples), Some(&start), Some(&end)];
+        let canonical = [
+            labels.as_ref(),
+            Some(&samples),
+            Some(&start),
+            Some(&end),
+            histograms.as_ref(),
+        ];
         let columns = self
             .projection
             .iter()
@@ -714,6 +812,7 @@ impl SeriesStream {
             &RecordBatchOptions::new().with_row_count(Some(n)),
         )?;
         drop(labels);
+        drop(histograms);
         drop(samples);
         drop(start);
         drop(end);

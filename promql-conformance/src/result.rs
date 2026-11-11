@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 
+use promql_histogram::FloatHistogram;
 use promql_parser::SeriesDescription;
 
 /// A label set. `BTreeMap` because comparison must be order-insensitive
@@ -22,23 +23,30 @@ pub struct Point {
     pub v: f64,
 }
 
-/// One matrix row.
+/// One native histogram sample.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HPoint {
+    pub t: i64,
+    pub h: FloatHistogram,
+}
+
+/// One matrix row: upstream's `promql.Series`, floats and histograms
+/// apart, each ascending by time.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Series {
     pub labels: Labels,
     pub floats: Vec<Point>,
-    /// Native-histogram points, which the protocol does not encode yet.
-    /// Non-zero means the case is out of reach rather than mismatched.
-    pub histograms: usize,
+    pub histograms: Vec<HPoint>,
 }
 
-/// One vector element.
+/// One vector element: a float, or a histogram when `histogram` is set,
+/// and then `v` means nothing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sample {
     pub labels: Labels,
     pub t: i64,
     pub v: f64,
-    pub histogram: bool,
+    pub histogram: Option<FloatHistogram>,
 }
 
 /// The result of a range query.
@@ -64,12 +72,11 @@ pub enum QueryResult {
 }
 
 impl QueryResult {
-    /// Whether any part of this result is a native histogram, which the
-    /// protocol cannot carry yet.
+    /// Whether any part of this result is a native histogram.
     pub fn has_histograms(&self) -> bool {
         match self {
-            QueryResult::Matrix(series) => series.iter().any(|s| s.histograms > 0),
-            QueryResult::Vector(samples) => samples.iter().any(|s| s.histogram),
+            QueryResult::Matrix(series) => series.iter().any(|s| !s.histograms.is_empty()),
+            QueryResult::Vector(samples) => samples.iter().any(|s| s.histogram.is_some()),
             _ => false,
         }
     }
@@ -178,6 +185,10 @@ pub struct LoadedSeries<'a> {
     pub series: &'a [SeriesDescription],
     /// The block's sample interval, in seconds.
     pub interval_secs: f64,
+    /// `load_with_nhcb`: the block's classic histograms are also stored
+    /// as native histograms with custom buckets, upstream's
+    /// `appendCustomHistogram`.
+    pub with_nhcb: bool,
 }
 
 #[derive(Debug, thiserror::Error)]

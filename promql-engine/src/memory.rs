@@ -54,12 +54,13 @@ use datafusion::physical_plan::ExecutionPlan;
 use promql_parser::ast::{LabelMatcher, SeriesDescription};
 
 use crate::error::{EngineError, SeriesError};
+use crate::histogram::{Value, HISTOGRAMS};
 use crate::matcher::{mask_all, CompiledMatcher};
 #[cfg(test)]
 use crate::series::decode;
 use crate::series::{
-    clip, drop_empty, drop_unused_labels, encode, label_names_of, sample_item, with_block, Block,
-    Series, FLOATS, LABELS, SERIES_ID, TIMESTAMP,
+    clip, drop_empty, drop_unused_labels, encode, label_names_of, sample_columns, with_block,
+    Block, Series, FLOATS, LABELS, SERIES_ID, TIMESTAMP,
 };
 use crate::source::{SelectHints, SeriesSource};
 
@@ -208,7 +209,7 @@ impl MemorySeriesSource {
     /// keeps [`encode`] from seeing one label set twice.
     pub fn from_descriptions(series: &[SeriesDescription], interval_secs: f64) -> Self {
         let interval_ms = (interval_secs * 1000.0).round() as i64;
-        let mut merged: BTreeMap<Vec<(&str, &str)>, BTreeMap<i64, f64>> = BTreeMap::new();
+        let mut merged: BTreeMap<Vec<(&str, &str)>, BTreeMap<i64, Value>> = BTreeMap::new();
         for sd in series {
             // The parser keeps a description's labels as written, a name
             // possibly repeated; sorted by name, the last value wins. The
@@ -231,15 +232,30 @@ impl MemorySeriesSource {
             }
             let samples = merged.entry(labels).or_default();
             for (i, v) in sd.values.iter().enumerate().filter(|(_, v)| !v.omitted) {
-                samples.insert(i as i64 * interval_ms, v.value);
+                let value = match &v.histogram {
+                    Some(h) => Value::Histogram(Arc::new(h.clone())),
+                    None => Value::Float(v.value),
+                };
+                samples.insert(i as i64 * interval_ms, value);
             }
         }
         let stored = merged
             .into_iter()
             .map(|(labels, samples)| {
-                let (timestamps, values) = samples.into_iter().unzip();
-                Series::new(&labels, timestamps, values)
-                    .expect("a sorted map yields ascending timestamps and unique names")
+                let mut floats = (Vec::new(), Vec::new());
+                let mut histograms = Vec::new();
+                for (t, value) in samples {
+                    match value {
+                        Value::Float(v) => {
+                            floats.0.push(t);
+                            floats.1.push(v);
+                        }
+                        Value::Histogram(h) => histograms.push((t, Arc::unwrap_or_clone(h))),
+                    }
+                }
+                Series::new(&labels, floats.0, floats.1)
+                    .and_then(|series| series.with_histograms(histograms))
+                    .expect("a sorted map yields ascending, distinct timestamps and unique names")
             })
             .collect();
         // The merge above keyed on the label set, so no two survive equal.
@@ -279,6 +295,7 @@ impl SeriesSource for MemorySeriesSource {
         let raw = add_ids(&self.batch, self.ids)?;
         let selected = filter_record_batch(&raw, &mask)?;
         let selected = drop_unused_labels(&selected).map_err(external)?;
+        let selected = drop_unused_samples(&selected)?;
 
         // Obligation 2, blocks: by default one over the whole window-end
         // domain, `[start_ms + window_ms, end_ms]`, its end exclusive.
@@ -321,6 +338,37 @@ impl SeriesSource for MemorySeriesSource {
             .collect::<Result<Vec<_>>>()?;
         Ok(MemorySourceConfig::try_new_exec(&partitions, schema, None)?)
     }
+}
+
+/// Drop the sample column no selected series has a sample in, when the
+/// other one has some.
+///
+/// A store's schema is fixed per selection and planned against, so a
+/// selection of only histograms says so by having no `floats` column,
+/// and one of only floats has no `histograms`. A store that cannot know
+/// this before reading may hand over both columns; this one can, so it
+/// lets the planner refuse or simplify on the type it actually has. An
+/// empty selection keeps `floats`, the shape a float store has.
+fn drop_unused_samples(batch: &RecordBatch) -> Result<RecordBatch> {
+    let Some(histograms) = batch.column_by_name(HISTOGRAMS) else {
+        return Ok(batch.clone());
+    };
+    let unused = |column: &ArrayRef| {
+        let list = column.as_list::<i32>();
+        (0..list.len()).all(|row| list.value_length(row) == 0)
+    };
+    let floats = batch.column_by_name(FLOATS).expect("canonical");
+    let drop = if unused(histograms) {
+        HISTOGRAMS
+    } else if unused(floats) {
+        FLOATS
+    } else {
+        return Ok(batch.clone());
+    };
+    let keep: Vec<usize> = (0..batch.num_columns())
+        .filter(|&i| batch.schema().field(i).name() != drop)
+        .collect();
+    Ok(batch.project(&keep)?)
 }
 
 /// Identity is assigned over the immutable stored rows, not the selected
@@ -455,65 +503,100 @@ fn split_into_chunks(
     chunk_ms: i64,
     rows_per_batch: usize,
 ) -> Result<Vec<RecordBatch>> {
-    let samples = batch
-        .column_by_name(FLOATS)
-        .expect("canonical")
-        .as_list::<i32>();
-    let offsets = samples.value_offsets();
-    let timestamps = samples
-        .values()
-        .as_struct()
-        .column_by_name(TIMESTAMP)
-        .expect("canonical")
-        .as_primitive::<TimestampMillisecondType>()
-        .values();
+    let schema = batch.schema();
+    // Floats and histograms of one series are cut at the same times, so a
+    // chunk row holds whatever the series had in its span, of either type.
+    let lists: Vec<(&str, &ListArray, &[i64])> = sample_columns(&schema)
+        .map(|name| {
+            let list = batch
+                .column_by_name(name)
+                .expect("present")
+                .as_list::<i32>();
+            let timestamps = list
+                .values()
+                .as_struct()
+                .column_by_name(TIMESTAMP)
+                .expect("canonical")
+                .as_primitive::<TimestampMillisecondType>()
+                .values();
+            (name, list, timestamps.as_ref())
+        })
+        .collect();
 
-    // Chunk `c` is series `rows[c]`'s samples `bounds[c]..bounds[c + 1]`.
+    // Chunk `c` is series `rows[c]`'s samples `bounds[k][c]..bounds[k][c + 1]`
+    // of sample list `k`.
     let mut rows: Vec<u32> = Vec::new();
-    let mut bounds: Vec<i32> = vec![offsets[0]];
+    let mut bounds: Vec<Vec<i32>> = lists
+        .iter()
+        .map(|(_, list, _)| vec![list.value_offsets()[0]])
+        .collect();
     for row in 0..batch.num_rows() {
-        let (mut start, end) = (offsets[row] as usize, offsets[row + 1] as usize);
-        if start == end {
-            rows.push(row as u32);
-            bounds.push(end as i32);
-        }
-        while start < end {
-            let mut next = start + 1;
-            while next < end && timestamps[next] - timestamps[start] <= chunk_ms {
-                next += 1;
+        let mut at: Vec<usize> = lists
+            .iter()
+            .map(|(_, list, _)| list.value_offsets()[row] as usize)
+            .collect();
+        let ends: Vec<usize> = lists
+            .iter()
+            .map(|(_, list, _)| list.value_offsets()[row + 1] as usize)
+            .collect();
+        loop {
+            // The chunk opens at the earliest sample not yet handed over.
+            let start = lists
+                .iter()
+                .enumerate()
+                .filter(|(k, _)| at[*k] < ends[*k])
+                .map(|(k, (_, _, ts))| ts[at[k]])
+                .min();
+            if let Some(start) = start {
+                for (k, (_, _, ts)) in lists.iter().enumerate() {
+                    while at[k] < ends[k] && ts[at[k]] - start <= chunk_ms {
+                        at[k] += 1;
+                    }
+                }
             }
             rows.push(row as u32);
-            bounds.push(next as i32);
-            start = next;
+            for (k, bounds) in bounds.iter_mut().enumerate() {
+                bounds.push(at[k] as i32);
+            }
+            if at == ends {
+                break;
+            }
         }
     }
 
     let mut out = Vec::new();
-    for (k, rows) in rows.chunks(rows_per_batch).enumerate() {
-        let bounds = &bounds[k * rows_per_batch..=k * rows_per_batch + rows.len()];
-        let first = bounds[0];
-        let list = ListArray::new(
-            sample_item(),
-            OffsetBuffer::new(bounds.iter().map(|b| b - first).collect::<Vec<_>>().into()),
-            samples
-                .values()
-                .slice(first as usize, (bounds[rows.len()] - first) as usize),
-            None,
-        );
+    for (c, rows) in rows.chunks(rows_per_batch).enumerate() {
+        let span = c * rows_per_batch..=c * rows_per_batch + rows.len();
+        let chunked: Vec<(&str, ArrayRef)> = lists
+            .iter()
+            .zip(&bounds)
+            .map(|((name, list, _), bounds)| {
+                let bounds = &bounds[span.clone()];
+                let first = bounds[0];
+                let DataType::List(item) = list.data_type() else {
+                    unreachable!("a samples list")
+                };
+                let chunks = ListArray::new(
+                    item.clone(),
+                    OffsetBuffer::new(bounds.iter().map(|b| b - first).collect::<Vec<_>>().into()),
+                    list.values()
+                        .slice(first as usize, (bounds[rows.len()] - first) as usize),
+                    None,
+                );
+                (*name, Arc::new(chunks) as ArrayRef)
+            })
+            .collect();
         let indices = UInt32Array::from(rows.to_vec());
-        let samples: ArrayRef = Arc::new(list);
-        let columns = batch
-            .schema()
+        let columns = schema
             .fields()
             .iter()
             .zip(batch.columns())
-            .map(|(field, column)| {
-                if field.name() == FLOATS {
-                    Ok(Arc::clone(&samples))
-                } else {
-                    take(column, &indices, None)
-                }
-            })
+            .map(
+                |(field, column)| match chunked.iter().find(|(name, _)| name == field.name()) {
+                    Some((_, chunks)) => Ok(Arc::clone(chunks)),
+                    None => take(column, &indices, None),
+                },
+            )
             .collect::<std::result::Result<Vec<_>, ArrowError>>()?;
         out.push(RecordBatch::try_new(batch.schema(), columns)?);
     }

@@ -24,8 +24,14 @@
 //! answers, and `close` at the block edge leaves nothing of the series
 //! behind, so the reach-back a block repeats is folded afresh.
 
+use std::sync::Arc;
+
+use promql_histogram::FloatHistogram;
+
+use crate::histogram::{self, HistogramColumns, Value};
+use crate::mixed::Histograms;
 use crate::params::{step_count, Params};
-use crate::range::{advance_predict_linear, advance_range, RangeOp, Sweep};
+use crate::range::{advance_predict_linear, advance_range, Func, RangeOp, Sweep};
 use crate::selector::{advance_selector, is_stale, Pick};
 
 /// Maximum new history between readiness/retirement checks, independent of
@@ -76,11 +82,116 @@ pub(crate) struct PushCursor {
     started: bool,
 }
 
+/// Where a kernel's answers go: `(step timestamp, value)` in step order,
+/// each step at most once.
+///
+/// Two closures, one per sample type: a float answer is never wrapped in
+/// a [`Value`] and matched again on its way out, and a closure is compiled
+/// into the kernel loop it is handed to.
+pub(crate) struct Emit<F, H> {
+    pub(crate) floats: F,
+    pub(crate) histograms: H,
+}
+
+/// `FnMut(i64, f64)`, named so that a kernel's signature says it in a word.
+pub(crate) trait FloatSink: FnMut(i64, f64) {}
+impl<F: FnMut(i64, f64)> FloatSink for F {}
+
+/// `FnMut(i64, Arc<FloatHistogram>)`, likewise.
+pub(crate) trait HistogramSink: FnMut(i64, Arc<FloatHistogram>) {}
+impl<H: FnMut(i64, Arc<FloatHistogram>)> HistogramSink for H {}
+
+impl<F: FloatSink, H: HistogramSink> Emit<F, H> {
+    pub(crate) fn float(&mut self, t: i64, v: f64) {
+        (self.floats)(t, v)
+    }
+
+    pub(crate) fn histogram(&mut self, t: i64, h: Arc<FloatHistogram>) {
+        (self.histograms)(t, h)
+    }
+
+    pub(crate) fn value(&mut self, t: i64, v: Value) {
+        match v {
+            Value::Float(v) => self.float(t, v),
+            Value::Histogram(h) => self.histogram(t, h),
+        }
+    }
+}
+
+#[cfg(test)]
+impl<F: FloatSink> Emit<F, fn(i64, Arc<FloatHistogram>)> {
+    /// A sink for a kernel that can only answer with floats.
+    pub(crate) fn floats(floats: F) -> Self {
+        Self {
+            floats,
+            histograms: |_, _| unreachable!("a float-only sink was handed a histogram"),
+        }
+    }
+}
+
+/// One chronological run of a raw row's samples, all of one type. A row
+/// holding both types is pushed as alternating runs in time order.
+#[derive(Clone, Copy)]
+pub(crate) enum Values<'a> {
+    Floats(&'a [f64]),
+    /// Entry `i` of the run is row `start + i` of `columns`.
+    Histograms {
+        columns: &'a HistogramColumns<'a>,
+        start: usize,
+    },
+}
+
+impl Values<'_> {
+    fn slice(self, from: usize, to: usize) -> Self {
+        match self {
+            Values::Floats(vs) => Values::Floats(&vs[from..to]),
+            Values::Histograms { columns, start } => Values::Histograms {
+                columns,
+                start: start + from,
+            },
+        }
+    }
+
+    /// Entry `i`, a histogram decoded out of its batch.
+    fn get(self, i: usize) -> Value {
+        match self {
+            Values::Floats(vs) => Value::Float(vs[i]),
+            Values::Histograms { columns, start } => {
+                Value::Histogram(Arc::new(columns.decode(start + i)))
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Hash)]
 pub(crate) enum Kernel {
     Selector(Pick),
     /// Window fold: ordinary range functions and `predict_linear`.
     Range(RangeOp),
+}
+
+impl Kernel {
+    /// Whether this kernel can answer a step with a histogram, which is
+    /// what gives the evaluated rows a `histograms` column. The others
+    /// read histograms (`count_over_time`) or skip them (`max_over_time`)
+    /// and answer with floats.
+    pub(crate) fn emits_histograms(self) -> bool {
+        match self {
+            Kernel::Selector(pick) => pick == Pick::Value,
+            Kernel::Range(RangeOp::Func(func)) => matches!(
+                func,
+                Func::Rate
+                    | Func::Increase
+                    | Func::Delta
+                    | Func::Irate
+                    | Func::Idelta
+                    | Func::SumOverTime
+                    | Func::AvgOverTime
+                    | Func::LastOverTime
+            ),
+            Kernel::Range(RangeOp::PredictLinear(_)) => false,
+        }
+    }
 }
 
 /// Immutable configuration belongs to the block, not to each series. The
@@ -132,7 +243,7 @@ pub(crate) struct BufferedSeriesIterator {
 enum SeriesState {
     Window(WindowBuffer),
     Candidate {
-        sample: Option<(i64, f64)>,
+        sample: Option<(i64, Value)>,
         last_t: Option<i64>,
     },
 }
@@ -140,7 +251,15 @@ enum SeriesState {
 pub(crate) struct WindowBuffer {
     pub(crate) sweep: Option<Sweep>,
     pub(crate) ts: Vec<i64>,
+    /// A histogram sample holds its `sum` here: staleness is those bits
+    /// for either type, so the checks on this vector need not know which.
     pub(crate) vs: Vec<f64>,
+    /// The histogram of each buffered sample, `None` for a float. Empty
+    /// until the series shows a histogram, so a float series pays nothing;
+    /// from then on parallel to `vs`.
+    pub(crate) hs: Vec<Option<Arc<FloatHistogram>>>,
+    /// Heap the histograms in `hs` own, kept as they enter and leave.
+    hist_bytes: usize,
     /// Absolute ordinal `i` lives at `[i - base]`.
     pub(crate) base: usize,
     /// Absolute ordinals: the first sample a later step can still read, and
@@ -153,7 +272,7 @@ pub(crate) struct WindowBuffer {
     /// for overlap, including timestamps claimed by filtered stale markers.
     pub(crate) last_t: Option<i64>,
     /// `@` computes one value once, then emits it resumably over the grid.
-    pub(crate) pinned_value: Option<Option<f64>>,
+    pub(crate) pinned_value: Option<Option<Value>>,
 }
 
 impl BufferedSeriesIterator {
@@ -177,7 +296,7 @@ impl BufferedSeriesIterator {
         context: &EvalContext,
         ts: &[i64],
         vs: &[f64],
-        emit: impl FnMut(i64, f64),
+        emit: impl FloatSink,
     ) {
         assert!(self.push_budgeted(
             context,
@@ -190,6 +309,7 @@ impl BufferedSeriesIterator {
     }
 
     /// True only when this row and all currently ready steps are consumed.
+    #[cfg(test)]
     pub(crate) fn push_budgeted(
         &mut self,
         context: &EvalContext,
@@ -197,12 +317,33 @@ impl BufferedSeriesIterator {
         vs: &[f64],
         cursor: &mut PushCursor,
         budget: &mut WorkBudget,
-        mut emit: impl FnMut(i64, f64),
+        emit: impl FloatSink,
     ) -> bool {
         debug_assert_eq!(ts.len(), vs.len());
+        self.push_values_budgeted(
+            context,
+            ts,
+            Values::Floats(vs),
+            cursor,
+            budget,
+            &mut Emit::floats(emit),
+        )
+    }
+
+    /// [`Self::push_budgeted`] for a run of either type. `ts` has one entry
+    /// per entry of `vs`.
+    pub(crate) fn push_values_budgeted(
+        &mut self,
+        context: &EvalContext,
+        ts: &[i64],
+        vs: Values<'_>,
+        cursor: &mut PushCursor,
+        budget: &mut WorkBudget,
+        emit: &mut Emit<impl FloatSink, impl HistogramSink>,
+    ) -> bool {
         match &mut self.state {
             SeriesState::Window(window) => {
-                return window.push(context, ts, vs, cursor, budget, &mut emit);
+                return window.push(context, ts, vs, cursor, budget, emit);
             }
             SeriesState::Candidate { sample, last_t } => {
                 if !budget.take() {
@@ -232,10 +373,11 @@ impl BufferedSeriesIterator {
                 }
                 let from = previous.map_or(0, |last| ts.partition_point(|t| *t <= last));
                 let ts = &ts[from..];
-                let vs = &vs[from..];
                 let hi = ts.partition_point(|t| *t <= end);
                 if hi > 0 && ts[hi - 1] > end - p.window_ms {
-                    *sample = Some((ts[hi - 1], vs[hi - 1]));
+                    // The one sample that can answer: a histogram run
+                    // decodes this entry and no other.
+                    *sample = Some((ts[hi - 1], vs.get(from + hi - 1)));
                 }
             }
         }
@@ -245,8 +387,12 @@ impl BufferedSeriesIterator {
     /// Emits remaining samples and resets numerics, retaining window/sweep
     /// capacities. Repeated close without push emits nothing, not an empty row.
     #[cfg(test)]
-    pub(crate) fn close(&mut self, context: &EvalContext, emit: impl FnMut(i64, f64)) {
-        assert!(self.close_budgeted(context, &mut WorkBudget::new(usize::MAX), emit));
+    pub(crate) fn close(&mut self, context: &EvalContext, emit: impl FloatSink) {
+        assert!(self.close_budgeted(
+            context,
+            &mut WorkBudget::new(usize::MAX),
+            &mut Emit::floats(emit)
+        ));
     }
 
     /// False leaves the close cursor and all allocations alive for resumption.
@@ -254,24 +400,29 @@ impl BufferedSeriesIterator {
         &mut self,
         context: &EvalContext,
         budget: &mut WorkBudget,
-        mut emit: impl FnMut(i64, f64),
+        emit: &mut Emit<impl FloatSink, impl HistogramSink>,
     ) -> bool {
         match &mut self.state {
             SeriesState::Window(window) => {
-                return window.close(context, budget, &mut emit);
+                return window.close(context, budget, emit);
             }
             SeriesState::Candidate { sample, last_t } => {
                 if !budget.take() {
                     return false;
                 }
                 if let Some((t, v)) = sample.take() {
+                    let Kernel::Selector(pick) = context.kernel() else {
+                        unreachable!("candidate belongs to a selector");
+                    };
+                    let step = context.params().start_ms;
                     // `vectorSelectorSingle`: stale bits belong to the
                     // original value, before timestamp's Pick conversion.
-                    if !is_stale(v) {
-                        let Kernel::Selector(pick) = context.kernel() else {
-                            unreachable!("candidate belongs to a selector");
-                        };
-                        emit(context.params().start_ms, pick.of(t, v));
+                    match v {
+                        Value::Float(v) if is_stale(v) => {}
+                        Value::Float(v) => emit.float(step, pick.of(t, v)),
+                        Value::Histogram(h) if is_stale(h.sum) => {}
+                        Value::Histogram(h) if pick == Pick::Value => emit.histogram(step, h),
+                        Value::Histogram(_) => emit.float(step, pick.of(t, 0.0)),
                     }
                 }
                 *last_t = None;
@@ -299,6 +450,8 @@ impl WindowBuffer {
             sweep,
             ts: Vec::new(),
             vs: Vec::new(),
+            hs: Vec::new(),
+            hist_bytes: 0,
             base: 0,
             lo: 0,
             hi: 0,
@@ -312,10 +465,10 @@ impl WindowBuffer {
         &mut self,
         context: &EvalContext,
         ts: &[i64],
-        vs: &[f64],
+        vs: Values<'_>,
         cursor: &mut PushCursor,
         budget: &mut WorkBudget,
-        emit: &mut impl FnMut(i64, f64),
+        emit: &mut Emit<impl FloatSink, impl HistogramSink>,
     ) -> bool {
         let Some(&last) = ts.last() else {
             return true;
@@ -389,19 +542,26 @@ impl WindowBuffer {
             } else {
                 Some(ts[until - 1])
             };
-            let (slice_ts, slice_vs) = (&ts[from..end], &vs[from..end]);
-            if self.ts.is_empty()
-                && p.at_ms.is_none()
-                && (matches!(context.kernel(), Kernel::Selector(_))
-                    || !slice_vs.iter().any(|v| is_stale(*v)))
-            {
+            let slice_ts = &ts[from..end];
+            let borrowed = match vs {
+                Values::Floats(vs) => Some(&vs[from..end]),
+                // A histogram is decoded once, into the buffer.
+                Values::Histograms { .. } => None,
+            }
+            .filter(|slice_vs| {
+                self.ts.is_empty()
+                    && p.at_ms.is_none()
+                    && (matches!(context.kernel(), Kernel::Selector(_))
+                        || !slice_vs.iter().any(|v| is_stale(*v)))
+            });
+            if let Some(slice_vs) = borrowed {
                 // Keep the borrowed fast path for small ordinary rows, but
                 // inspect/walk at most one allowance, never the whole row.
                 // If a step suspends, copy only its reachable suffix before
                 // returning: ordinals survive the change of backing storage.
                 debug_assert_eq!(self.lo, self.base);
                 debug_assert_eq!(self.hi, self.base);
-                self.advance(context, slice_ts, slice_vs, budget, emit);
+                self.advance(context, slice_ts, slice_vs, &[], budget, emit);
                 if self.next_step >= context.steps() {
                     self.retire_history();
                 } else {
@@ -409,9 +569,12 @@ impl WindowBuffer {
                     self.ts.extend_from_slice(&slice_ts[keep..]);
                     self.vs.extend_from_slice(&slice_vs[keep..]);
                     self.base = self.lo;
+                    if !self.hs.is_empty() {
+                        self.hs.resize(self.ts.len(), None);
+                    }
                 }
             } else {
-                self.append(context, slice_ts, slice_vs);
+                self.append(context, slice_ts, vs.slice(from, end));
             }
             cursor.position = until;
         }
@@ -433,7 +596,7 @@ impl WindowBuffer {
         &mut self,
         context: &EvalContext,
         budget: &mut WorkBudget,
-        emit: &mut impl FnMut(i64, f64),
+        emit: &mut Emit<impl FloatSink, impl HistogramSink>,
     ) -> bool {
         // A pinned value may still need repetition after history is retired.
         if !self.ts.is_empty() || self.pinned_value.is_some() {
@@ -446,6 +609,7 @@ impl WindowBuffer {
         }
         self.ts.clear();
         self.vs.clear();
+        self.clear_histograms();
         self.base = 0;
         self.lo = 0;
         self.hi = 0;
@@ -461,27 +625,44 @@ impl WindowBuffer {
     fn heap_size(&self) -> usize {
         self.ts.capacity() * std::mem::size_of::<i64>()
             + self.vs.capacity() * std::mem::size_of::<f64>()
+            + self.hs.capacity() * std::mem::size_of::<Option<Arc<FloatHistogram>>>()
+            + self.hist_bytes
             + self.sweep.as_ref().map_or(0, Sweep::heap_size)
     }
 
+    fn clear_histograms(&mut self) {
+        self.hs.clear();
+        self.hist_bytes = 0;
+    }
+
     /// `ts`/`vs` are the series' samples from ordinal `base` on, the
-    /// buffer's or a chunk's.
+    /// buffer's or a chunk's; `hs` is empty or parallel to them.
     fn advance(
         &mut self,
         context: &EvalContext,
         ts: &[i64],
         vs: &[f64],
+        hs: &Histograms,
         budget: &mut WorkBudget,
-        emit: &mut impl FnMut(i64, f64),
+        emit: &mut Emit<impl FloatSink, impl HistogramSink>,
     ) {
         match context.kernel() {
-            Kernel::Selector(pick) => advance_selector(self, context, ts, vs, pick, budget, emit),
+            Kernel::Selector(pick) => {
+                advance_selector(self, context, ts, vs, hs, pick, budget, emit)
+            }
             Kernel::Range(RangeOp::Func(func)) => {
-                advance_range(self, context, ts, vs, func, budget, emit)
+                advance_range(self, context, ts, vs, hs, func, budget, emit)
             }
-            Kernel::Range(RangeOp::PredictLinear(seconds)) => {
-                advance_predict_linear(self, context, ts, vs, f64::from_bits(seconds), budget, emit)
-            }
+            Kernel::Range(RangeOp::PredictLinear(seconds)) => advance_predict_linear(
+                self,
+                context,
+                ts,
+                vs,
+                hs,
+                f64::from_bits(seconds),
+                budget,
+                emit,
+            ),
         }
     }
 
@@ -491,17 +672,86 @@ impl WindowBuffer {
         &mut self,
         context: &EvalContext,
         budget: &mut WorkBudget,
-        emit: &mut impl FnMut(i64, f64),
+        emit: &mut Emit<impl FloatSink, impl HistogramSink>,
     ) {
-        let (ts, vs) = (std::mem::take(&mut self.ts), std::mem::take(&mut self.vs));
-        self.advance(context, &ts, &vs, budget, emit);
-        (self.ts, self.vs) = (ts, vs);
+        let (ts, vs, hs) = (
+            std::mem::take(&mut self.ts),
+            std::mem::take(&mut self.vs),
+            std::mem::take(&mut self.hs),
+        );
+        self.advance(context, &ts, &vs, &hs, budget, emit);
+        (self.ts, self.vs, self.hs) = (ts, vs, hs);
     }
 
     /// Copies at most one ingestion allowance. `push` already removed dead
     /// prefixes/overlap and advanced the readiness watermark before filtering
     /// stale markers: filtering must not give a later chunk a second claim.
-    fn append(&mut self, context: &EvalContext, ts: &[i64], vs: &[f64]) {
+    fn append(&mut self, context: &EvalContext, ts: &[i64], vs: Values<'_>) {
+        let (columns, start) = match vs {
+            Values::Floats(vs) => {
+                self.append_floats(context, ts, vs);
+                // Floats after a histogram keep `hs` parallel.
+                if !self.hs.is_empty() {
+                    self.hs.resize(self.ts.len(), None);
+                }
+                return;
+            }
+            Values::Histograms { columns, start } => (columns, start),
+        };
+        let p = context.params();
+        // The sweeps fold floats. The first histogram ends them for this
+        // series: the refolding path reads the same cursors.
+        self.sweep = None;
+        let keep = |buffer: &mut Self, i: usize| {
+            buffer.hs.resize(buffer.ts.len(), None);
+            let h = columns.decode(start + i);
+            buffer.hist_bytes += histogram::heap_size(&h);
+            buffer.ts.push(ts[i]);
+            buffer.vs.push(h.sum);
+            buffer.hs.push(Some(Arc::new(h)));
+        };
+        match context.kernel() {
+            Kernel::Selector(_) if p.at_ms.is_some() => {
+                if !ts.is_empty() {
+                    self.ts.clear();
+                    self.vs.clear();
+                    self.clear_histograms();
+                    keep(self, ts.len() - 1);
+                }
+            }
+            // A selector answers a step with the latest sample at or before
+            // it. One that a later sample of this run supersedes before any
+            // step's lookup can never answer, so its buckets are not copied
+            // out of the batch. The run's last sample always might.
+            Kernel::Selector(_) => {
+                let steps = context.steps();
+                for i in 0..ts.len() {
+                    let superseded_at = ts.get(i + 1).copied().unwrap_or(i64::MAX);
+                    let since_start =
+                        i128::from(ts[i]) + i128::from(p.offset_ms) - i128::from(p.start_ms);
+                    let step = i128::from(p.step_ms);
+                    let first = if since_start <= 0 {
+                        0
+                    } else {
+                        (since_start + step - 1) / step
+                    };
+                    let lookup = i128::from(p.start_ms) + first * step - i128::from(p.offset_ms);
+                    if first < steps && lookup < i128::from(superseded_at) {
+                        keep(self, i);
+                    }
+                }
+            }
+            Kernel::Range(_) => {
+                for i in 0..ts.len() {
+                    if !is_stale(columns.sum[start + i]) {
+                        keep(self, i);
+                    }
+                }
+            }
+        }
+    }
+
+    fn append_floats(&mut self, context: &EvalContext, ts: &[i64], vs: &[f64]) {
         let p = context.params();
         match context.kernel() {
             // Pinned, the selector reads only the latest sample of its window.
@@ -509,6 +759,7 @@ impl WindowBuffer {
                 if let (Some(&t), Some(&v)) = (ts.last(), vs.last()) {
                     self.ts.clear();
                     self.vs.clear();
+                    self.clear_histograms();
                     self.ts.push(t);
                     self.vs.push(v);
                 }
@@ -531,6 +782,7 @@ impl WindowBuffer {
     fn retire_history(&mut self) {
         self.ts.clear();
         self.vs.clear();
+        self.clear_histograms();
         self.base = self.hi.max(self.lo);
         self.lo = self.base;
         self.hi = self.base;
@@ -550,6 +802,16 @@ impl WindowBuffer {
         if cut > 0 && cut >= self.ts.len() / 2 {
             self.ts.drain(..cut);
             self.vs.drain(..cut);
+            if !self.hs.is_empty() {
+                let cut = cut.min(self.hs.len());
+                for h in self.hs.drain(..cut).flatten() {
+                    self.hist_bytes -= histogram::heap_size(&h);
+                }
+                // Only floats are left: back to paying nothing per step.
+                if self.hist_bytes == 0 {
+                    self.hs.clear();
+                }
+            }
             self.base = self.lo;
         }
     }
@@ -676,6 +938,187 @@ mod tests {
             out,
             vec![(0, 1.0), (2 * M, 6.0), (3 * M, 6.0), (4 * M, 6.0)]
         );
+    }
+
+    /// Histograms with these counts at these times, as a store's entries.
+    fn histogram_entries(samples: &[(i64, f64)]) -> datafusion::arrow::array::StructArray {
+        let samples: Vec<(i64, FloatHistogram)> = samples
+            .iter()
+            .map(|(t, count)| {
+                let h = FloatHistogram {
+                    count: *count,
+                    sum: *count,
+                    positive_spans: vec![promql_histogram::Span {
+                        offset: 0,
+                        length: 4,
+                    }],
+                    positive_buckets: vec![*count; 4],
+                    ..FloatHistogram::default()
+                };
+                (*t, h)
+            })
+            .collect();
+        histogram::encode_row(&samples)
+    }
+
+    /// What a kernel answered: floats and the counts of histograms.
+    #[derive(Default)]
+    struct Answers {
+        floats: Vec<(i64, f64)>,
+        histograms: Vec<(i64, f64)>,
+    }
+
+    impl Answers {
+        fn emit(&mut self) -> Emit<impl FloatSink + '_, impl HistogramSink + '_> {
+            let (floats, histograms) = (&mut self.floats, &mut self.histograms);
+            Emit {
+                floats: |t, v| floats.push((t, v)),
+                histograms: |t, h: Arc<FloatHistogram>| histograms.push((t, h.count)),
+            }
+        }
+    }
+
+    fn push_run(
+        it: &mut BufferedSeriesIterator,
+        context: &EvalContext,
+        ts: &[i64],
+        vs: Values<'_>,
+        out: &mut Answers,
+    ) {
+        assert!(it.push_values_budgeted(
+            context,
+            ts,
+            vs,
+            &mut PushCursor::default(),
+            &mut WorkBudget::new(usize::MAX),
+            &mut out.emit(),
+        ));
+    }
+
+    fn push_histograms(
+        it: &mut BufferedSeriesIterator,
+        context: &EvalContext,
+        entries: &datafusion::arrow::array::StructArray,
+        out: &mut Answers,
+    ) {
+        let columns = HistogramColumns::new(entries);
+        let run = Values::Histograms {
+            columns: &columns,
+            start: 0,
+        };
+        push_run(it, context, columns.timestamps, run, out);
+    }
+
+    fn close_into(it: &mut BufferedSeriesIterator, context: &EvalContext, out: &mut Answers) {
+        assert!(it.close_budgeted(context, &mut WorkBudget::new(usize::MAX), &mut out.emit()));
+    }
+
+    #[test]
+    fn a_selector_copies_only_the_histograms_a_step_can_pick() {
+        // Steps every 5m over samples every minute: of the ten samples one
+        // run brings, the lookup at 5m picks the sixth, and the tenth is
+        // the run's last, which a later step may still pick.
+        let p = Params {
+            start_ms: 0,
+            end_ms: 20 * M,
+            step_ms: 5 * M,
+            window_ms: 5 * M,
+            offset_ms: 0,
+            at_ms: None,
+        };
+        let context = EvalContext::new(Kernel::Selector(Pick::Value), p);
+        let mut it = BufferedSeriesIterator::new(&context);
+        let mut out = Answers::default();
+        let samples: Vec<(i64, f64)> = (0..10).map(|i| (i * M, i as f64)).collect();
+        push_histograms(&mut it, &context, &histogram_entries(&samples), &mut out);
+        // 0 answers step 0, 5m answers step 5m; 9m waits for a later run.
+        assert_eq!(out.histograms, vec![(0, 0.0), (5 * M, 5.0)]);
+        assert!(out.floats.is_empty());
+        let held: Vec<i64> = window(&it).ts.clone();
+        assert!(held.len() <= 3, "{held:?}");
+        assert_eq!(held.last(), Some(&(9 * M)));
+        close_into(&mut it, &context, &mut out);
+        assert_eq!(out.histograms, vec![(0, 0.0), (5 * M, 5.0), (10 * M, 9.0)]);
+    }
+
+    #[test]
+    fn histograms_that_leave_the_window_give_their_bytes_back() {
+        let p = Params {
+            start_ms: 0,
+            end_ms: 60 * M,
+            step_ms: M,
+            window_ms: 3 * M,
+            offset_ms: 0,
+            at_ms: None,
+        };
+        let context = EvalContext::new(Kernel::Range(RangeOp::Func(Func::CountOverTime)), p);
+        let mut it = BufferedSeriesIterator::new(&context);
+        let mut out = Answers::default();
+        let mut peak = 0;
+        for chunk in 0..6 {
+            let samples: Vec<(i64, f64)> = (0..10).map(|i| ((chunk * 10 + i) * M, 1.0)).collect();
+            push_histograms(&mut it, &context, &histogram_entries(&samples), &mut out);
+            peak = peak.max(it.size());
+        }
+        // Sixty histograms went through; a three-minute window and one
+        // ingestion run of ten is what was ever held.
+        let one =
+            histogram::heap_size(&histogram::decode_row(&histogram_entries(&[(0, 1.0)]))[0].1);
+        assert!(peak < 30 * one, "peak {peak} bytes, {one} a histogram");
+        close_into(&mut it, &context, &mut out);
+        assert_eq!(out.floats.len(), 61);
+        assert_eq!(out.floats[10], (10 * M, 3.0));
+        assert_eq!(window(&it).hist_bytes, 0);
+        assert!(window(&it).hs.is_empty());
+    }
+
+    #[test]
+    fn floats_after_a_histogram_refold_without_the_sweep() {
+        let p = Params {
+            start_ms: 0,
+            end_ms: 8 * M,
+            step_ms: M,
+            window_ms: 2 * M,
+            offset_ms: 0,
+            at_ms: None,
+        };
+        let context = EvalContext::new(Kernel::Range(RangeOp::Func(Func::Increase)), p);
+        let mut it = BufferedSeriesIterator::new(&context);
+        let mut out = Answers::default();
+        push_run(
+            &mut it,
+            &context,
+            &[0, M, 2 * M],
+            Values::Floats(&[1.0, 2.0, 3.0]),
+            &mut out,
+        );
+        assert!(window(&it).sweep.is_some());
+        push_histograms(
+            &mut it,
+            &context,
+            &histogram_entries(&[(3 * M, 1.0), (4 * M, 3.0), (5 * M, 6.0)]),
+            &mut out,
+        );
+        assert!(window(&it).sweep.is_none());
+        push_run(
+            &mut it,
+            &context,
+            &[6 * M, 7 * M, 8 * M],
+            Values::Floats(&[10.0, 12.0, 15.0]),
+            &mut out,
+        );
+        close_into(&mut it, &context, &mut out);
+        // Windows of floats alone, then of both (nothing), then of
+        // histograms alone, both again, and floats alone once more.
+        let float_steps: Vec<i64> = out.floats.iter().map(|(t, _)| *t).collect();
+        assert_eq!(float_steps, vec![M, 2 * M, 7 * M, 8 * M]);
+        let histogram_steps: Vec<i64> = out.histograms.iter().map(|(t, _)| *t).collect();
+        assert_eq!(histogram_steps, vec![4 * M, 5 * M]);
+        // (3m, 5m] holds counts 3 and 6 a minute apart: an increase of 3,
+        // extrapolated a minute back to the window's start, so doubled.
+        // (2m, 4m] holds 1 and 3: its increase of 2 reaches zero half a
+        // minute back, and is extrapolated no further.
+        assert_eq!(out.histograms, vec![(4 * M, 3.0), (5 * M, 6.0)]);
     }
 
     #[test]
@@ -1035,7 +1478,11 @@ mod tests {
         loop {
             let before = out.len();
             let mut budget = WorkBudget::new(units);
-            let done = it.close_budgeted(&context, &mut budget, |t, v| out.push((t, v)));
+            let done = it.close_budgeted(
+                &context,
+                &mut budget,
+                &mut Emit::floats(|t, v| out.push((t, v))),
+            );
             assert!(out.len() - before <= units);
             if done {
                 break;
@@ -1118,13 +1565,18 @@ mod tests {
         let mut it = BufferedSeriesIterator::new(&context);
         it.push(&context, &ts, &vs, |_, _| panic!("first step is not ready"));
         let mut out = Vec::new();
-        assert!(
-            !it.close_budgeted(&context, &mut WorkBudget::new(20_000), |t, v| out
-                .push((t, v)))
-        );
+        assert!(!it.close_budgeted(
+            &context,
+            &mut WorkBudget::new(20_000),
+            &mut Emit::floats(|t, v| out.push((t, v)))
+        ));
         assert_eq!(window(&it).next_step, 1);
         assert_eq!(out, vec![(10_000, 10_000.)]);
-        assert!(!it.close_budgeted(&context, &mut WorkBudget::new(1), |t, v| out.push((t, v))));
+        assert!(!it.close_budgeted(
+            &context,
+            &mut WorkBudget::new(1),
+            &mut Emit::floats(|t, v| out.push((t, v)))
+        ));
         assert_eq!(window(&it).next_step, 2);
         it.close(&context, |t, v| out.push((t, v)));
         assert_eq!(
@@ -1187,7 +1639,11 @@ mod tests {
             assert_eq!(window(&it).next_step, 1);
             let before = window(&it).next_step;
             assert!(
-                !it.close_budgeted(&context, &mut WorkBudget::new(units), |_, _| {}),
+                !it.close_budgeted(
+                    &context,
+                    &mut WorkBudget::new(units),
+                    &mut Emit::floats(|_, _| {})
+                ),
                 "units={units}: one budgeted close finished all 10000 steps"
             );
             let ran = window(&it).next_step - before;
@@ -1415,7 +1871,9 @@ mod tests {
                 let SeriesState::Candidate { sample, last_t } = &it.state else {
                     panic!("one step allocated a window");
                 };
-                let (t, v) = sample.unwrap();
+                let Some((t, Value::Float(v))) = sample.clone() else {
+                    panic!("expected a float candidate");
+                };
                 assert_eq!(t, 9 * M);
                 assert_eq!(v.to_bits(), value.to_bits());
                 assert_eq!(*last_t, Some(12 * M));

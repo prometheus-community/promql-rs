@@ -5,10 +5,10 @@ exponential and custom buckets, traversal, validation, arithmetic, reset
 detection, quantiles, fractions, variance, and trimming. See
 [`UPSTREAM.md`](UPSTREAM.md) for the pinned revision and function map.
 
-This crate is independent of Arrow and DataFusion. **It does not yet enable
-native-histogram queries in `promql-engine`.** The engine still has a float-only
-source/result schema and evaluator; its conformance harness skips histogram
-fixtures it cannot load.
+This crate is independent of Arrow and DataFusion. `promql-engine` carries
+histograms between operators in Arrow (its `histogram` module) and decodes a
+sample into a `FloatHistogram` here wherever one is computed on; `promql-parser`
+builds them from `{{…}}` series descriptors.
 
 ## Ownership and validation
 

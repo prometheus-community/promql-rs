@@ -2959,6 +2959,7 @@ version = "0.1.0"
 dependencies = [
  "libtest-mimic",
  "promql-engine",
+ "promql-histogram",
  "promql-parser",
  "regex",
  "serde",
@@ -2978,6 +2979,7 @@ dependencies = [
  "insta",
  "jemalloc_pprof",
  "promql-common",
+ "promql-histogram",
  "promql-parser",
  "regex",
  "serde",

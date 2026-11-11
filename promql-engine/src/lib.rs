@@ -8,6 +8,10 @@
 //! step grid, `offset`, `@`, functions and aggregations — happens on the
 //! engine's side of that trait as ordinary DataFusion plans and functions.
 //!
+//! A series' samples are floats, native histograms ([`histogram`]), or both
+//! over time, in two sibling list columns. A query over floats alone has no
+//! histograms column and plans as if there were no such thing.
+//!
 //! `docs/series-source.md` is the design note for the trait and the shape.
 //! Above them, `plan` turns a parsed expression into a `LogicalPlan`
 //! over the store's plan, with typed selector/range evaluation that lowers
@@ -37,12 +41,17 @@ pub(crate) mod engine;
 pub(crate) mod error;
 pub(crate) mod explain;
 pub(crate) mod function;
+pub mod histogram;
+pub(crate) mod histogram_agg;
+pub(crate) mod histogram_classic;
+pub mod histogram_fn;
 pub(crate) mod labels;
 mod labelset;
 mod matcher;
 pub mod math; // benches/kernels.rs
 pub(crate) mod matrix;
 pub(crate) mod memory;
+mod mixed;
 pub(crate) mod params;
 pub(crate) mod plan;
 pub mod range; // benches/kernels.rs

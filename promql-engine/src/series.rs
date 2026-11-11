@@ -11,8 +11,14 @@
 //! floats       List<Struct<timestamp: Timestamp(ms), value: Float64>>
 //! block_start  Timestamp(ms)                 window ends the block answers, from here
 //! block_end    Timestamp(ms)                 to here, exclusive
+//! histograms   List<Struct<timestamp, …>>    optional; see [`crate::histogram`]
 //! series_id    UInt64 | FixedSizeBinary(n>0) mandatory for raw sources, absent from results
 //! ```
+//!
+//! A series' samples are floats, native histograms, or both over time:
+//! `floats` and `histograms` are sibling lists, and a timestamp is in one
+//! of them. A batch without histograms simply has no `histograms` column,
+//! so a float-only store and every float-only plan carry nothing for them.
 //!
 //! A store cuts its answer into blocks along its own time units and
 //! stamps every series with its block, constant over the block. A block
@@ -81,7 +87,10 @@ use datafusion::arrow::datatypes::{
 };
 use datafusion::arrow::error::ArrowError;
 
+use promql_histogram::FloatHistogram;
+
 use crate::error::SeriesError;
+use crate::histogram::{self, HISTOGRAMS};
 
 /// A message-only [`SeriesError`]. A macro rather than a helper so each
 /// site keeps `format!`'s inline captures.
@@ -156,6 +165,22 @@ pub fn schema(label_names: &[String]) -> SchemaRef {
     ]))
 }
 
+/// [`schema`] with the `histograms` column, for batches that carry native
+/// histogram samples. It follows the block columns so the float shape is a
+/// prefix of it.
+pub fn schema_with_histograms(label_names: &[String]) -> SchemaRef {
+    let mut fields = schema(label_names).fields().to_vec();
+    fields.push(Arc::new(histogram::histograms_field()));
+    Arc::new(Schema::new(fields))
+}
+
+/// The sample list columns `schema` has, floats first.
+pub(crate) fn sample_columns(schema: &Schema) -> impl Iterator<Item = &'static str> + '_ {
+    [FLOATS, HISTOGRAMS]
+        .into_iter()
+        .filter(|name| schema.field_with_name(name).is_ok())
+}
+
 /// The block a series belongs to: it answers the steps whose window end
 /// lies in `[start_ms, end_ms)`, and holds every sample those windows
 /// reach.
@@ -218,14 +243,28 @@ pub fn block_of(batch: &RecordBatch, row: usize) -> Block {
 /// the batch.
 pub fn validate(schema: &Schema) -> Result<(), SeriesError> {
     let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-    if names != [LABELS, FLOATS, BLOCK_START, BLOCK_END]
-        && names != [LABELS, FLOATS, BLOCK_START, BLOCK_END, SERIES_ID]
-    {
+    let rest = names
+        .strip_prefix(&[LABELS, FLOATS, BLOCK_START, BLOCK_END])
+        .map(|rest| rest.strip_prefix(&[HISTOGRAMS]).unwrap_or(rest));
+    if !matches!(rest, Some([]) | Some([SERIES_ID])) {
         return Err(invalid!(
             "expected exactly the columns `{LABELS}`, `{FLOATS}`, `{BLOCK_START}` and \
-             `{BLOCK_END}`, optionally followed by `{SERIES_ID}`, in that order, got {}",
+             `{BLOCK_END}`, optionally followed by `{HISTOGRAMS}` and then `{SERIES_ID}`, in \
+             that order, got {}",
             names.join(", ")
         ));
+    }
+    if let Ok(histograms) = schema.field_with_name(HISTOGRAMS) {
+        if histograms.is_nullable() {
+            return Err(invalid!("`{HISTOGRAMS}` must not be nullable"));
+        }
+        if !histogram::is_histograms_type(histograms.data_type()) {
+            return Err(invalid!(
+                "`{HISTOGRAMS}` is {}, expected {}",
+                histograms.data_type(),
+                histogram::histograms_type()
+            ));
+        }
     }
 
     if let Ok(id) = schema.field_with_name(SERIES_ID) {
@@ -346,6 +385,9 @@ pub struct Series {
     labels: StructArray,
     /// The `(timestamp, value)` structs, timestamps strictly ascending.
     samples: StructArray,
+    /// The native histogram samples, `None` where the batch had no
+    /// `histograms` column. Prometheus's `Series.Histograms`.
+    histograms: Option<StructArray>,
 }
 
 impl Series {
@@ -406,7 +448,53 @@ impl Series {
             ],
             None,
         );
-        Ok(Series { labels, samples })
+        Ok(Series {
+            labels,
+            samples,
+            histograms: None,
+        })
+    }
+
+    /// This series with native histogram samples, ascending by timestamp.
+    /// A timestamp is a float or a histogram, never both.
+    pub fn with_histograms(
+        mut self,
+        histograms: Vec<(i64, FloatHistogram)>,
+    ) -> Result<Series, SeriesError> {
+        if let Some(w) = histograms.windows(2).find(|w| w[0].0 >= w[1].0) {
+            return Err(invalid!(
+                "histogram timestamps must be strictly ascending; {} is followed by {}",
+                w[0].0,
+                w[1].0
+            ));
+        }
+        let floats = self.timestamps();
+        if let Some((t, _)) = histograms
+            .iter()
+            .find(|(t, _)| floats.binary_search(t).is_ok())
+        {
+            return Err(invalid!(
+                "timestamp {t} holds both a float and a histogram sample"
+            ));
+        }
+        self.histograms = (!histograms.is_empty()).then(|| histogram::encode_row(&histograms));
+        Ok(self)
+    }
+
+    /// The native histogram samples, decoded, ascending by timestamp.
+    pub fn histograms(&self) -> Vec<(i64, FloatHistogram)> {
+        self.histograms
+            .as_ref()
+            .map_or_else(Vec::new, histogram::decode_row)
+    }
+
+    /// The timestamps of the native histogram samples.
+    pub fn histogram_timestamps(&self) -> &[i64] {
+        self.histograms.as_ref().map_or(&[], |h| {
+            h.column(0)
+                .as_primitive::<TimestampMillisecondType>()
+                .values()
+        })
     }
 
     /// The value of one label, `""` when the series does not have it, as
@@ -574,11 +662,34 @@ pub fn encode(
         None,
     );
     let [block_start, block_end] = block.columns(series.len());
-    RecordBatch::try_new(
-        schema(&names),
-        vec![Arc::new(labels), Arc::new(samples), block_start, block_end],
-    )
-    .map_err(SeriesError::from)
+    let mut columns: Vec<ArrayRef> =
+        vec![Arc::new(labels), Arc::new(samples), block_start, block_end];
+    // A batch has the column when a series in it has a histogram. A store
+    // that streams several batches builds them itself under one schema.
+    if series.iter().all(|s| s.histograms.is_none()) {
+        return RecordBatch::try_new(schema(&names), columns).map_err(SeriesError::from);
+    }
+    let mut offsets: Vec<i32> = Vec::with_capacity(series.len() + 1);
+    offsets.push(0);
+    let mut total = 0usize;
+    let mut parts: Vec<&dyn Array> = Vec::new();
+    for s in series {
+        if let Some(h) = &s.histograms {
+            total += h.len();
+            parts.push(h);
+        }
+        offsets.push(
+            i32::try_from(total)
+                .map_err(|_| "more than i32::MAX histogram samples in one batch".to_string())?,
+        );
+    }
+    columns.push(Arc::new(ListArray::new(
+        histogram::histogram_item(),
+        OffsetBuffer::new(offsets.into()),
+        concat(&parts)?,
+        None,
+    )));
+    RecordBatch::try_new(schema_with_histograms(&names), columns).map_err(SeriesError::from)
 }
 
 /// The rows of canonical batches, as zero-copy slices, one [`Series`]
@@ -597,13 +708,18 @@ pub fn decode(batches: &[RecordBatch]) -> Result<Vec<Series>, SeriesError> {
             .column_by_name(FLOATS)
             .expect("validated")
             .as_list::<i32>();
+        let histograms = batch.column_by_name(HISTOGRAMS).map(|c| c.as_list::<i32>());
         for row in 0..batch.num_rows() {
-            if samples.value_length(row) == 0 {
+            let histograms = histograms
+                .filter(|h| h.value_length(row) > 0)
+                .map(|h| h.value(row).as_struct().clone());
+            if samples.value_length(row) == 0 && histograms.is_none() {
                 continue;
             }
             out.push(Series {
                 labels: labels.slice(row, 1),
                 samples: samples.value(row).as_struct().clone(),
+                histograms,
             });
         }
     }
@@ -629,10 +745,22 @@ pub fn coalesce(series: Vec<Series>) -> Result<Vec<Series>, SeriesError> {
             1 => out.push(run.pop().expect("one")),
             _ => {
                 let samples = coalesce_samples(run)?;
-                out.push(Series {
+                let histograms = coalesce_histograms(run)?;
+                let joined = Series {
                     labels: run[0].labels.clone(),
                     samples,
-                });
+                    histograms,
+                };
+                // Each list is checked against itself above; a float and a
+                // histogram of two rows can still share a timestamp.
+                if joined
+                    .histogram_timestamps()
+                    .iter()
+                    .any(|t| joined.timestamps().binary_search(t).is_ok())
+                {
+                    return Err(invalid!("{}", crate::labelset::SAME_LABELSET));
+                }
+                out.push(joined);
                 run.clear();
             }
         }
@@ -707,6 +835,39 @@ fn coalesce_samples(run: &[Series]) -> Result<StructArray, SeriesError> {
     )?)
 }
 
+/// [`coalesce_samples`] for the rows' histograms. Results are small next
+/// to their buckets, so the interleaved case decodes and re-encodes rather
+/// than merging twelve children by hand.
+fn coalesce_histograms(run: &[Series]) -> Result<Option<StructArray>, SeriesError> {
+    let parts: Vec<&StructArray> = run.iter().filter_map(|s| s.histograms.as_ref()).collect();
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    let mut last = None;
+    let chronological = parts.iter().all(|h| {
+        let ts = h
+            .column(0)
+            .as_primitive::<TimestampMillisecondType>()
+            .values();
+        let separated = last.is_none_or(|last| last < ts[0]);
+        last = ts.last().copied();
+        separated
+    });
+    if chronological {
+        let parts: Vec<&dyn Array> = parts.iter().map(|h| *h as &dyn Array).collect();
+        return Ok(Some(concat(&parts)?.as_struct().clone()));
+    }
+    let mut all: Vec<(i64, FloatHistogram)> = parts
+        .iter()
+        .flat_map(|h| histogram::decode_row(h))
+        .collect();
+    all.sort_by_key(|(t, _)| *t);
+    if all.windows(2).any(|w| w[0].0 == w[1].0) {
+        return Err(invalid!("{}", crate::labelset::SAME_LABELSET));
+    }
+    Ok(Some(histogram::encode_row(&all)))
+}
+
 /// A canonical batch with every empty-samples row removed.
 ///
 /// Pulled out of [`decode`] so the engine's public API can hand back
@@ -716,48 +877,53 @@ fn coalesce_samples(run: &[Series]) -> Result<StructArray, SeriesError> {
 /// samples, so only row-sized columns and offsets need filtering; copying
 /// the sample children would duplicate the answer for no semantic change.
 pub fn drop_empty(batch: &RecordBatch) -> RecordBatch {
-    let samples = batch
-        .column_by_name(FLOATS)
-        .expect("validated")
-        .as_list::<i32>();
-    if (0..batch.num_rows()).all(|row| samples.value_length(row) > 0) {
+    let schema = batch.schema();
+    let lists: Vec<(&str, &ListArray)> = sample_columns(&schema)
+        .map(|name| {
+            let column = batch.column_by_name(name).expect("present");
+            (name, column.as_list::<i32>())
+        })
+        .collect();
+    // A row is a series while either list holds a sample.
+    let kept = |row: usize| lists.iter().any(|(_, list)| list.value_length(row) > 0);
+    if (0..batch.num_rows()).all(kept) {
         return batch.clone();
     }
-    let mask = BooleanArray::from_iter(
-        (0..batch.num_rows()).map(|row| Some(samples.value_length(row) > 0)),
-    );
+    let mask = BooleanArray::from_iter((0..batch.num_rows()).map(|row| Some(kept(row))));
     let predicate = FilterBuilder::new(&mask).optimize().build();
-    let mut offsets = Vec::with_capacity(predicate.count() + 1);
-    // Sliced lists may start inside their retained child array.
-    offsets.push(samples.offsets()[0]);
-    for row in 0..batch.num_rows() {
-        if mask.value(row) {
-            offsets.push(samples.offsets()[row + 1]);
+    let relist = |list: &ListArray| -> ArrayRef {
+        let mut offsets = Vec::with_capacity(predicate.count() + 1);
+        // Sliced lists may start inside their retained child array. A
+        // dropped row is empty in every list, so the kept rows' ends are
+        // still the boundaries.
+        offsets.push(list.offsets()[0]);
+        for row in 0..batch.num_rows() {
+            if mask.value(row) {
+                offsets.push(list.offsets()[row + 1]);
+            }
         }
-    }
-    let DataType::List(item) = samples.data_type() else {
-        unreachable!("validated samples list")
+        let DataType::List(item) = list.data_type() else {
+            unreachable!("validated samples list")
+        };
+        Arc::new(ListArray::new(
+            item.clone(),
+            OffsetBuffer::new(offsets.into()),
+            Arc::clone(list.values()),
+            None,
+        ))
     };
-    let kept: ArrayRef = Arc::new(ListArray::new(
-        item.clone(),
-        OffsetBuffer::new(offsets.into()),
-        Arc::clone(samples.values()),
-        None,
-    ));
-    let columns = batch
-        .schema()
+    let columns = schema
         .fields()
         .iter()
         .zip(batch.columns())
-        .map(|(field, column)| {
-            if field.name() == FLOATS {
-                Arc::clone(&kept)
-            } else {
-                predicate
+        .map(
+            |(field, column)| match lists.iter().find(|(name, _)| name == field.name()) {
+                Some((_, list)) => relist(list),
+                None => predicate
                     .filter(column.as_ref())
-                    .expect("mask has one entry per row")
-            }
-        })
+                    .expect("mask has one entry per row"),
+            },
+        )
         .collect();
     RecordBatch::try_new(batch.schema(), columns)
         .expect("canonical columns with matching row counts")
@@ -852,10 +1018,28 @@ fn replace_column(
 /// all lie inside the range — the common case for a store that already
 /// pruned by time — is handed back untouched.
 pub fn clip(batch: &RecordBatch, start_ms: i64, end_ms: i64) -> Result<RecordBatch, SeriesError> {
-    let samples = batch
-        .column_by_name(FLOATS)
-        .expect("canonical")
-        .as_list::<i32>();
+    let schema = batch.schema();
+    let mut clipped = batch.clone();
+    for name in sample_columns(&schema) {
+        let list = batch
+            .column_by_name(name)
+            .expect("present")
+            .as_list::<i32>();
+        if let Some(list) = clip_list(list, start_ms, end_ms)? {
+            let field = schema.field_with_name(name).expect("present").clone();
+            clipped = replace_column(&clipped, name, field, Arc::new(list))?;
+        }
+    }
+    Ok(clipped)
+}
+
+/// [`clip`] for one sample list, floats or histograms: only the entries'
+/// first child, the timestamp, is read. `None` is "nothing to clip".
+fn clip_list(
+    samples: &ListArray,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<Option<ListArray>, SeriesError> {
     let entries = samples.values().as_struct();
     let timestamps = entries
         .column_by_name(TIMESTAMP)
@@ -868,9 +1052,9 @@ pub fn clip(batch: &RecordBatch, start_ms: i64, end_ms: i64) -> Result<RecordBat
     // mask run-wise (the gap before the range, then the range itself) in
     // one pass over each row rather than a `set_bit` per kept sample.
     let offsets = samples.offsets();
-    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(batch.num_rows());
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(samples.len());
     let mut untouched = true;
-    for row in 0..batch.num_rows() {
+    for row in 0..samples.len() {
         let (from, to) = (offsets[row] as usize, offsets[row + 1] as usize);
         let window = &timestamps[from..to];
         let lo = from + window.partition_point(|t| *t < start_ms);
@@ -879,7 +1063,7 @@ pub fn clip(batch: &RecordBatch, start_ms: i64, end_ms: i64) -> Result<RecordBat
         ranges.push((lo, hi));
     }
     if untouched {
-        return Ok(batch.clone());
+        return Ok(None);
     }
 
     let mut mask = BooleanBufferBuilder::new(entries.len());
@@ -897,18 +1081,15 @@ pub fn clip(batch: &RecordBatch, start_ms: i64, end_ms: i64) -> Result<RecordBat
     mask.append_n(entries.len() - cursor, false);
 
     let entries = filter(entries, &BooleanArray::new(mask.finish(), None))?;
-    let samples = ListArray::new(
-        sample_item(),
+    let DataType::List(item) = samples.data_type() else {
+        unreachable!("a samples list")
+    };
+    Ok(Some(ListArray::new(
+        item.clone(),
         OffsetBuffer::new(clipped.into()),
         entries,
         None,
-    );
-    replace_column(
-        batch,
-        FLOATS,
-        Field::new(FLOATS, floats_type(), false),
-        Arc::new(samples),
-    )
+    )))
 }
 
 /// The timestamp and value children of a samples list's entries. Callers

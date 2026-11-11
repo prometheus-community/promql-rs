@@ -166,46 +166,44 @@ fn expect_assertions_are_recorded() {
     );
 }
 
-/// Native histograms are the one shape we knowingly cannot read, and
-/// they turn up on both sides — in `load` lines and in expected results.
-/// Every other rejection is a parser bug, so the two are asserted apart.
+/// Every series line of the corpus is read, in `load` blocks and in
+/// expected results, native-histogram descriptors included: they turn up
+/// on both sides, and a line this cannot read is an eval that is skipped
+/// rather than judged.
 #[test]
-fn native_histograms_are_the_only_thing_we_cannot_read() {
+fn every_series_line_is_read_native_histograms_included() {
     let scripts = corpus();
-    let mut in_loads = 0;
-    let mut in_expectations = 0;
-    let mut parse_errors = Vec::new();
+    let mut unread = Vec::new();
+    let mut histograms_loaded = 0;
+    let mut histograms_expected = 0;
 
     for l in scripts.iter().flat_map(Script::loads) {
-        for u in l.block.unsupported() {
-            in_loads += 1;
-            if u.reason != script::Unsupported::NativeHistogram {
-                parse_errors.push(u.text.clone());
-            }
-        }
+        unread.extend(l.block.unsupported().map(|u| u.text.clone()));
+        histograms_loaded += l
+            .block
+            .parsed()
+            .filter(|d| d.values.iter().any(|v| v.histogram.is_some()))
+            .count();
     }
     for e in scripts.iter().flat_map(Script::evals) {
-        for u in &e.unsupported {
-            in_expectations += 1;
-            if u.reason != script::Unsupported::NativeHistogram {
-                parse_errors.push(u.text.clone());
-            }
+        unread.extend(e.unsupported.iter().map(|u| u.text.clone()));
+        if let script::Expected::Series(rows) = &e.expected {
+            histograms_expected += rows
+                .iter()
+                .filter(|r| r.desc.values.iter().any(|v| v.histogram.is_some()))
+                .count();
         }
     }
 
     assert!(
-        in_loads > 0,
-        "native-histogram load lines should be recorded"
+        unread.is_empty(),
+        "{} unread row(s): {unread:#?}",
+        unread.len()
     );
-    assert!(
-        in_expectations > 0,
-        "native-histogram expected rows should be recorded"
-    );
-    assert!(
-        parse_errors.is_empty(),
-        "{} row(s) rejected for reasons other than native histograms: {parse_errors:#?}",
-        parse_errors.len()
-    );
+    // Hundreds of each: the corpus's histogram half is really being read
+    // as histograms, not skipped some other way.
+    assert!(histograms_loaded > 200, "{histograms_loaded} loaded");
+    assert!(histograms_expected > 200, "{histograms_expected} expected");
 }
 
 #[test]

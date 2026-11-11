@@ -12,6 +12,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use datafusion::arrow::datatypes::{Field, FieldRef, Schema};
 use datafusion::catalog::Session;
 use datafusion::common::{internal_err, DFSchema, DFSchemaRef, Result};
 use datafusion::execution::context::QueryPlanner;
@@ -21,6 +22,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
 
 use crate::buffer::Kernel;
+use crate::histogram::HISTOGRAMS;
 use crate::params::Params;
 use crate::series::{BLOCK_END, BLOCK_START, FLOATS, LABELS, SERIES_ID};
 
@@ -52,10 +54,7 @@ impl SeriesEval {
         // Bind by name, retaining field and schema metadata but not raw
         // identity uniqueness. Physical construction binds the ID type.
         input.schema().field_with_unqualified_name(SERIES_ID)?;
-        let fields = [LABELS, FLOATS, BLOCK_START, BLOCK_END]
-            .into_iter()
-            .map(|name| input.schema().field_with_unqualified_name(name).cloned())
-            .collect::<Result<Vec<_>>>()?;
+        let fields = evaluated_fields(input.schema().as_arrow(), kernel)?;
         let schema = Arc::new(DFSchema::from_unqualified_fields(
             fields.into(),
             input.schema().metadata().clone(),
@@ -109,14 +108,58 @@ impl UserDefinedLogicalNodeCore for SeriesEval {
         // Samples-only output still needs full raw identity, samples and
         // blocks. Speculative extracted columns are not output aliases.
         let schema = self.input.schema();
-        let columns = [LABELS, FLOATS, BLOCK_START, BLOCK_END, SERIES_ID]
-            .into_iter()
-            .map(|name| schema.index_of_column_by_name(None, name))
-            .collect::<Option<Vec<_>>>()?;
+        // Whichever sample columns the source has; identity and blocks always.
+        let columns = [
+            LABELS,
+            FLOATS,
+            BLOCK_START,
+            BLOCK_END,
+            HISTOGRAMS,
+            SERIES_ID,
+        ]
+        .into_iter()
+        .filter(|name| {
+            !matches!(*name, FLOATS | HISTOGRAMS)
+                || schema.index_of_column_by_name(None, name).is_some()
+        })
+        .map(|name| schema.index_of_column_by_name(None, name))
+        .collect::<Option<Vec<_>>>()?;
         Some(vec![columns])
     }
     // Default predicate/limit behavior prevents pushdown through evaluation:
     // a raw chunk is not an evaluated output row.
+}
+
+/// The evaluated columns for a raw input: `labels`, `floats` and the block
+/// always, in that order, then `histograms` where the source has them and
+/// `kernel` can answer with one.
+///
+/// `floats` is there even for a source of only histograms. Every operator
+/// above evaluation reads it, and one that maps histograms to floats
+/// (`histogram_count`, `count_over_time`) writes it; an always-present
+/// column whose rows may be empty costs four bytes a row, where an
+/// optional one would fork every operator's plan. Field and nested
+/// metadata of the source's columns is retained.
+pub(crate) fn evaluated_fields(input: &Schema, kernel: Kernel) -> Result<Vec<FieldRef>> {
+    let source = |name: &str| input.field_with_name(name).cloned().map(Arc::new);
+    // `column_with_name`, not `field_with_name`: an absent column is the
+    // common case here, and the latter formats an error to say so.
+    let has = |name: &str| input.column_with_name(name).is_some();
+    let histograms = has(HISTOGRAMS);
+    let floats = match has(FLOATS) || !histograms {
+        true => source(FLOATS)?,
+        false => Arc::new(Field::new(FLOATS, crate::series::floats_type(), false)),
+    };
+    let mut fields = vec![
+        source(LABELS)?,
+        floats,
+        source(BLOCK_START)?,
+        source(BLOCK_END)?,
+    ];
+    if histograms && kernel.emits_histograms() {
+        fields.push(source(HISTOGRAMS)?);
+    }
+    Ok(fields)
 }
 
 #[derive(Debug)]

@@ -173,9 +173,8 @@ pub struct Eval {
     pub range_vector: Option<Range>,
     pub expect: Expect,
     pub expected: Expected,
-    /// Expected rows this parser cannot read — native-histogram
-    /// descriptors, at time of writing, which appear in expected
-    /// results just as they do in load lines.
+    /// Expected rows the series grammar cannot read. None in the
+    /// vendored corpus today; an upstream re-pin can bring one.
     ///
     /// Recorded rather than raised, and recorded rather than dropped:
     /// an eval whose expectation we can only half-read must be skipped,
@@ -484,12 +483,7 @@ fn parse_eval(file: &str, lines: &[&str], i: usize) -> Result<(usize, Eval), Err
         // that `ordered` positions stay faithful to the source text.
         pos += 1;
 
-        // The grammar reads native-histogram descriptors, but nothing
-        // past it does yet: a row holding one stays the known gap.
-        let desc = promql_parser::parse_series_desc(row)
-            .ok()
-            .filter(|d| d.values.iter().all(|v| v.histogram.is_none()));
-        let Some(desc) = desc else {
+        let Ok(desc) = promql_parser::parse_series_desc(row) else {
             // A native-histogram descriptor is a known gap, not a
             // broken corpus. Anything else is a parser bug worth
             // seeing, so the two are kept apart.
@@ -644,8 +638,8 @@ pub struct LoadBlock {
     /// The sample interval from the directive line, in seconds.
     pub interval_secs: f64,
     /// Whether the directive was `load_with_nhcb` rather than `load`.
-    /// Upstream derives classic-histogram buckets from those, so the
-    /// distinction is recorded now and acted on when histograms land.
+    /// Upstream then also stores the block's classic histograms as
+    /// native ones with custom buckets (`appendCustomHistogram`).
     pub with_nhcb: bool,
     /// One entry per series line, in source order.
     pub series: Vec<SeriesLine>,
@@ -691,8 +685,9 @@ pub struct UnsupportedLine {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unsupported {
-    /// A `{{schema:1 ...}}` native-histogram descriptor. The grammar
-    /// rules behind those are still on `promql-sync`'s skip list.
+    /// A line holding a `{{schema:1 ...}}` native-histogram descriptor
+    /// that the series grammar still refused. It marks the eval as a
+    /// native-histogram one, so it is categorised as such, not as core.
     NativeHistogram,
     /// Anything else the parser rejected. Treated as a real failure by
     /// the corpus tests rather than an accepted gap.
@@ -726,9 +721,8 @@ fn parse_load_block(file: &str, line: usize, raw: &str) -> Result<LoadBlock, Err
 
     let series = lines
         .map(|l| match promql_parser::parse_series_desc(l) {
-            // As for expected rows: read, but not yet loadable.
-            Ok(sd) if sd.values.iter().all(|v| v.histogram.is_none()) => SeriesLine::Parsed(sd),
-            _ => SeriesLine::Unsupported(UnsupportedLine {
+            Ok(sd) => SeriesLine::Parsed(sd),
+            Err(_) => SeriesLine::Unsupported(UnsupportedLine {
                 text: l.to_string(),
                 reason: if l.contains("{{") {
                     Unsupported::NativeHistogram

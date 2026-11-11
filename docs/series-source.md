@@ -104,25 +104,87 @@ block and one chunk per series; it still supplies mandatory IDs.
 ```text
 labels       Struct<{name}: Utf8View, …>    one field per label name, sorted
 floats       List<Struct<timestamp: Timestamp(ms), value: Float64>>
+histograms   List<Struct<timestamp: Timestamp(ms), …>>   native histograms
 block_start  Timestamp(ms)                  inclusive window-end boundary
 block_end    Timestamp(ms)                  exclusive; both constant within a block
 series_id    UInt64 | FixedSizeBinary(n>0)  mandatory raw identity, internal to evaluation
 ```
 
 One row is one chunk of one full label set in one block, with at least one
-sample. Samples within a chunk ascend by timestamp. Nothing is nullable.
+sample. A selection has `floats`, `histograms`, or both
+([sample types](#sample-types)). Samples within a list ascend by timestamp.
+Nothing is nullable.
 An absent label is `""`, not NULL. Block columns are plain millisecond timestamp
 arrays, not run-end encoded. `Float64` preserves StaleNaN's exact `0x7ff0_0000_0000_0002` bits;
 nothing may cast it through an ordinary NaN.
 
 Columns bind by name, so sources may reorder them and supply extra columns.
-Evaluation binds `labels`, `floats`, both edges and `series_id`; it emits the
-canonical four fields in that order, preserving field and schema metadata.
+Evaluation binds `labels`, the sample columns the selection has, both edges and
+`series_id`; it emits the canonical four fields in that order, then
+`histograms` where it can answer with one, preserving field and schema
+metadata.
 IDs and other source-only columns never escape evaluation. `series.rs` defines
 the shape; `series::validate` is an explicit utility, not a required
 source-boundary audit. Canonical evaluated data has four columns; a canonical
 raw batch also has its fixed-width ID. Chunk-splitting helpers preserve every
 non-sample column, including IDs and source-specific columns.
+
+### Sample types
+
+A series' samples are floats, native histograms, or both over time: a metric
+migrated from a classic to a native histogram is one series that changes type.
+The two types are sibling list columns, not one list of a union:
+
+```text
+histograms  List<Struct<
+  timestamp: Timestamp(ms),
+  counter_reset_hint: UInt8,       0 unknown, 1 reset, 2 not reset, 3 gauge
+  schema: Int32,                   -4..8 exponential, -53 custom buckets
+  count, sum, zero_threshold, zero_count: Float64,
+  negative_spans: List<Struct<offset: Int32, length: UInt32>>,
+  negative_buckets: List<Float64>,
+  positive_spans: List<Struct<offset: Int32, length: UInt32>>,
+  positive_buckets: List<Float64>,
+  custom_values: List<Float64>,
+>>
+```
+
+The entry is Prometheus's `histogram.FloatHistogram` field for field: spans and
+absolute bucket counts as they are, neither expanded to bounds nor serialized
+to bytes. `histogram::histograms_type` builds the type and
+`histogram::encode_row` one row of it.
+
+- **Either column may be absent, not both.** The schema is fixed per selection
+  and planned against, so a store without native histograms omits `histograms`
+  and its queries plan exactly as they did before the column existed. A
+  selection of only histograms may omit `floats`. A store that cannot know
+  before reading supplies both; a row's list for the type it lacks is empty.
+- **A timestamp of a series is in one list.** Evaluation merges the two lists
+  of a chunk by time and treats the result as one series: the latest sample
+  before a step is the latest of either type. Like contiguity this is trusted,
+  not checked. Should both lists hold a timestamp, the float is the sample.
+- **Staleness** is `sum` holding StaleNaN's exact bits, as upstream's
+  `value.IsStaleNaN(h.Sum)`. A stale histogram's other fields are not read.
+- **Counter reset hints are the store's to supply**, as its chunks know them:
+  `gauge` for a gauge histogram, `not_reset` where the store knows the sample
+  continues its predecessor, `unknown` otherwise. The engine detects resets
+  itself where the hint does not decide, with `FloatHistogram.DetectReset`.
+  Prometheus's TSDB answers `unknown` for the first histogram of every chunk
+  and `not_reset` for the rest (`counterResetHint` in
+  `tsdb/chunkenc/histogram_meta.go`).
+- **Buckets are validated at ingress, not here.** The kernels assume
+  structurally valid histograms (`promql_histogram::FloatHistogram::
+  normalize_ingress`); evaluation copies a histogram out of a batch only when a
+  window or a step needs it, and validating there would touch every bucket of
+  every sample.
+
+Why two columns rather than a union or a nullable child: a float sample then
+costs sixteen bytes and no type tag, as it did; a consumer of one type never
+touches the other's buffers; and DataFusion prunes a top-level column where it
+would not prune a struct child, so `rate(float_metric[5m])` over a store with
+both columns carries no bucket past the scan. Prometheus's `promql.Series`
+holds `Floats` and `Histograms` apart for the first two reasons
+(`promql/value.go`).
 
 ### Identity and order
 
@@ -154,8 +216,8 @@ trusted ordering is an obligation, not a runtime certification.
 
 **Overlap.** Adjacent chunks can overlap, as several files or compaction levels
 may contain them. Within a block, first chunk wins: samples at or before the
-last timestamp already seen are skipped, including stale markers before range
-functions filter them out. Each block starts afresh because reach-back repeats
+last timestamp already seen are skipped, of either type and including stale
+markers before range functions filter them out. Each block starts afresh because reach-back repeats
 samples intentionally. This follows Thanos's `chunkSeriesIterator`
 (`pkg/query/iter.go:277-281`); Prometheus's block merge instead unions samples
 and drops duplicate timestamps. They agree on duplicates, not interleaved
@@ -188,7 +250,10 @@ store-specific work on its own.
 ## Implementing it
 
 **In memory.** `MemorySeriesSource` assigns stable IDs before filtering and
-emits contiguous chunks. Whole-series, realistic-chunk and one-sample-chunk
+emits contiguous chunks. It knows its data before it answers, so a selection
+none of whose series has a histogram has no `histograms` column, and one with
+no float has no `floats`; a chunk of a series with both holds what the series
+had in the chunk's span, of either type. Whole-series, realistic-chunk and one-sample-chunk
 fixtures share the same contract. Tests also cut blocks and partitions and
 exercise both UInt64 and fixed binary identities, without an alternate
 interleaving mode.
@@ -215,7 +280,9 @@ concatenating every chunk to use that helper.
 
 ## Non-goals
 
-Native histograms, exemplars, metadata and dictionary labels remain deferred.
+Exemplars, metadata and dictionary labels remain deferred. Histograms arrive
+as `FloatHistogram`s; a store holding integer histograms converts them as
+Prometheus's `ToFloat` does.
 A series crossing DataFusion partitions would require a distributed merge and
 is outside the contract. Downsampling/pre-aggregation hints do not specify a
 safe transformation. See [`engine.md`](engine.md) for evaluation, numerical

@@ -9,9 +9,6 @@
 //! Empty/singleton fold results stay inline. The batch owner alone creates Arrow
 //! row boundaries, including rows with no evaluated samples.
 
-#[cfg(test)]
-use std::sync::Arc;
-
 use datafusion::arrow::array::{AsArray, StructArray};
 #[cfg(test)]
 use datafusion::arrow::{
@@ -20,7 +17,12 @@ use datafusion::arrow::{
 };
 use datafusion::common::{DataFusionError, Result};
 
-use crate::buffer::{BufferedSeriesIterator, EvalContext, PushCursor, WorkBudget};
+use std::sync::Arc;
+
+use promql_histogram::FloatHistogram;
+
+use crate::buffer::{BufferedSeriesIterator, Emit, EvalContext, PushCursor, Values, WorkBudget};
+use crate::histogram::{self, HistogramsBuilder};
 use crate::series::SamplesBuilder;
 
 #[cfg(test)]
@@ -31,6 +33,10 @@ pub(crate) struct SeriesFold {
     // Close retains capacities until the owner has charged output growth.
     iterator: Option<BufferedSeriesIterator>,
     pub(crate) out: SingleSeriesSamples,
+    /// Evaluated histogram samples, owned until the batch owner copies
+    /// them into its builder. A step is in `out` or here, never both.
+    pub(crate) histograms: Vec<(i64, Arc<FloatHistogram>)>,
+    histogram_bytes: usize,
 }
 
 /// Arrow row boundaries belong to the batch owner, not a numerical fold.
@@ -143,11 +149,26 @@ pub(crate) fn emit_label_rows<'a>(
     Ok(Arc::new(StructArray::try_new(fields, columns, None)?))
 }
 
+/// One evaluated histogram into the fold's results. A selector repeats
+/// one sample over many steps as clones of one `Arc`; charging each is
+/// an overestimate, never an omission.
+fn keep(
+    histograms: &mut Vec<(i64, Arc<FloatHistogram>)>,
+    bytes: &mut usize,
+    t: i64,
+    h: Arc<FloatHistogram>,
+) {
+    *bytes += histogram::heap_size(&h);
+    histograms.push((t, h));
+}
+
 impl SeriesFold {
     pub(crate) fn new(context: &EvalContext) -> Self {
         Self {
             iterator: Some(BufferedSeriesIterator::new(context)),
             out: SingleSeriesSamples::Inline(None),
+            histograms: Vec::new(),
+            histogram_bytes: 0,
         }
     }
 
@@ -155,6 +176,19 @@ impl SeriesFold {
         self.iterator.as_ref().map_or(0, |it| {
             it.size() - std::mem::size_of::<BufferedSeriesIterator>()
         }) + self.out.heap_size()
+            + self.histograms.capacity() * std::mem::size_of::<(i64, Arc<FloatHistogram>)>()
+            + self.histogram_bytes
+    }
+
+    /// Evaluated samples of both types.
+    pub(crate) fn len(&self) -> usize {
+        self.out.len() + self.histograms.len()
+    }
+
+    pub(crate) fn append_histograms_to(&self, output: &mut HistogramsBuilder) {
+        for (t, h) in &self.histograms {
+            output.push(*t, h);
+        }
     }
 
     #[cfg(test)]
@@ -178,22 +212,31 @@ impl SeriesFold {
         }
     }
 
+    /// One chronological run of a raw row, floats or histograms.
     pub(crate) fn push_budgeted(
         &mut self,
         context: &EvalContext,
         ts: &[i64],
-        vs: &[f64],
+        vs: Values<'_>,
         cursor: &mut PushCursor,
         budget: &mut WorkBudget,
     ) -> bool {
-        let output = &mut self.out;
-        self.iterator.as_mut().expect("open fold").push_budgeted(
+        let Self {
+            iterator,
+            out,
+            histograms,
+            histogram_bytes,
+        } = self;
+        iterator.as_mut().expect("open fold").push_values_budgeted(
             context,
             ts,
             vs,
             cursor,
             budget,
-            |t, v| output.push(t, v),
+            &mut Emit {
+                floats: |t, v| out.push(t, v),
+                histograms: |t, h| keep(histograms, histogram_bytes, t, h),
+            },
         )
     }
 
@@ -202,9 +245,21 @@ impl SeriesFold {
         context: &EvalContext,
         budget: &mut WorkBudget,
     ) -> bool {
-        let output = &mut self.out;
-        self.iterator.as_mut().is_none_or(|iterator| {
-            iterator.close_budgeted(context, budget, |t, v| output.push(t, v))
+        let Self {
+            iterator,
+            out,
+            histograms,
+            histogram_bytes,
+        } = self;
+        iterator.as_mut().is_none_or(|iterator| {
+            iterator.close_budgeted(
+                context,
+                budget,
+                &mut Emit {
+                    floats: |t, v| out.push(t, v),
+                    histograms: |t, h| keep(histograms, histogram_bytes, t, h),
+                },
+            )
         })
     }
 

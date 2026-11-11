@@ -17,6 +17,7 @@ chrono = { workspace = true }
 datafusion = { workspace = true }
 futures = { workspace = true }
 promql-common = { path = "../promql-common" }
+promql-histogram = { path = "../promql-histogram" }
 promql-parser = { path = "../promql-parser" }
 regex = { workspace = true }
 thiserror = { workspace = true }

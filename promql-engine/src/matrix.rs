@@ -16,8 +16,10 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, ArrayRef, AsArray, BooleanBufferBuilder, ListArray};
-use datafusion::arrow::buffer::BooleanBuffer;
+use datafusion::arrow::array::{
+    Array, ArrayRef, AsArray, BooleanArray, BooleanBufferBuilder, ListArray,
+};
+use datafusion::arrow::buffer::{BooleanBuffer, OffsetBuffer};
 use datafusion::arrow::datatypes::{DataType, FieldRef};
 use datafusion::common::{plan_err, ScalarValue};
 use datafusion::error::{DataFusionError, Result};
@@ -27,6 +29,7 @@ use datafusion::logical_expr::{
 };
 
 use crate::elementwise::filtered;
+use crate::histogram::{self, HistogramColumns};
 use crate::selector::is_stale;
 use crate::series;
 
@@ -83,10 +86,14 @@ impl ScalarUDFImpl for MatrixSelector {
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        if !arg_types.first().is_some_and(series::is_floats_type) {
+        if !arg_types
+            .first()
+            .is_some_and(|t| series::is_floats_type(t) || histogram::is_histograms_type(t))
+        {
             return plan_err!(
-                "{NAME}: first argument must be {}, got {:?}",
+                "{NAME}: first argument must be {} or {}, got {:?}",
                 series::floats_type(),
+                histogram::histograms_type(),
                 arg_types.first()
             );
         }
@@ -134,8 +141,14 @@ impl ScalarUDFImpl for MatrixSelector {
     }
 }
 
-/// Keep, in every row of `floats`, the samples `window` holds.
+/// Keep, in every row of a samples column, the samples `window` holds.
+/// The column is `floats` or `histograms`: `matrixIterSlice` fills
+/// `Floats` and `Histograms` by the same window, and a histogram is
+/// stale by its sum.
 pub fn apply(samples: &ListArray, window: Window) -> Result<ListArray> {
+    if histogram::is_histograms_type(samples.data_type()) {
+        return apply_histograms(samples, window);
+    }
     // A list slice retains the entire backing child. `filtered` counts
     // predicates relative to the first referenced offset, as elementwise
     // comparisons do; passing a backing-wide predicate misassigns rows.
@@ -157,6 +170,31 @@ pub fn apply(samples: &ListArray, window: Window) -> Result<ListArray> {
         .expect("a canonical samples entry")
         .as_primitive();
     filtered(samples, timestamps, values, &holds)
+}
+
+fn apply_histograms(samples: &ListArray, window: Window) -> Result<ListArray> {
+    let offsets = samples.value_offsets();
+    let (start, end) = (offsets[0] as usize, offsets[samples.len()] as usize);
+    let entries = samples.values().slice(start, end - start);
+    let columns = HistogramColumns::new(entries.as_struct());
+    let mut holds = BooleanBufferBuilder::new(end - start);
+    for (t, sum) in columns.timestamps.iter().zip(columns.sum) {
+        holds.append(window.holds(*t, *sum));
+    }
+    let holds = holds.finish();
+    let kept = offsets.windows(2).map(|row| {
+        let (lo, hi) = (row[0] as usize - start, row[1] as usize - start);
+        holds.slice(lo, hi - lo).count_set_bits()
+    });
+    let DataType::List(item) = samples.data_type() else {
+        unreachable!("a samples list")
+    };
+    Ok(ListArray::new(
+        Arc::clone(item),
+        OffsetBuffer::from_lengths(kept),
+        datafusion::arrow::compute::filter(&entries, &BooleanArray::new(holds, None))?,
+        samples.nulls().cloned(),
+    ))
 }
 
 #[cfg(test)]

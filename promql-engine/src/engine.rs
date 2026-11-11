@@ -154,6 +154,12 @@ impl Engine {
         ctx.register_udf(elementwise::udf());
         ctx.register_udf(matrix::udf());
         ctx.register_udaf(binary::udaf());
+        ctx.register_udaf(crate::histogram_agg::udaf());
+        ctx.register_udaf(crate::histogram_classic::udaf());
+        ctx.register_udaf(binary::histograms::udaf());
+        for udf in crate::histogram_fn::udfs() {
+            ctx.register_udf(udf);
+        }
         ctx.register_udf(sort::Natural::udf());
         ctx.register_udf(sort::Set::udf());
         Self {
