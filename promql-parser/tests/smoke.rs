@@ -70,6 +70,45 @@ fn arithmetic_precedence() {
     }
 }
 
+/// Upstream's `lexStatements` reads `</` and `>/` as the histogram trim
+/// operators, `TRIM_UPPER` and `TRIM_LOWER`, at a comparison's
+/// precedence. The words `trim_upper` and `trim_lower` are not tokens:
+/// they are ordinary metric names.
+#[test]
+fn histogram_trim_operators() {
+    use promql_parser::token::ItemType;
+
+    for (query, op) in [
+        ("h </ 2", ItemType::TrimUpper),
+        ("h >/ -Inf", ItemType::TrimLower),
+        ("h>/on(job) x", ItemType::TrimLower),
+    ] {
+        match must_parse(query) {
+            Expr::Binary(b) => assert_eq!(b.op, op, "{query}"),
+            other => panic!("{query}: expected Binary, got {other:?}"),
+        }
+    }
+    // Tighter than `and`, looser than `+`, as every comparison is.
+    match must_parse("a and h </ 1 + 1") {
+        Expr::Binary(b) => {
+            assert_eq!(b.op, ItemType::Land);
+            match *b.rhs {
+                Expr::Binary(ref trim) => assert_eq!(trim.op, ItemType::TrimUpper),
+                ref other => panic!("expected a trim, got {other:?}"),
+            }
+        }
+        other => panic!("expected Binary, got {other:?}"),
+    }
+    for name in ["trim_upper", "trim_lower"] {
+        match must_parse(name) {
+            Expr::VectorSelector(vs) => assert_eq!(vs.name, name),
+            other => panic!("{name}: expected a selector, got {other:?}"),
+        }
+    }
+    assert_eq!(ItemType::TrimUpper.to_string(), "</");
+    assert_eq!(ItemType::TrimLower.to_string(), ">/");
+}
+
 /// Upstream gives the unary rule `MUL`'s precedence, so a sign binds to
 /// the operand and not to the expression around it.
 #[test]

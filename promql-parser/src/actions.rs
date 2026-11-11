@@ -217,6 +217,8 @@ fn op_item_type_from_lex<'l, 'i: 'l>(lexer: &'l L<'l, 'i>, lx: Lx) -> Result<Ite
         "<=" => ItemType::Lte,
         ">" => ItemType::Gtr,
         ">=" => ItemType::Gte,
+        "</" => ItemType::TrimUpper,
+        ">/" => ItemType::TrimLower,
         // Word operators are recovered from the source text, so they
         // have to fold case the way the lexer does.
         w if w.eq_ignore_ascii_case("and") => ItemType::Land,
