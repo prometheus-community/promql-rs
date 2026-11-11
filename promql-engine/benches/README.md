@@ -8,6 +8,13 @@ The benchmark targets measure different parts of query evaluation:
 - [`memory.rs`](memory.rs) measures heap use for individual queries, not
   execution time.
 
+`EngineHistogram` in `engine.rs` runs native histogram queries end to end over
+1000 series of 300 histograms with 20 buckets each. `EngineHistogramFloats`
+runs float queries twice, over a store of floats and over one where one more
+series of the metric is a histogram, so that the selection has a `histograms`
+column: compare the two `store=` values of one query to see what a float
+series pays for sharing a selection with histograms.
+
 The source files define benchmark IDs, fixture sizes, query grids, and setup.
 Their module comments describe the measurement boundaries.
 [Compare benchmark revisions](compare.md) covers baselines and profiles.

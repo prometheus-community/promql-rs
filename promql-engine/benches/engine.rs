@@ -10,7 +10,9 @@
 //! planning. `EngineExecutePreplanned` resets physical templates over
 //! preconstructed selected batches and drains DataFusion outputs without
 //! planning or API result collection. `EngineFocused*` covers adverse scaling
-//! shapes (see `benches/README.md`). All raw executions reset plan state
+//! shapes (see `benches/README.md`). `EngineHistogram` runs native histogram
+//! queries end to end, and `EngineHistogramFloats` the float path of a
+//! selection that also holds histograms. All raw executions reset plan state
 //! before each run.
 //!
 //! Recommended CLI invocation:
@@ -31,6 +33,7 @@ use promql_engine::{
     explain_physical_plan, explain_plan, Engine, EngineOptions, InstantResult, MemorySeriesSource,
     RangeQuery, Series, SeriesIdEncoding, SeriesSource,
 };
+use promql_histogram::{CounterResetHint, FloatHistogram, Span};
 use promql_parser::ParserOptions;
 
 #[path = "support/focused.rs"]
@@ -872,6 +875,202 @@ fn register_explain<'a>(mut suite: Suite<'a>) -> Suite<'a> {
     suite
 }
 
+/// A native histogram counter per series: `BUCKETS` populated buckets at
+/// schema 3, every count growing each scrape, as a latency histogram of a
+/// busy service looks after its first minutes.
+const HISTOGRAM_SHAPE: Shape = Shape {
+    series: 1_000,
+    samples: 300,
+};
+const BUCKETS: usize = 20;
+/// The scalars of one histogram sample and its bucket counts, as Arrow
+/// holds them; spans and list offsets are left out.
+const HISTOGRAM_BYTES: u64 = 45 + 8 * BUCKETS as u64;
+
+fn histogram_at(series: usize, sample: usize) -> FloatHistogram {
+    // Bucket `b` gains `1 + (series + b) % 5` observations per scrape.
+    let buckets: Vec<f64> = (0..BUCKETS)
+        .map(|b| ((sample + 1) * (1 + (series + b) % 5)) as f64)
+        .collect();
+    let count: f64 = buckets.iter().sum();
+    FloatHistogram {
+        counter_reset_hint: match sample {
+            0 => CounterResetHint::Unknown,
+            _ => CounterResetHint::NotReset,
+        },
+        schema: 3,
+        count,
+        sum: count * 0.25,
+        positive_spans: vec![Span {
+            offset: -8,
+            length: BUCKETS as u32,
+        }],
+        positive_buckets: buckets,
+        ..FloatHistogram::default()
+    }
+}
+
+fn histogram_labels(i: usize) -> (String, String) {
+    (format!("nginx-{i}"), format!("/{}", i % 8))
+}
+
+/// `http_request_duration_seconds` as native histograms, scraped every 15s.
+fn histogram_source() -> MemorySeriesSource {
+    let shape = HISTOGRAM_SHAPE;
+    let all: Vec<Series> = (0..shape.series)
+        .map(|i| {
+            let (pod, route) = histogram_labels(i);
+            let labels = [
+                ("__name__", "http_request_duration_seconds"),
+                ("pod", pod.as_str()),
+                ("route", route.as_str()),
+            ];
+            histogram_series(&labels, i, shape.samples)
+        })
+        .collect();
+    MemorySeriesSource::try_new(all).unwrap()
+}
+
+fn histogram_series(labels: &[(&str, &str)], i: usize, samples: usize) -> Series {
+    let histograms = (0..samples)
+        .map(|j| (j as i64 * SCRAPE_MS, histogram_at(i, j)))
+        .collect();
+    Series::new(labels, Vec::new(), Vec::new())
+        .unwrap()
+        .with_histograms(histograms)
+        .unwrap()
+}
+
+/// `http_requests_total` float counters, one per pod. With
+/// `one_histogram`, one more series of that name is a native histogram,
+/// which is all it takes for a selection of the metric to have a
+/// `histograms` column. Its one sample is the first scrape, before
+/// anything the benchmarked hour reads, so the series itself costs
+/// nothing and what is timed is the floats.
+fn float_source(one_histogram: bool) -> MemorySeriesSource {
+    let shape = HISTOGRAM_SHAPE;
+    let timestamps: Vec<i64> = (0..shape.samples).map(|j| j as i64 * SCRAPE_MS).collect();
+    let mut all: Vec<Series> = (0..shape.series)
+        .map(|i| {
+            let (pod, route) = histogram_labels(i);
+            let labels = [
+                ("__name__", "http_requests_total"),
+                ("pod", pod.as_str()),
+                ("route", route.as_str()),
+            ];
+            let values = (0..shape.samples)
+                .map(|j| ((j + 1) * (1 + i % 7)) as f64)
+                .collect();
+            Series::new(&labels, timestamps.clone(), values).unwrap()
+        })
+        .collect();
+    if one_histogram {
+        let labels = [("__name__", "http_requests_total"), ("pod", "a-histogram")];
+        all.push(histogram_series(&labels, 0, 1));
+    }
+    MemorySeriesSource::try_new(all).unwrap()
+}
+
+fn shared_histogram_source() -> &'static Arc<dyn SeriesSource> {
+    static SOURCE: OnceLock<Arc<dyn SeriesSource>> = OnceLock::new();
+    SOURCE.get_or_init(|| Arc::new(histogram_source()))
+}
+
+fn shared_float_source(one_histogram: bool) -> &'static Arc<dyn SeriesSource> {
+    static SOURCES: [OnceLock<Arc<dyn SeriesSource>>; 2] = [OnceLock::new(), OnceLock::new()];
+    SOURCES[usize::from(one_histogram)].get_or_init(|| Arc::new(float_source(one_histogram)))
+}
+
+/// Native histograms through every layer that knows them, over the last
+/// hour of data at 30s: the selector, the range kernel, the histogram
+/// functions, the aggregation and the pairing.
+///
+/// `EngineHistogramFloats` is the float path beside them: one query over
+/// the same float series, in a store of floats alone and in one where one
+/// more series of the metric is a histogram, so that the selection has a
+/// `histograms` column. The difference is what a float series pays for
+/// sharing a selection with histograms.
+fn register_histograms<'a>(mut suite: Suite<'a>) -> Suite<'a> {
+    let shape = HISTOGRAM_SHAPE;
+    let end = shape.end_ms();
+    let range = RangeQuery::new(end - HOUR_MS, end, STEP_MS);
+    let id = format!("{}x{}x{BUCKETS}", shape.series, shape.samples);
+    let bytes = (shape.series * shape.samples) as u64 * HISTOGRAM_BYTES;
+    for (qname, q) in [
+        ("selector", "http_request_duration_seconds"),
+        ("rate_5m", "rate(http_request_duration_seconds[5m])"),
+        (
+            "count_rate_5m",
+            "histogram_count(rate(http_request_duration_seconds[5m]))",
+        ),
+        (
+            "quantile_rate_5m",
+            "histogram_quantile(0.9, rate(http_request_duration_seconds[5m]))",
+        ),
+        (
+            "sum_by_route_rate_5m",
+            "sum by (route) (rate(http_request_duration_seconds[5m]))",
+        ),
+        (
+            "quantile_sum_by_route_rate_5m",
+            "histogram_quantile(0.9, sum by (route) (rate(http_request_duration_seconds[5m])))",
+        ),
+        (
+            "vector_vector",
+            "http_request_duration_seconds + http_request_duration_seconds",
+        ),
+    ] {
+        suite = suite.bench(
+            format!("EngineHistogram/query={qname}/shape={id}"),
+            move |b| {
+                let engine = blocking_engine();
+                let source = shared_histogram_source();
+                b.set_bytes(bytes);
+                b.report_allocs();
+                while b.keep_running() {
+                    black_box(
+                        engine
+                            .range_query(source.as_ref(), black_box(q), &range)
+                            .unwrap(),
+                    );
+                }
+            },
+        );
+    }
+    let float_bytes = (shape.series * shape.samples) as u64 * SAMPLE_BYTES;
+    for (name, one_histogram) in [("floats", false), ("floats_and_one_histogram", true)] {
+        for (qname, q) in [
+            ("selector", "http_requests_total"),
+            ("rate_5m", "rate(http_requests_total[5m])"),
+            (
+                "sum_by_route_rate_5m",
+                "sum by (route) (rate(http_requests_total[5m]))",
+            ),
+        ] {
+            suite = suite.bench(
+                format!(
+                    "EngineHistogramFloats/query={qname}/store={name}/shape={}",
+                    shape.id()
+                ),
+                move |b| {
+                    let engine = blocking_engine();
+                    let source = shared_float_source(one_histogram);
+                    b.set_bytes(float_bytes);
+                    b.report_allocs();
+                    while b.keep_running() {
+                        black_box(
+                            engine
+                                .range_query(source.as_ref(), black_box(q), &range)
+                                .unwrap(),
+                        );
+                    }
+                },
+            );
+        }
+    }
+    suite
+}
+
 fn main() {
     let mut suite = Suite::from_env("promql_engine/engine").with_alloc(&ALLOC);
     suite = register_query(suite);
@@ -884,5 +1083,6 @@ fn main() {
     suite = register_contiguous(suite);
     suite = register_execute_preplanned(suite);
     suite = register_focused(suite);
+    suite = register_histograms(suite);
     suite.run();
 }
