@@ -1118,32 +1118,23 @@ fn unquote_string(raw: &str) -> Result<String, String> {
     let mut out: Vec<u8> = Vec::with_capacity(inner.len());
     let mut chars = inner.chars();
     let mut utf8 = [0u8; 4];
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.extend_from_slice(c.encode_utf8(&mut utf8).as_bytes());
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            out.extend_from_slice(character.encode_utf8(&mut utf8).as_bytes());
             continue;
         }
         let first = chars.next().ok_or("escape sequence not terminated")?;
         // `\xNN` and octal are one byte each; `\u` and `\U` a code point.
         // An octal escape's first digit is the one already read.
+        if let Some(byte) = simple_escape(first) {
+            out.push(byte);
+            continue;
+        }
+        if first == char::from(open) {
+            out.push(open);
+            continue;
+        }
         let (digits, radix, seed, is_byte) = match first {
-            'a' | 'b' | 'f' | 'n' | 'r' | 't' | 'v' | '\\' => {
-                out.push(match first {
-                    'a' => 0x07,
-                    'b' => 0x08,
-                    'f' => 0x0c,
-                    'n' => b'\n',
-                    'r' => b'\r',
-                    't' => b'\t',
-                    'v' => 0x0b,
-                    _ => b'\\',
-                });
-                continue;
-            }
-            quote if quote == char::from(open) => {
-                out.push(open);
-                continue;
-            }
             '0'..='7' => (2, 8, u32::from(first) - u32::from('0'), true),
             'x' => (2, 16, 0, true),
             'u' => (4, 16, 0, false),
@@ -1154,26 +1145,43 @@ fn unquote_string(raw: &str) -> Result<String, String> {
         for _ in 0..digits {
             // `inner` lost the closing quote, which upstream's `lexEscape`
             // reads as the next digit and reports as the illegal character.
-            let c = chars.next().unwrap_or(char::from(open));
-            let digit = c
-                .to_digit(radix)
-                .ok_or_else(|| format!("illegal character {} in escape sequence", go_rune(c)))?;
+            let character = chars.next().unwrap_or(char::from(open));
+            let digit = character.to_digit(radix).ok_or_else(|| {
+                format!(
+                    "illegal character {} in escape sequence",
+                    go_rune(character)
+                )
+            })?;
             value = value * radix + digit;
         }
         let invalid = || "escape sequence is an invalid Unicode code point".to_string();
         if is_byte {
             out.push(u8::try_from(value).map_err(|_| invalid())?);
         } else {
-            let c = char::from_u32(value).ok_or_else(invalid)?;
-            out.extend_from_slice(c.encode_utf8(&mut utf8).as_bytes());
+            let character = char::from_u32(value).ok_or_else(invalid)?;
+            out.extend_from_slice(character.encode_utf8(&mut utf8).as_bytes());
         }
     }
     String::from_utf8(out).map_err(|_| "invalid UTF-8 in string after unescaping".to_string())
 }
 
+fn simple_escape(escape: char) -> Option<u8> {
+    Some(match escape {
+        'a' => 0x07,
+        'b' => 0x08,
+        'f' => 0x0c,
+        'n' => b'\n',
+        'r' => b'\r',
+        't' => b'\t',
+        'v' => 0x0b,
+        '\\' => b'\\',
+        _ => return None,
+    })
+}
+
 /// Go's `%#U`: `U+0064 'd'`.
-fn go_rune(c: char) -> String {
-    format!("U+{:04X} '{c}'", c as u32)
+fn go_rune(character: char) -> String {
+    format!("U+{:04X} '{character}'", character as u32)
 }
 
 #[cfg(test)]

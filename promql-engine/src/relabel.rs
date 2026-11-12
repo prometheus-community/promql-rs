@@ -98,11 +98,11 @@ impl ScalarUDFImpl for LabelReplace {
     }
 
     fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
-        for (i, f) in args.arg_fields.iter().take(2).enumerate() {
-            if !matches!(f.data_type(), DataType::Utf8View | DataType::Utf8) {
+        for (position, field) in args.arg_fields.iter().take(2).enumerate() {
+            if !matches!(field.data_type(), DataType::Utf8View | DataType::Utf8) {
                 return plan_err!(
-                    "{NAME}: argument {i} must be a label value, got {}",
-                    f.data_type()
+                    "{NAME}: argument {position} must be a label value, got {}",
+                    field.data_type()
                 );
             }
         }

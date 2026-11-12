@@ -886,7 +886,7 @@ impl Planner<'_> {
                 },
             ),
             (relabel::Func::Join, [dst, separator, sources @ ..]) => {
-                if let Some(src) = sources.iter().find(|s| s.is_empty()) {
+                if let Some(src) = sources.iter().find(|source| source.is_empty()) {
                     return Err(invalid("source", src));
                 }
                 (*dst, Value::Join { separator, sources })
@@ -918,9 +918,10 @@ impl Planner<'_> {
             // `concat_ws` wants a value to join; `strings.Join` of nothing
             // is "".
             Value::Join { sources: [], .. } => lit(""),
-            Value::Join { separator, sources } => {
-                concat_ws(lit(separator), sources.iter().map(|s| read(s)).collect())
-            }
+            Value::Join { separator, sources } => concat_ws(
+                lit(separator),
+                sources.iter().map(|source| read(source)).collect(),
+            ),
         };
         let mut label_names = input.label_names.clone();
         label_names.push(dst.to_string());
