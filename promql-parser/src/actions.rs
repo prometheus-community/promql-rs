@@ -95,10 +95,20 @@ pub fn duration_literal<'l, 'i: 'l>(lexer: &'l L<'l, 'i>, lx: Lx) -> Result<Expr
     }))
 }
 
-pub fn string_literal<'l, 'i: 'l>(lexer: &'l L<'l, 'i>, lx: Lx) -> Result<Expr, ()> {
-    let span = lx.span();
+/// The value of a STRING token, for every grammar rule that reads one.
+/// The lrlex lexer accepts any `\.`, so this is where upstream's
+/// `lexEscape` errors surface; the raw text stands in so parsing goes on.
+fn unquote_token(p: &ParserCtx, lexer: &L, span: Span) -> String {
     let raw = lexer.span_str(span);
-    let val = unquote_string(raw).unwrap_or_else(|_| raw.to_string());
+    unquote_string(raw).unwrap_or_else(|message| {
+        p.add_parse_err(to_pos_range(span), message);
+        raw.to_string()
+    })
+}
+
+pub fn string_literal<'l, 'i: 'l>(p: &ParserCtx, lexer: &'l L<'l, 'i>, lx: Lx) -> Result<Expr, ()> {
+    let span = lx.span();
+    let val = unquote_token(p, lexer, span);
     Ok(Expr::StringLiteral(StringLiteral {
         val,
         pos_range: to_pos_range(span),
@@ -108,9 +118,12 @@ pub fn string_literal<'l, 'i: 'l>(lexer: &'l L<'l, 'i>, lx: Lx) -> Result<Expr, 
 /// Return just the string content of a STRING token (with outer
 /// quotes stripped and escapes processed), useful when the grammar
 /// wants the raw value rather than a full `StringLiteral` expression.
-pub fn string_literal_value<'l, 'i: 'l>(lexer: &'l L<'l, 'i>, span: Span) -> Result<String, ()> {
-    let raw = lexer.span_str(span);
-    Ok(unquote_string(raw).unwrap_or_else(|_| raw.to_string()))
+pub fn string_literal_value<'l, 'i: 'l>(
+    p: &ParserCtx,
+    lexer: &'l L<'l, 'i>,
+    span: Span,
+) -> Result<String, ()> {
+    Ok(unquote_token(p, lexer, span))
 }
 
 pub fn paren<'l, 'i: 'l>(
@@ -406,6 +419,7 @@ pub fn vector_selector<'l, 'i: 'l>(
 }
 
 pub fn label_matcher<'l, 'i: 'l>(
+    p: &ParserCtx,
     lexer: &'l L<'l, 'i>,
     span: Span,
     name_span: Span,
@@ -413,8 +427,7 @@ pub fn label_matcher<'l, 'i: 'l>(
     value_lx: Lx,
 ) -> Result<LabelMatcher, ()> {
     let name = lexer.span_str(name_span).to_string();
-    let raw_value = lexer.span_str(value_lx.span());
-    let value = unquote_string(raw_value).unwrap_or_else(|_| raw_value.to_string());
+    let value = unquote_token(p, lexer, value_lx.span());
     Ok(LabelMatcher {
         name,
         op,
@@ -442,14 +455,14 @@ pub fn quoted_metric_name_matcher_from_ident<'l, 'i: 'l>(
 /// UTF-8 label) and the value is a `STRING` token. Upstream's
 /// `label_matcher : string_identifier match_op STRING` form.
 pub fn label_matcher_quoted_name<'l, 'i: 'l>(
+    p: &ParserCtx,
     lexer: &'l L<'l, 'i>,
     span: Span,
     name: String,
     op: MatchOp,
     value_lx: Lx,
 ) -> Result<LabelMatcher, ()> {
-    let raw = lexer.span_str(value_lx.span());
-    let value = unquote_string(raw).unwrap_or_else(|_| raw.to_string());
+    let value = unquote_token(p, lexer, value_lx.span());
     Ok(LabelMatcher {
         name,
         op,
@@ -878,17 +891,18 @@ pub fn push_label(mut acc: Vec<LabelMatcher>, item: LabelMatcher) -> Result<Vec<
 /// `label_set_item : IDENTIFIER EQL STRING`. Unlike `label_matcher`,
 /// a label set only ever has `=`.
 pub fn label_from_ident<'l, 'i: 'l>(
+    p: &ParserCtx,
     lexer: &'l L<'l, 'i>,
     span: Span,
     name: Result<Lx, Lx>,
     value: Result<Lx, Lx>,
 ) -> Result<LabelMatcher, ()> {
     let name = lexer.span_str(name.map_err(|_| ())?.span()).to_string();
-    let raw = lexer.span_str(value.map_err(|_| ())?.span());
+    let value = unquote_token(p, lexer, value.map_err(|_| ())?.span());
     Ok(LabelMatcher {
         name,
         op: MatchOp::Equal,
-        value: unquote_string(raw)?,
+        value,
         pos_range: to_pos_range(span),
     })
 }
@@ -896,16 +910,17 @@ pub fn label_from_ident<'l, 'i: 'l>(
 /// `label_set_item : string_identifier EQL STRING` — quoted UTF-8
 /// label name.
 pub fn label_from_string_ident<'l, 'i: 'l>(
+    p: &ParserCtx,
     lexer: &'l L<'l, 'i>,
     span: Span,
     name: String,
     value: Result<Lx, Lx>,
 ) -> Result<LabelMatcher, ()> {
-    let raw = lexer.span_str(value.map_err(|_| ())?.span());
+    let value = unquote_token(p, lexer, value.map_err(|_| ())?.span());
     Ok(LabelMatcher {
         name,
         op: MatchOp::Equal,
-        value: unquote_string(raw)?,
+        value,
         pos_range: to_pos_range(span),
     })
 }
@@ -1081,53 +1096,164 @@ pub fn parse_duration_seconds(raw: &str) -> Result<f64, ()> {
         .map_err(|_| ())
 }
 
-fn unquote_string(raw: &str) -> Result<String, ()> {
+/// Upstream `strutil.Unquote`, a port of Go's `strconv.Unquote` that also
+/// takes single-quoted strings, with `lexEscape`'s messages. `\xNN` and
+/// octal escapes are bytes, so the result can be invalid UTF-8, which Go
+/// keeps and a Rust `String` cannot hold.
+fn unquote_string(raw: &str) -> Result<String, String> {
+    let malformed = || "malformed string literal".to_string();
     if raw.len() < 2 {
-        return Err(());
+        return Err(malformed());
     }
     let bytes = raw.as_bytes();
     let open = bytes[0];
     let close = bytes[raw.len() - 1];
     if open != close {
-        return Err(());
+        return Err(malformed());
     }
     let inner = &raw[1..raw.len() - 1];
-    if open == b'`' {
+    if open == b'`' || !inner.contains('\\') {
         return Ok(inner.to_string());
     }
-    let mut out = String::with_capacity(inner.len());
-    let mut it = inner.chars();
-    while let Some(c) = it.next() {
-        if c != '\\' {
-            out.push(c);
+    let mut out: Vec<u8> = Vec::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    let mut utf8 = [0u8; 4];
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            out.extend_from_slice(character.encode_utf8(&mut utf8).as_bytes());
             continue;
         }
-        match it.next() {
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('r') => out.push('\r'),
-            Some('\\') => out.push('\\'),
-            Some('\'') => out.push('\''),
-            Some('"') => out.push('"'),
-            Some('`') => out.push('`'),
-            Some('0') => out.push('\0'),
-            Some('a') => out.push('\x07'),
-            Some('b') => out.push('\x08'),
-            Some('f') => out.push('\x0c'),
-            Some('v') => out.push('\x0b'),
-            Some(other) => {
-                out.push('\\');
-                out.push(other);
-            }
-            None => return Err(()),
+        let first = chars.next().ok_or("escape sequence not terminated")?;
+        // `\xNN` and octal are one byte each; `\u` and `\U` a code point.
+        // An octal escape's first digit is the one already read.
+        if let Some(byte) = simple_escape(first) {
+            out.push(byte);
+            continue;
+        }
+        if first == char::from(open) {
+            out.push(open);
+            continue;
+        }
+        let (digits, radix, seed, is_byte) = match first {
+            '0'..='7' => (2, 8, u32::from(first) - u32::from('0'), true),
+            'x' => (2, 16, 0, true),
+            'u' => (4, 16, 0, false),
+            'U' => (8, 16, 0, false),
+            other => return Err(format!("unknown escape sequence {}", go_rune(other))),
+        };
+        let mut value = seed;
+        for _ in 0..digits {
+            // `inner` lost the closing quote, which upstream's `lexEscape`
+            // reads as the next digit and reports as the illegal character.
+            let character = chars.next().unwrap_or(char::from(open));
+            let digit = character.to_digit(radix).ok_or_else(|| {
+                format!(
+                    "illegal character {} in escape sequence",
+                    go_rune(character)
+                )
+            })?;
+            value = value * radix + digit;
+        }
+        let invalid = || "escape sequence is an invalid Unicode code point".to_string();
+        if is_byte {
+            out.push(u8::try_from(value).map_err(|_| invalid())?);
+        } else {
+            let character = char::from_u32(value).ok_or_else(invalid)?;
+            out.extend_from_slice(character.encode_utf8(&mut utf8).as_bytes());
         }
     }
-    Ok(out)
+    String::from_utf8(out).map_err(|_| "invalid UTF-8 in string after unescaping".to_string())
+}
+
+fn simple_escape(escape: char) -> Option<u8> {
+    Some(match escape {
+        'a' => 0x07,
+        'b' => 0x08,
+        'f' => 0x0c,
+        'n' => b'\n',
+        'r' => b'\r',
+        't' => b'\t',
+        'v' => 0x0b,
+        '\\' => b'\\',
+        _ => return None,
+    })
+}
+
+/// Go's `%#U`: `U+0064 'd'`.
+fn go_rune(character: char) -> String {
+    format!("U+{:04X} '{character}'", character as u32)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Go's `strconv.Unquote`: `\x` and octal are bytes, `\u` and `\U`
+    /// are code points, and bytes that are not UTF-8 have no `String`.
+    #[test]
+    fn unquote_decodes_every_escape_go_does() {
+        assert_eq!(
+            unquote_string(r#""\x41\101\u00e9\U0001F600""#),
+            Ok("AA\u{e9}\u{1F600}".to_string())
+        );
+        assert_eq!(unquote_string(r#""\xc3\xa9""#), Ok("\u{e9}".to_string()));
+        assert_eq!(
+            unquote_string(r#""\a\b\f\n\r\t\v\\\"""#),
+            Ok("\x07\x08\x0c\n\r\t\x0b\\\"".to_string())
+        );
+        assert_eq!(unquote_string(r#"'\''"#), Ok("'".to_string()));
+        assert_eq!(unquote_string(r#""\000""#), Ok("\0".to_string()));
+        assert_eq!(
+            unquote_string(r#""\xff""#).unwrap_err(),
+            "invalid UTF-8 in string after unescaping"
+        );
+        assert_eq!(
+            unquote_string(r#""\d""#).unwrap_err(),
+            "unknown escape sequence U+0064 'd'"
+        );
+        assert_eq!(
+            unquote_string(r#""\xg0""#).unwrap_err(),
+            "illegal character U+0067 'g' in escape sequence"
+        );
+        for short in [r#""\x4""#, r#""\0""#] {
+            assert_eq!(
+                unquote_string(short).unwrap_err(),
+                "illegal character U+0022 '\"' in escape sequence"
+            );
+        }
+        assert_eq!(
+            unquote_string(r#""\400""#).unwrap_err(),
+            "escape sequence is an invalid Unicode code point"
+        );
+    }
+
+    /// The grammar's lexer accepts any `\.`, so the parse is where a bad
+    /// escape surfaces, wherever the string sits.
+    #[test]
+    fn a_bad_escape_fails_the_parse_with_its_message() {
+        for query in [
+            r#"label_replace(up, "\xff", "", "a", "")"#,
+            r#"up{a="\xff"}"#,
+            r#"{"\xff"}"#,
+        ] {
+            let err = crate::parse_expr(query).unwrap_err().to_string();
+            assert!(
+                err.contains("invalid UTF-8 in string after unescaping"),
+                "{query}: {err}"
+            );
+        }
+        for series in [r#"up{a="\xff"} 1"#, r#"up{"a"="\xff"} 1"#] {
+            let err = crate::parse_series_desc(series).unwrap_err().to_string();
+            assert!(
+                err.contains("invalid UTF-8 in string after unescaping"),
+                "{series}: {err}"
+            );
+        }
+        assert!(crate::parse_expr(r#"up{a="\d"}"#)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown escape sequence U+0064 'd'"));
+    }
 
     /// `parse_duration_seconds` delegates to `Duration::parse`, which
     /// stops at `ms` (see `promql_common::model::time`'s `unit_info_basic`

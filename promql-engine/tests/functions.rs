@@ -489,3 +489,89 @@ fn a_literal_covers_the_range_and_a_string_is_refused_in_one() {
         "{err}"
     );
 }
+
+fn labels(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+#[test]
+fn label_replace_writes_the_expansion_only_where_the_source_matches() {
+    assert_eq!(
+        vector(r#"label_replace(temperature, "region", "city-$1", "city", "o(.*)")"#),
+        vec![
+            (
+                labels(&[("__name__", "temperature"), ("city", "lima")]),
+                -9.75
+            ),
+            (
+                labels(&[
+                    ("__name__", "temperature"),
+                    ("city", "oslo"),
+                    ("region", "city-slo")
+                ]),
+                9.25
+            ),
+        ]
+    );
+}
+
+/// A label the input lacks reads as "", which `(.*)` matches.
+#[test]
+fn label_replace_reads_a_missing_source_as_empty() {
+    let rows = vector(r#"label_replace(temperature, "region", "x$1", "nowhere", "(.*)")"#);
+    assert!(rows
+        .iter()
+        .all(|(l, _)| l.contains(&("region".into(), "x".into()))));
+}
+
+#[test]
+fn label_replace_to_empty_deletes_the_destination() {
+    assert_eq!(
+        vector(r#"label_replace(temperature{city="oslo"}, "city", "", "city", ".*")"#),
+        vec![(labels(&[("__name__", "temperature")]), 9.25)]
+    );
+}
+
+#[test]
+fn label_join_joins_in_argument_order_and_reads_missing_sources_as_empty() {
+    let rows = vector(r#"label_join(temperature, "id", "/", "city", "nowhere", "__name__")"#);
+    assert_eq!(rows[0].0[2], ("id".into(), "lima//temperature".into()));
+    assert_eq!(rows[1].0[2], ("id".into(), "oslo//temperature".into()));
+}
+
+#[test]
+fn label_join_of_no_sources_deletes_the_destination() {
+    assert_eq!(
+        vector(r#"label_join(temperature{city="oslo"}, "city", ",")"#),
+        vec![(labels(&[("__name__", "temperature")]), 9.25)]
+    );
+}
+
+#[test]
+fn relabelling_refuses_what_upstream_refuses_in_its_words() {
+    for (query, message) in [
+        (
+            r#"label_replace(temperature, "a", "", "city", "(.*")"#,
+            "invalid regular expression in label_replace(): (.*",
+        ),
+        (
+            r#"label_replace(temperature, "", "", "city", ".*")"#,
+            "invalid destination label name in label_replace(): ",
+        ),
+        (
+            r#"label_join(temperature, "", ",", "city")"#,
+            "invalid destination label name in label_join(): ",
+        ),
+        (
+            r#"label_join(temperature, "a", ",", "city", "")"#,
+            "invalid source label name in label_join(): ",
+        ),
+    ] {
+        let err = error(query);
+        assert!(matches!(err, EngineError::Query(_)), "{query}: {err:?}");
+        assert_eq!(err.to_string(), message, "{query}");
+    }
+}

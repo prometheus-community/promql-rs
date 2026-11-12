@@ -1,0 +1,11 @@
+---
+source: promql-engine/tests/plan/functions.rs
+expression: "sum by (region) (label_replace(temperature, \"region\", \"$1\", \"city\", \"(.*)\"))"
+---
+Projection: labels{region: __group__region}
+  Aggregate: sum by (region) (samples, 600000..1200000 step 30s) per block
+    Projection: labels{__name__, city, region: promql_label_replace(get_field(label_replace_0.labels, Utf8("city")), Utf8(""), Utf8("^(?s:(.*))$"), Utf8("$1"))}
+      SubqueryAlias: label_replace_0
+        Projection: labels, samples, block_start, block_end
+          SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+            TableScan: temperature

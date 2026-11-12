@@ -108,11 +108,7 @@ pub fn exprs(func: Func, labels: &[String], label_names: &[String]) -> Vec<SortE
     labels
         .iter()
         .map(|l| {
-            let value = if label_names.contains(l) {
-                get_field(col(LABELS), l.as_str())
-            } else {
-                lit("")
-            };
+            let value = crate::labels::field(label_names, l);
             SortExpr::new(Natural::udf().call(vec![value]), asc, false)
         })
         // "If all labels provided as arguments were equal, sort by the
