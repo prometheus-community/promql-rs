@@ -223,6 +223,14 @@ impl FloatHistogram {
                 .iter()
                 .any(|(index, count)| current.get(index).copied().unwrap_or(0.0) < *count);
         }
+        if self.shares_layout(previous) {
+            let dropped = |current: &[f64], previous: &[f64]| {
+                current.iter().zip(previous).any(|(c, p)| c < p)
+            };
+            return self.zero_count < previous.zero_count
+                || dropped(&self.positive_buckets, &previous.positive_buckets)
+                || dropped(&self.negative_buckets, &previous.negative_buckets);
+        }
         if self.schema > previous.schema || self.zero_threshold < previous.zero_threshold {
             return true;
         }
@@ -303,6 +311,14 @@ impl FloatHistogram {
             self.combine_custom(other, subtract, kahan, compensation);
             return Ok(outcome);
         }
+        if self.shares_layout(other)
+            && compensation
+                .as_deref()
+                .is_none_or(|c| self.shares_layout(c))
+        {
+            self.combine_aligned(other, subtract, compensation);
+            return Ok(outcome);
+        }
 
         self.reconcile_zero(other, subtract, kahan, compensation.as_deref_mut());
         let target_schema = self.schema.min(other.schema);
@@ -331,6 +347,86 @@ impl FloatHistogram {
             }
         }
         Ok(outcome)
+    }
+
+    /// Whether `other` has exactly this histogram's exponential layout:
+    /// the schema, the zero threshold, the spans, and no bucket reaching
+    /// into the zero bucket. Reconciling two such histograms moves no
+    /// count from one bucket to another, so [`Self::combine_aligned`] and
+    /// the comparison in [`Self::detect_reset`] can walk the two bucket
+    /// vectors side by side. Consecutive samples of one series nearly
+    /// always share a layout, and that is where `rate` spends its time.
+    fn shares_layout(&self, other: &Self) -> bool {
+        self.schema == other.schema
+            && self.zero_threshold == other.zero_threshold
+            && self.positive_spans == other.positive_spans
+            && self.negative_spans == other.negative_spans
+            && self.positive_buckets.len() == other.positive_buckets.len()
+            && self.negative_buckets.len() == other.negative_buckets.len()
+            && self.clears_zero_bucket()
+    }
+
+    /// Whether every bucket lies wholly outside the zero bucket, so that
+    /// none is folded into the zero count when thresholds are reconciled.
+    fn clears_zero_bucket(&self) -> bool {
+        let clears = |spans: &[Span]| {
+            let mut index = 0i64;
+            spans.iter().all(|span| {
+                index += i64::from(span.offset);
+                let first = index;
+                index += i64::from(span.length);
+                // A bucket's lower bound is the bound of the index below.
+                span.length == 0
+                    || i32::try_from(first - 1).is_ok_and(|below| {
+                        crate::buckets::exponential_bound(below, self.schema) >= self.zero_threshold
+                    })
+            })
+        };
+        self.zero_threshold == 0.0 || (clears(&self.positive_spans) && clears(&self.negative_spans))
+    }
+
+    /// [`Self::combine`] for two histograms that [`Self::shares_layout`]:
+    /// the same additions on the same pairs, without the maps that find
+    /// the pairs when layouts differ.
+    fn combine_aligned(&mut self, other: &Self, subtract: bool, compensation: Option<&mut Self>) {
+        let signed = |value: f64| if subtract { -value } else { value };
+        let Some(c) = compensation else {
+            self.zero_count += signed(other.zero_count);
+            let sides = [
+                (&mut self.positive_buckets, &other.positive_buckets),
+                (&mut self.negative_buckets, &other.negative_buckets),
+            ];
+            for (buckets, others) in sides {
+                for (bucket, other) in buckets.iter_mut().zip(others) {
+                    *bucket += signed(*other);
+                }
+            }
+            return;
+        };
+        // Each count and then the other's compensation, which is zero for
+        // a plain histogram: the two steps `kahan_merge` takes.
+        let add = |value: f64, sum: &mut f64, c: &mut f64| {
+            (*sum, *c) = kahan_inc(value, *sum, *c);
+            (*sum, *c) = kahan_inc(0.0, *sum, *c);
+        };
+        add(other.zero_count, &mut self.zero_count, &mut c.zero_count);
+        let sides = [
+            (
+                &mut self.positive_buckets,
+                &mut c.positive_buckets,
+                &other.positive_buckets,
+            ),
+            (
+                &mut self.negative_buckets,
+                &mut c.negative_buckets,
+                &other.negative_buckets,
+            ),
+        ];
+        for (buckets, compensations, others) in sides {
+            for ((bucket, c), other) in buckets.iter_mut().zip(compensations).zip(others) {
+                add(signed(*other), bucket, c);
+            }
+        }
     }
 
     fn combine_custom(

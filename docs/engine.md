@@ -215,7 +215,10 @@ step's lookup, since such a sample cannot answer. With a 15 s scrape under a
 The sweeps (`rate`, `increase`, the extrema) fold floats. The first histogram
 of a series drops its sweep, and windows refold from the same cursors, so a
 histogram `rate` costs the histograms in its window at every step rather than
-those entering and leaving it. Only a window that holds a histogram goes to `mixed::evaluate`, which ports what each
+those entering and leaving it. Consecutive samples of one series nearly always
+share a bucket layout, and `promql-histogram` subtracts, adds and compares two
+such histograms bucket by bucket; only layouts that differ are reconciled
+through maps. Only a window that holds a histogram goes to `mixed::evaluate`, which ports what each
 function does once `samples.Histograms` is not empty. That is one of three
 things: compute on the histograms (`rate`, `sum_over_time`, `last_over_time`,
 `changes`, …), compute on the floats and pass over the histograms

@@ -28,6 +28,13 @@ into annotations. Incompatible exponential/custom schemas are errors.
 `trim_buckets` returns an independent copy, matching the pinned Prometheus
 `FloatHistogram.TrimBuckets`.
 
+`add`, `sub`, `KahanSum::add` and `detect_reset` reconcile two bucket layouts
+through ordered maps. Two histograms of one exponential layout, the same
+schema, zero threshold and spans with no bucket inside the zero bucket, skip
+that and are walked bucket by bucket: consecutive samples of a series nearly
+always qualify, and so do the terms of a `sum` over series that populate the
+same buckets. `tests/aligned.rs` holds the shortcut to the general path.
+
 `heap_size` reports retained vector capacity, not just populated entries. It
 excludes the inline value; an engine's reservation must account for both.
 
