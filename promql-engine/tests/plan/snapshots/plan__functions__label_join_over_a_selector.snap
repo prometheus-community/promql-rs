@@ -1,0 +1,9 @@
+---
+source: promql-engine/tests/plan/functions.rs
+expression: "label_join(temperature, \"id\", \"/\", \"city\", \"nowhere\")"
+---
+Projection: labels{__name__, city, id: concat_ws(Utf8("/"), get_field(label_join_0.labels, Utf8("city")), Utf8(""))}
+  SubqueryAlias: label_join_0
+    Projection: labels, samples, block_start, block_end
+      SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+        TableScan: temperature

@@ -46,6 +46,7 @@ pub(crate) mod memory;
 pub(crate) mod params;
 pub(crate) mod plan;
 pub mod range; // benches/kernels.rs
+pub(crate) mod relabel;
 pub(crate) mod scalar;
 pub mod selector; // benches/kernels.rs
 pub mod series;

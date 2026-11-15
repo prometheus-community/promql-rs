@@ -39,6 +39,7 @@ use std::time::Duration;
 use datafusion::catalog::Session;
 use datafusion::common::{Column, ScalarValue};
 use datafusion::datasource::{provider_as_source, MemTable};
+use datafusion::functions::string::expr_fn::concat_ws;
 use datafusion::logical_expr::{col, lit, LogicalPlan, LogicalPlanBuilder};
 use promql_parser::ast::{
     AggregateExpr, AtModifier, BinaryExpr, Call, Expr, MatrixSelector, UnaryExpr,
@@ -57,6 +58,7 @@ use crate::matcher::{effective_matchers, METRIC_NAME};
 use crate::matrix;
 use crate::params::{step_count, Params};
 use crate::range::{Func, RangeOp};
+use crate::relabel;
 use crate::selector;
 use crate::series::{Block, Series, BLOCK_END, BLOCK_START, LABELS, SAMPLES};
 use crate::series_eval::SeriesEval;
@@ -704,9 +706,9 @@ impl Planner<'_> {
         if let Some(func) = sort::Func::parse(name) {
             return self.sort(call, func).await;
         }
-        // `label_replace` and `label_join` do not get here yet. When they
-        // do they must stop `grouping`: they rewrite labels, so a `by`
-        // can name a label the input lacks while its source goes unnamed.
+        if let Some(func) = relabel::Func::parse(name) {
+            return self.relabel(call, func).await;
+        }
         self.range_function(call, above).await
     }
 
@@ -840,6 +842,113 @@ impl Planner<'_> {
                     args.get(1).copied(),
                 )
                 .alias(SAMPLES),
+                col(BLOCK_START),
+                col(BLOCK_END),
+            ])?
+            .build()?;
+        Ok(Planned { plan, label_names })
+    }
+
+    /// `label_replace` and `label_join`: upstream's `evalLabelReplace`
+    /// and `evalLabelJoin` (`promql/functions.go` at 83962c35). Both
+    /// rebuild `labels` with a computed destination; "" deletes it.
+    async fn relabel(&mut self, call: &Call, func: relabel::Func) -> Result<Planned, EngineError> {
+        let name = call.func.name.as_str();
+        let mut strings = Vec::with_capacity(call.args.len() - 1);
+        for arg in &call.args[1..] {
+            strings.push(string_literal(arg).ok_or_else(|| {
+                EngineError::Unsupported(format!("the {name} function over {}", describe(arg)))
+            })?);
+        }
+        enum Value<'s> {
+            Replace {
+                replacement: &'s str,
+                src: &'s str,
+                regex: regex::Regex,
+            },
+            Join {
+                separator: &'s str,
+                sources: &'s [&'s str],
+            },
+        }
+        // Checked in upstream's order and before the input is planned, as
+        // upstream panics before `ev.eval` reads a series.
+        let invalid = |what: &str, label: &str| {
+            EngineError::Query(format!("invalid {what} label name in {name}(): {label}"))
+        };
+        let (dst, value) = match (func, &strings[..]) {
+            (relabel::Func::Replace, &[dst, replacement, src, regex]) => (
+                dst,
+                Value::Replace {
+                    replacement,
+                    src,
+                    regex: relabel::compile(regex)?,
+                },
+            ),
+            (relabel::Func::Join, [dst, separator, sources @ ..]) => {
+                if let Some(src) = sources.iter().find(|source| source.is_empty()) {
+                    return Err(invalid("source", src));
+                }
+                (*dst, Value::Join { separator, sources })
+            }
+            _ => unreachable!("check_call holds {name} to its arity"),
+        };
+        if dst.is_empty() {
+            return Err(invalid("destination", dst));
+        }
+
+        // No `by` reaches the store: the call can create the label a `by`
+        // names, and the store would group by a label the series lack.
+        let input = self
+            .expr(
+                &call.args[0],
+                Above {
+                    func: Some(name),
+                    grouping: None,
+                },
+            )
+            .await?;
+        let read = |label: &str| labels::field(&input.label_names, label);
+        let dst_value = match value {
+            Value::Replace {
+                replacement,
+                src,
+                regex,
+            } => relabel::call(read(src), read(dst), regex, replacement),
+            // `concat_ws` wants a value to join; `strings.Join` of nothing
+            // is "".
+            Value::Join { sources: [], .. } => lit(""),
+            Value::Join { separator, sources } => concat_ws(
+                lit(separator),
+                sources.iter().map(|source| read(source)).collect(),
+            ),
+        };
+        let mut label_names = input.label_names.clone();
+        label_names.push(dst.to_string());
+        label_names.sort();
+        label_names.dedup();
+        let labels_expr = labels::call(
+            label_names
+                .iter()
+                .map(|label| {
+                    let value = if label == dst {
+                        dst_value.clone()
+                    } else {
+                        read(label)
+                    };
+                    (label.clone(), value)
+                })
+                .collect(),
+        );
+        // Upstream's `mergeSeriesWithSameLabelset` runs here and errors on
+        // a collision with shared timestamps; this engine defers it to
+        // `labelset::finalize`, so `count` above a collision counts both.
+        let stage = self.stage(name);
+        let plan = LogicalPlanBuilder::from(input.plan)
+            .alias(stage)?
+            .project(vec![
+                labels_expr.alias(LABELS),
+                col(SAMPLES),
                 col(BLOCK_START),
                 col(BLOCK_END),
             ])?

@@ -124,7 +124,7 @@ grouping_label_list -> Result<Vec<String>, ()>:
 
 grouping_label -> Result<String, ()>:
     maybe_label { $1 }
-  | 'STRING' { Ok(actions::string_literal_value($lexer, $1.map_err(|_| ())?.span())?) }
+  | 'STRING' { Ok(actions::string_literal_value(p, $lexer, $1.map_err(|_| ())?.span())?) }
   ;
 
 fill_value -> Result<f64, ()>:
@@ -211,8 +211,8 @@ label_match_list -> Result<Vec<LabelMatcher>, ()>:
   ;
 
 label_matcher -> Result<LabelMatcher, ()>:
-    'IDENT' match_op 'STRING' { actions::label_matcher($lexer, $span, $1.map_err(|_| ())?.span(), $2?, $3.map_err(|_| ())?) }
-  | string_identifier match_op 'STRING' { actions::label_matcher_quoted_name($lexer, $span, $1?, $2?, $3.map_err(|_| ())?) }
+    'IDENT' match_op 'STRING' { actions::label_matcher(p, $lexer, $span, $1.map_err(|_| ())?.span(), $2?, $3.map_err(|_| ())?) }
+  | string_identifier match_op 'STRING' { actions::label_matcher_quoted_name(p, $lexer, $span, $1?, $2?, $3.map_err(|_| ())?) }
   | string_identifier { actions::quoted_metric_name_matcher_from_ident($lexer, $span, $1?) }
   ;
 
@@ -268,8 +268,8 @@ label_set_list -> Result<Vec<LabelMatcher>, ()>:
   ;
 
 label_set_item -> Result<LabelMatcher, ()>:
-    'IDENT' 'EQ' 'STRING' { actions::label_from_ident($lexer, $span, $1, $3) }
-  | string_identifier 'EQ' 'STRING' { actions::label_from_string_ident($lexer, $span, $1?, $3) }
+    'IDENT' 'EQ' 'STRING' { actions::label_from_ident(p, $lexer, $span, $1, $3) }
+  | string_identifier 'EQ' 'STRING' { actions::label_from_string_ident(p, $lexer, $span, $1?, $3) }
   | string_identifier { actions::label_metric_name($span, $1?) }
   ;
 
@@ -390,11 +390,11 @@ uint -> Result<u64, ()>:
   ;
 
 string_literal -> Result<Expr, ()>:
-    'STRING' { actions::string_literal($lexer, $1.map_err(|_| ())?) }
+    'STRING' { actions::string_literal(p, $lexer, $1.map_err(|_| ())?) }
   ;
 
 string_identifier -> Result<String, ()>:
-    'STRING' { Ok(actions::string_literal_value($lexer, $1.map_err(|_| ())?.span())?) }
+    'STRING' { Ok(actions::string_literal_value(p, $lexer, $1.map_err(|_| ())?.span())?) }
   ;
 
 maybe_grouping_labels -> Result<Vec<String>, ()>:
