@@ -529,11 +529,12 @@ pub fn subquery_from_exprs<'l, 'i: 'l>(
 /// is supported; extracts the f64 and applies it to the subject.
 pub fn offset_from_expr<'l, 'i: 'l>(
     _lexer: &'l L<'l, 'i>,
+    p: &ParserCtx,
     inner: Result<Expr, ()>,
     offset: Result<Expr, ()>,
 ) -> Result<Expr, ()> {
     let offset_secs = duration_from_expr(&offset?)?;
-    Ok(apply_offset(inner?, offset_secs))
+    apply_offset(p, inner?, offset_secs)
 }
 
 /// Extract a seconds-valued f64 from an Expr whose shape is a
@@ -548,60 +549,128 @@ fn duration_from_expr(e: &Expr) -> Result<f64, ()> {
     }
 }
 
-fn apply_offset(mut e: Expr, offset_secs: f64) -> Expr {
-    match &mut e {
-        Expr::VectorSelector(vs) => {
-            vs.original_offset_secs = offset_secs;
-            vs.offset_secs = offset_secs;
-        }
-        Expr::MatrixSelector(ms) => {
-            if let Expr::VectorSelector(vs) = ms.vector_selector.as_mut() {
-                vs.original_offset_secs = offset_secs;
-                vs.offset_secs = offset_secs;
+/// Upstream `addOffset` (`parse.go`). The offset binds to the selector or
+/// subquery it follows; on anything else upstream reports an error, so
+/// ignoring it here would answer `sum(foo) offset 5m` as `sum(foo)`.
+fn apply_offset(p: &ParserCtx, mut e: Expr, offset_secs: f64) -> Result<Expr, ()> {
+    let range = e.position_range();
+    let (original, has_expr, live) = match &mut e {
+        Expr::VectorSelector(vs) => (
+            &mut vs.original_offset_secs,
+            vs.original_offset_expr.is_some(),
+            &mut vs.offset_secs,
+        ),
+        Expr::MatrixSelector(ms) => match ms.vector_selector.as_mut() {
+            Expr::VectorSelector(vs) => (
+                &mut vs.original_offset_secs,
+                vs.original_offset_expr.is_some(),
+                &mut vs.offset_secs,
+            ),
+            _ => {
+                p.add_parse_err(range, "ranges only allowed for vector selectors");
+                return Err(());
             }
+        },
+        Expr::Subquery(sq) => (
+            &mut sq.original_offset_secs,
+            sq.original_offset_expr.is_some(),
+            &mut sq.offset_secs,
+        ),
+        _ => {
+            p.add_parse_err(
+                range,
+                "offset modifier must be preceded by an instant vector selector \
+                 or range vector selector or a subquery",
+            );
+            return Err(());
         }
-        Expr::Subquery(sq) => {
-            sq.original_offset_secs = offset_secs;
-            sq.offset_secs = offset_secs;
-        }
-        _ => {}
+    };
+    // Upstream tests the original offset against zero, so a leading
+    // `offset 0s` does not count as having been set.
+    if *original != 0.0 || has_expr {
+        p.add_parse_err(range, "offset may not be set multiple times");
+        return Err(());
     }
-    e
-}
-
-/// NaN, ±Inf and out-of-range seconds are a parse error, not a clamped
-/// timestamp (upstream's `setTimestamp` rejects them too).
-fn apply_at_timestamp(mut e: Expr, secs: f64) -> Result<Expr, ()> {
-    let ts_ms = promql_common::model::secs_to_millis(secs).ok_or(())?;
-    match &mut e {
-        Expr::VectorSelector(vs) => vs.timestamp = Some(ts_ms),
-        Expr::MatrixSelector(ms) => {
-            if let Expr::VectorSelector(vs) = ms.vector_selector.as_mut() {
-                vs.timestamp = Some(ts_ms);
-            }
-        }
-        Expr::Subquery(sq) => sq.timestamp = Some(ts_ms),
-        _ => {}
-    }
+    *original = offset_secs;
+    *live = offset_secs;
     Ok(e)
 }
 
+/// Upstream `getAtModifierVars`: the `@` slots of the selector or
+/// subquery `e`, or an error for any other node and for a second `@`.
+fn at_modifier_vars<'e>(
+    p: &ParserCtx,
+    e: &'e mut Expr,
+) -> Result<(&'e mut Option<i64>, &'e mut Option<AtModifier>), ()> {
+    let range = e.position_range();
+    let (timestamp, start_or_end) = match e {
+        Expr::VectorSelector(vs) => (&mut vs.timestamp, &mut vs.start_or_end),
+        Expr::MatrixSelector(ms) => match ms.vector_selector.as_mut() {
+            Expr::VectorSelector(vs) => (&mut vs.timestamp, &mut vs.start_or_end),
+            _ => {
+                p.add_parse_err(range, "ranges only allowed for vector selectors");
+                return Err(());
+            }
+        },
+        Expr::Subquery(sq) => (&mut sq.timestamp, &mut sq.start_or_end),
+        _ => {
+            p.add_parse_err(
+                range,
+                "@ modifier must be preceded by an instant vector selector \
+                 or range vector selector or a subquery",
+            );
+            return Err(());
+        }
+    };
+    if timestamp.is_some() || start_or_end.is_some() {
+        p.add_parse_err(range, "@ <timestamp> may not be set multiple times");
+        return Err(());
+    }
+    Ok((timestamp, start_or_end))
+}
+
+/// Upstream `setTimestamp`. Both of its checks run, so a bad timestamp on
+/// a non-selector reports both errors, as upstream does.
+fn apply_at_timestamp(p: &ParserCtx, mut e: Expr, secs: f64) -> Result<Expr, ()> {
+    // Stricter than upstream's `ts >= MaxInt64` (in seconds): Go then
+    // converts to milliseconds and wraps for |ts| past ~9.2e15 s, where
+    // this reports the same error instead of a wrapped timestamp.
+    let ts_ms = promql_common::model::secs_to_millis(secs);
+    if ts_ms.is_none() {
+        p.add_parse_err(
+            e.position_range(),
+            format!(
+                "timestamp out of bounds for @ modifier: {}",
+                go_percent_f(secs)
+            ),
+        );
+    }
+    let (timestamp, _) = at_modifier_vars(p, &mut e)?;
+    *timestamp = Some(ts_ms.ok_or(())?);
+    Ok(e)
+}
+
+/// Go's `%f`: six decimals, and `NaN` / `+Inf` / `-Inf` spelled its way.
+fn go_percent_f(v: f64) -> String {
+    if v.is_nan() {
+        "NaN".to_string()
+    } else if v.is_infinite() {
+        if v > 0.0 { "+Inf" } else { "-Inf" }.to_string()
+    } else {
+        format!("{v:.6}")
+    }
+}
+
+/// Upstream `setAtModifierPreprocessor`: `@ start()` / `@ end()`.
 pub fn at_modifier<'l, 'i: 'l>(
     _lexer: &'l L<'l, 'i>,
+    p: &ParserCtx,
     inner: Result<Expr, ()>,
     modifier: AtModifier,
 ) -> Result<Expr, ()> {
     let mut e = inner?;
-    match &mut e {
-        Expr::VectorSelector(vs) => vs.start_or_end = Some(modifier),
-        Expr::MatrixSelector(ms) => {
-            if let Expr::VectorSelector(vs) = ms.vector_selector.as_mut() {
-                vs.start_or_end = Some(modifier);
-            }
-        }
-        Expr::Subquery(sq) => sq.start_or_end = Some(modifier),
-        _ => {}
-    }
+    let (_, start_or_end) = at_modifier_vars(p, &mut e)?;
+    *start_or_end = Some(modifier);
     Ok(e)
 }
 
@@ -676,10 +745,11 @@ pub fn set_smoothed(p: &ParserCtx, inner: Result<Expr, ()>) -> Result<Expr, ()> 
 /// `signed_or_unsigned_number → number` rule chain).
 pub fn at_timestamp_val<'l, 'i: 'l>(
     _lexer: &'l L<'l, 'i>,
+    p: &ParserCtx,
     inner: Result<Expr, ()>,
     secs: f64,
 ) -> Result<Expr, ()> {
-    apply_at_timestamp(inner?, secs)
+    apply_at_timestamp(p, inner?, secs)
 }
 
 /// Just the f64 value of a NUMBER token — used by upstream's `number`
@@ -780,8 +850,11 @@ pub fn function_call_keyword<'l, 'i: 'l>(
 
 /// Upstream `newAggregateExpr`, including the experimental-aggregator
 /// gate: `limitk` and `limit_ratio` follow `EnableExperimentalFunctions`.
-/// Upstream reports it and returns the half-built node; this returns an
-/// error, since nothing downstream can use that node.
+/// Upstream reports each problem and returns the half-built node; this
+/// returns an error, since nothing downstream can use that node.
+///
+/// The checks run in upstream's order, so `limitk()` with the gate off
+/// reports the missing arguments rather than the gate.
 pub fn aggregate<'l, 'i: 'l>(
     _lexer: &'l L<'l, 'i>,
     p: &ParserCtx,
@@ -790,40 +863,50 @@ pub fn aggregate<'l, 'i: 'l>(
     modifier: Option<(bool, Vec<String>)>,
     mut args: Vec<Expr>,
 ) -> Result<Expr, ()> {
-    if !p.options().enable_experimental_functions
-        && matches!(op, ItemType::Limitk | ItemType::LimitRatio)
-    {
-        p.add_gate_err(
-            crate::options::EXPERIMENTAL_FUNCTIONS,
-            to_pos_range(span),
+    let pos_range = to_pos_range(span);
+    if args.is_empty() {
+        p.add_parse_err(pos_range, "no arguments for aggregate expression provided");
+        return Err(());
+    }
+    let desired = if aggregator_takes_param(op) {
+        if !p.options().enable_experimental_functions
+            && matches!(op, ItemType::Limitk | ItemType::LimitRatio)
+        {
+            p.add_gate_err(
+                crate::options::EXPERIMENTAL_FUNCTIONS,
+                pos_range,
+                format!(
+                    "{op}() is experimental and must be enabled with \
+                     --enable-feature=promql-experimental-functions"
+                ),
+            );
+            return Err(());
+        }
+        2
+    } else {
+        1
+    };
+    if args.len() != desired {
+        p.add_parse_err(
+            pos_range,
             format!(
-                "{op}() is experimental and must be enabled with \
-                 --enable-feature=promql-experimental-functions"
+                "wrong number of arguments for aggregate expression provided, \
+                 expected {desired}, got {}",
+                args.len()
             ),
         );
         return Err(());
     }
+    let expr = args.pop().expect("checked len");
+    let param = args.pop().map(Box::new);
     let (without, grouping) = modifier.unwrap_or((false, Vec::new()));
-    let (param, expr) = if aggregator_takes_param(op) && args.len() >= 2 {
-        let p = args.remove(0);
-        (Some(Box::new(p)), args.pop().expect("checked len"))
-    } else {
-        let e = args.pop().unwrap_or_else(|| {
-            Expr::NumberLiteral(NumberLiteral {
-                val: 0.0,
-                duration: false,
-                pos_range: to_pos_range(span),
-            })
-        });
-        (None, e)
-    };
     Ok(Expr::Aggregate(AggregateExpr {
         op,
         expr: Box::new(expr),
         param,
         grouping,
         without,
-        pos_range: to_pos_range(span),
+        pos_range,
     }))
 }
 
@@ -1048,37 +1131,131 @@ pub fn parse_uint<'l, 'i: 'l>(lexer: &'l L<'l, 'i>, lx: Result<Lx, Lx>) -> Resul
 
 // -------- shared parsers (number, duration, string) --------
 
+/// Upstream `number()`: `strconv.ParseInt(val, 0, 64)`, and
+/// `strconv.ParseFloat(val, 64)` only if that fails. Base 0 is what makes
+/// `010` octal (8) and lets `_` separate digits; a decimal parse alone
+/// would answer 10 and change the query's value without an error.
 fn parse_number_literal(raw: &str) -> Result<f64, ()> {
-    if raw.eq_ignore_ascii_case("nan") {
-        return Ok(f64::NAN);
+    go_parse_int_base0(raw)
+        .map(|n| n as f64)
+        .or_else(|| go_parse_float(raw))
+        .ok_or(())
+}
+
+fn split_sign(s: &str) -> (bool, &str) {
+    match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
     }
-    if raw.eq_ignore_ascii_case("inf") || raw.eq_ignore_ascii_case("+inf") {
-        return Ok(f64::INFINITY);
+}
+
+/// `strconv.ParseInt(s, 0, 64)`; `None` for its syntax and range errors.
+fn go_parse_int_base0(s: &str) -> Option<i64> {
+    let (negative, body) = split_sign(s);
+    let b = body.as_bytes();
+    if b.is_empty() {
+        return None;
     }
-    if raw.eq_ignore_ascii_case("-inf") {
-        return Ok(f64::NEG_INFINITY);
+    // `ParseUint`'s base-0 prefixes: a prefix needs at least one character
+    // after it, and any other leading `0` means octal.
+    let (radix, digits) = match b {
+        [b'0', p, _, ..] if matches!(p | 0x20, b'b' | b'o' | b'x') => {
+            let radix = match p | 0x20 {
+                b'b' => 2,
+                b'o' => 8,
+                _ => 16,
+            };
+            (radix, &body[2..])
+        }
+        [b'0', ..] => (8, &body[1..]),
+        _ => (10, body),
+    };
+    let mut n: u64 = 0;
+    let mut underscores = false;
+    for c in digits.chars() {
+        if c == '_' {
+            underscores = true;
+            continue;
+        }
+        let d = c.to_digit(radix)?;
+        n = n.checked_mul(u64::from(radix))?.checked_add(u64::from(d))?;
     }
-    let cleaned: String = raw.chars().filter(|&c| c != '_').collect();
-    let s = cleaned.as_str();
-    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        return u64::from_str_radix(hex, 16)
-            .map(|n| n as f64)
-            .map_err(|_| ());
+    if underscores && !go_underscore_ok(s) {
+        return None;
     }
-    if let Some(oct) = s.strip_prefix("0o").or_else(|| s.strip_prefix("0O")) {
-        return u64::from_str_radix(oct, 8)
-            .map(|n| n as f64)
-            .map_err(|_| ());
+    if negative {
+        // -2^63 is the one magnitude past i64::MAX that still fits.
+        (n <= 1 << 63).then(|| (n as i64).wrapping_neg())
+    } else {
+        i64::try_from(n).ok()
     }
-    if let Some(bin) = s.strip_prefix("0b").or_else(|| s.strip_prefix("0B")) {
-        return u64::from_str_radix(bin, 2)
-            .map(|n| n as f64)
-            .map_err(|_| ());
+}
+
+/// `strconv.ParseFloat(s, 64)` over what the lexers can hand it.
+fn go_parse_float(s: &str) -> Option<f64> {
+    let (negative, body) = split_sign(s);
+    let signed = |v: f64| if negative { -v } else { v };
+    let lower = body.to_ascii_lowercase();
+    // `special()`: a sign falls through to the infinity case only, so
+    // `+nan` is a syntax error while `+inf` is not.
+    if lower == "inf" || lower == "infinity" {
+        return Some(signed(f64::INFINITY));
     }
-    // Rust's parse saturates an overflowing literal to infinity where
-    // Go's `ParseFloat` returns `ErrRange`; the spelled-out infinities
-    // were handled above.
-    s.parse::<f64>().ok().filter(|v| v.is_finite()).ok_or(())
+    if lower == "nan" {
+        return (body.len() == s.len()).then_some(f64::NAN);
+    }
+    // A hex float needs a `p` exponent, which neither lexer produces;
+    // plain hex has already gone through `ParseInt`.
+    if lower.starts_with("0x") || body.starts_with(['+', '-']) {
+        return None;
+    }
+    if !body
+        .bytes()
+        .all(|c| c.is_ascii_digit() || matches!(c, b'.' | b'_' | b'e' | b'E' | b'+' | b'-'))
+    {
+        return None;
+    }
+    if body.contains('_') && !go_underscore_ok(s) {
+        return None;
+    }
+    let v: f64 = body.replace('_', "").parse().ok()?;
+    // Go reports overflow as `ErrRange` where Rust saturates to infinity;
+    // underflow to zero is not an error in either.
+    v.is_finite().then(|| signed(v))
+}
+
+/// Go's `strconv.underscoreOK`: `_` only between digits, or between a
+/// base prefix and a digit.
+fn go_underscore_ok(s: &str) -> bool {
+    let (_, body) = split_sign(s);
+    let b = body.as_bytes();
+    let mut saw = b'^';
+    let mut start = 0;
+    let mut hex = false;
+    if b.len() >= 2 && b[0] == b'0' && matches!(b[1] | 0x20, b'b' | b'o' | b'x') {
+        start = 2;
+        saw = b'0';
+        hex = b[1] | 0x20 == b'x';
+    }
+    for &c in &b[start..] {
+        if c.is_ascii_digit() || hex && matches!(c | 0x20, b'a'..=b'f') {
+            saw = b'0';
+            continue;
+        }
+        if c == b'_' {
+            if saw != b'0' {
+                return false;
+            }
+            saw = b'_';
+            continue;
+        }
+        if saw == b'_' {
+            return false;
+        }
+        saw = b'!';
+    }
+    saw != b'_'
 }
 
 /// Parse a PromQL duration literal (`30s`, `1h30m`, `500ms`) into
@@ -1263,5 +1440,51 @@ mod tests {
     #[test]
     fn duration_literal_rejects_sub_millisecond_unit() {
         assert!(parse_duration_seconds("5us").is_err());
+    }
+
+    /// Upstream `number()` on the shapes its two `strconv` calls treat
+    /// differently from a plain decimal parse. Expected values are Go's
+    /// own answers (`strconv` at go1.26), not derived from this code.
+    #[test]
+    fn number_literals_parse_as_go_does() {
+        for (raw, want) in [
+            ("010", Some(8.0)),
+            ("0755", Some(493.0)),
+            ("08", Some(8.0)),
+            ("09.5", Some(9.5)),
+            ("0", Some(0.0)),
+            ("00", Some(0.0)),
+            ("0_7", Some(7.0)),
+            ("017e1", Some(170.0)),
+            ("00.5", Some(0.5)),
+            ("1_000", Some(1000.0)),
+            ("1_000.5", Some(1000.5)),
+            ("0x_1F", Some(31.0)),
+            ("0x1_F", Some(31.0)),
+            ("0o17", Some(15.0)),
+            ("0B101", Some(5.0)),
+            ("0x7FFFFFFFFFFFFFFF", Some(9.223372036854776e18)),
+            ("9223372036854775808", Some(9.223372036854776e18)),
+            ("99999999999999999999", Some(1e20)),
+            ("1E3", Some(1000.0)),
+            (".5", Some(0.5)),
+            ("1.", Some(1.0)),
+            ("1e-400", Some(0.0)),
+            ("Inf", Some(f64::INFINITY)),
+            ("-Inf", Some(f64::NEG_INFINITY)),
+            ("infinity", Some(f64::INFINITY)),
+            ("0x", None),
+            ("0xFFFFFFFFFFFFFFFF", None),
+            ("1e400", None),
+            ("+nan", None),
+            ("1__0", None),
+            ("_1", None),
+            ("1_", None),
+            ("1_.5", None),
+            ("1_e5", None),
+        ] {
+            assert_eq!(parse_number_literal(raw).ok(), want, "{raw}");
+        }
+        assert!(parse_number_literal("NaN").unwrap().is_nan());
     }
 }

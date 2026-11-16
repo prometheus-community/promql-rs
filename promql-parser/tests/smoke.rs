@@ -501,3 +501,110 @@ fn a_label_name_may_not_contain_a_colon() {
     // identifier as alphanumerics alone.
     assert!(parse_expr(r#"up{a:b="c"}"#).is_err());
 }
+
+fn messages(q: &str) -> Vec<String> {
+    parse_expr(q)
+        .expect_err("upstream rejects this query")
+        .into_iter()
+        .map(|e| e.message)
+        .collect()
+}
+
+/// Upstream `addOffset`: an offset on anything but a selector or a
+/// subquery is an error. Dropping it would answer `sum(foo) offset 5m`
+/// as `sum(foo)`.
+#[test]
+fn offset_must_follow_a_selector_or_subquery() {
+    const MSG: &str = "offset modifier must be preceded by an instant vector selector \
+                       or range vector selector or a subquery";
+    for q in [
+        "sum(foo) offset 5m",
+        "rate(foo[5m]) offset 5m",
+        "(foo) offset 5m",
+        "1 offset 5m",
+    ] {
+        assert_eq!(messages(q), [MSG], "{q}");
+    }
+    assert_eq!(
+        messages("foo offset 5m offset 10m"),
+        ["offset may not be set multiple times"]
+    );
+    for q in [
+        "foo offset 5m",
+        "foo[5m] offset 5m",
+        "foo offset 0s offset 5m",
+    ] {
+        must_parse(q);
+    }
+}
+
+/// Upstream `getAtModifierVars` and `setTimestamp`.
+#[test]
+fn at_must_follow_a_selector_or_subquery_once() {
+    const MSG: &str = "@ modifier must be preceded by an instant vector selector \
+                       or range vector selector or a subquery";
+    for q in ["sum(foo) @ 100", "rate(foo[5m]) @ start()", "(foo) @ end()"] {
+        assert_eq!(messages(q), [MSG], "{q}");
+    }
+    for q in ["foo @ 1 @ 2", "foo @ 1 @ start()", "foo @ end() @ 1"] {
+        assert_eq!(
+            messages(q),
+            ["@ <timestamp> may not be set multiple times"],
+            "{q}"
+        );
+    }
+    assert_eq!(
+        messages("foo @ NaN"),
+        ["timestamp out of bounds for @ modifier: NaN"]
+    );
+    // Both of `setTimestamp`'s checks report.
+    assert_eq!(
+        messages("sum(foo) @ Inf"),
+        [
+            "timestamp out of bounds for @ modifier: +Inf".to_string(),
+            MSG.to_string()
+        ]
+    );
+    for q in ["foo @ 100", "foo[5m] @ start()", "foo @ 100 offset 5m"] {
+        must_parse(q);
+    }
+}
+
+/// Upstream `newAggregateExpr` counts the arguments instead of making
+/// up a node from what is there.
+#[test]
+fn aggregate_argument_count_is_checked() {
+    let at = |q: &str| {
+        parse_expr(q)
+            .expect_err("upstream rejects this query")
+            .into_iter()
+            .map(|e| (e.message, e.range.start, e.range.end))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        at("sum()"),
+        [(
+            "no arguments for aggregate expression provided".to_string(),
+            0,
+            5
+        )]
+    );
+    for (q, want) in [
+        ("sum(a, b)", "expected 1, got 2"),
+        ("topk(foo)", "expected 2, got 1"),
+        ("topk(1, 2, foo)", "expected 2, got 3"),
+    ] {
+        assert_eq!(
+            messages(q),
+            [format!(
+                "wrong number of arguments for aggregate expression provided, {want}"
+            )],
+            "{q}"
+        );
+    }
+    // The missing arguments are reported ahead of the experimental gate.
+    assert_eq!(
+        messages("limitk()"),
+        ["no arguments for aggregate expression provided"]
+    );
+}
