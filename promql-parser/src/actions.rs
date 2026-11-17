@@ -530,11 +530,12 @@ pub fn subquery_from_exprs<'l, 'i: 'l>(
 pub fn offset_from_expr<'l, 'i: 'l>(
     _lexer: &'l L<'l, 'i>,
     p: &ParserCtx,
+    span: Span,
     inner: Result<Expr, ()>,
     offset: Result<Expr, ()>,
 ) -> Result<Expr, ()> {
     let offset_secs = duration_from_expr(&offset?)?;
-    apply_offset(p, inner?, offset_secs)
+    apply_offset(p, inner?, offset_secs, span.end() as Pos)
 }
 
 /// Extract a seconds-valued f64 from an Expr whose shape is a
@@ -552,7 +553,7 @@ fn duration_from_expr(e: &Expr) -> Result<f64, ()> {
 /// Upstream `addOffset` (`parse.go`). The offset binds to the selector or
 /// subquery it follows; on anything else upstream reports an error, so
 /// ignoring it here would answer `sum(foo) offset 5m` as `sum(foo)`.
-fn apply_offset(p: &ParserCtx, mut e: Expr, offset_secs: f64) -> Result<Expr, ()> {
+fn apply_offset(p: &ParserCtx, mut e: Expr, offset_secs: f64, end: Pos) -> Result<Expr, ()> {
     let range = e.position_range();
     let (original, has_expr, live) = match &mut e {
         Expr::VectorSelector(vs) => (
@@ -593,7 +594,22 @@ fn apply_offset(p: &ParserCtx, mut e: Expr, offset_secs: f64) -> Result<Expr, ()
     }
     *original = offset_secs;
     *live = offset_secs;
+    extend_end(&mut e, end);
     Ok(e)
+}
+
+/// Upstream's `*endPosp = p.lastClosing`: a modifier the node takes
+/// stretches the node's end over it, so a later error on the node (a
+/// second offset, say) covers the first modifier too. Only the success
+/// paths call this, after the slot borrows have ended; upstream returns
+/// before the write on every error path.
+fn extend_end(e: &mut Expr, end: Pos) {
+    match e {
+        Expr::VectorSelector(vs) => vs.pos_range.end = end,
+        Expr::MatrixSelector(ms) => ms.end_pos = end,
+        Expr::Subquery(sq) => sq.end_pos = end,
+        _ => {}
+    }
 }
 
 /// Upstream `getAtModifierVars`: the `@` slots of the selector or
@@ -631,7 +647,7 @@ fn at_modifier_vars<'e>(
 
 /// Upstream `setTimestamp`. Both of its checks run, so a bad timestamp on
 /// a non-selector reports both errors, as upstream does.
-fn apply_at_timestamp(p: &ParserCtx, mut e: Expr, secs: f64) -> Result<Expr, ()> {
+fn apply_at_timestamp(p: &ParserCtx, mut e: Expr, secs: f64, end: Pos) -> Result<Expr, ()> {
     // Stricter than upstream's `ts >= MaxInt64` (in seconds): Go then
     // converts to milliseconds and wraps for |ts| past ~9.2e15 s, where
     // this reports the same error instead of a wrapped timestamp.
@@ -647,6 +663,7 @@ fn apply_at_timestamp(p: &ParserCtx, mut e: Expr, secs: f64) -> Result<Expr, ()>
     }
     let (timestamp, _) = at_modifier_vars(p, &mut e)?;
     *timestamp = Some(ts_ms.ok_or(())?);
+    extend_end(&mut e, end);
     Ok(e)
 }
 
@@ -665,12 +682,14 @@ fn go_percent_f(v: f64) -> String {
 pub fn at_modifier<'l, 'i: 'l>(
     _lexer: &'l L<'l, 'i>,
     p: &ParserCtx,
+    span: Span,
     inner: Result<Expr, ()>,
     modifier: AtModifier,
 ) -> Result<Expr, ()> {
     let mut e = inner?;
     let (_, start_or_end) = at_modifier_vars(p, &mut e)?;
     *start_or_end = Some(modifier);
+    extend_end(&mut e, span.end() as Pos);
     Ok(e)
 }
 
@@ -746,10 +765,11 @@ pub fn set_smoothed(p: &ParserCtx, inner: Result<Expr, ()>) -> Result<Expr, ()> 
 pub fn at_timestamp_val<'l, 'i: 'l>(
     _lexer: &'l L<'l, 'i>,
     p: &ParserCtx,
+    span: Span,
     inner: Result<Expr, ()>,
     secs: f64,
 ) -> Result<Expr, ()> {
-    apply_at_timestamp(p, inner?, secs)
+    apply_at_timestamp(p, inner?, secs, span.end() as Pos)
 }
 
 /// Just the f64 value of a NUMBER token — used by upstream's `number`

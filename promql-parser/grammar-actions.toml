@@ -763,12 +763,12 @@ action = "actions::offset($lexer, $1, false, $4.map_err(|_| ())?)"
 [[actions]]
 rule = "step_invariant_expr"
 alt = "expr AT signed_or_unsigned_number"
-action = "actions::at_timestamp_val($lexer, p, $1, $3?)"
+action = "actions::at_timestamp_val($lexer, p, $span, $1, $3?)"
 
 [[actions]]
 rule = "step_invariant_expr"
 alt = "expr AT at_modifier_preprocessors LEFT_PAREN RIGHT_PAREN"
-action = "actions::at_modifier($lexer, p, $1, $3?)"
+action = "actions::at_modifier($lexer, p, $span, $1, $3?)"
 
 [[actions]]
 rule = "at_modifier_preprocessors"
@@ -920,7 +920,7 @@ action = "actions::subquery_from_exprs($lexer, $span, $1, $3, Some($5))"
 [[actions]]
 rule = "offset_expr"
 alt = "expr OFFSET offset_duration_expr"
-action = "actions::offset_from_expr($lexer, p, $1, $3)"
+action = "actions::offset_from_expr($lexer, p, $span, $1, $3)"
 
 [[actions]]
 rule = "offset_duration_expr"
