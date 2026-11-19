@@ -27,8 +27,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `start` rule dispatching on an injected START_* pseudo-token
     // (mirroring upstream's `parseGenerated`), and each parse mode
     // pairs it with the lexer for that mode.
+    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
+    // `CTParserBuilder::build` skips codegen when `grammar.y.rs` is newer than
+    // `src/grammar.y`, which would leave an already-patched file behind if only
+    // `build.rs` changed.
+    let _ = std::fs::remove_file(out_dir.join("grammar.y.rs"));
+
     let ctp = CTParserBuilder::<lrlex::DefaultLexerTypes<u32>>::new()
         .yacckind(YaccKind::Grmtools)
+        // Upstream goyacc stops at the first syntax error rather than synthesizing
+        // token repairs; skipping CPCT+ avoids multi-millisecond repair searches on
+        // malformed inputs whose repaired AST `parse_generated` discards anyway.
+        .recoverer(lrpar::RecoveryKind::None)
         .grammar_in_src_dir("grammar.y")?
         // The emitted grammar mirrors upstream's, which is ambiguous
         // by design — operator precedence and the matrix/subquery [..]
@@ -38,6 +48,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // them silently.
         .error_on_conflicts(false)
         .build()?;
+
+    patch_generated_grammar(&out_dir.join("grammar.y.rs"))?;
 
     // `lexer.l` — ordinary PromQL expressions. `series.l` — series
     // descriptions (upstream's `seriesDesc` lexer mode). Neither
@@ -137,10 +149,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok_or_else(|| format!("grammar.y has no {token} token"))?;
         consts.push_str(&format!("pub const {token}: u32 = {id};\n"));
     }
-    std::fs::write(
-        std::path::Path::new(&std::env::var("OUT_DIR")?).join("start_tokens.rs"),
-        consts,
-    )?;
+    std::fs::write(out_dir.join("start_tokens.rs"), consts)?;
 
+    Ok(())
+}
+
+// `lrpar` emits `_reconstitute(__GRM_DATA, __STABLE_DATA)` and a heap `vec![...]`
+// of 248 action wrappers inside `parse()`, deserializing ~94 KiB of bincode tables
+// on every parse call. Cache the deserialized tables once via `crate::grammar::cached_tables`
+// and borrow the action wrappers from a stack slice.
+fn patch_generated_grammar(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let generated = std::fs::read_to_string(path)?;
+    const RECONSTITUTE_OLD: &str =
+        "let (grm, stable) = ::lrpar::ctbuilder::_reconstitute(__GRM_DATA, __STABLE_DATA);";
+    const RECONSTITUTE_NEW: &str = "let (grm, stable) = crate::grammar::cached_tables(|| ::lrpar::ctbuilder::_reconstitute(__GRM_DATA, __STABLE_DATA));";
+    if !generated.contains(RECONSTITUTE_OLD) {
+        return Err("expected lrpar _reconstitute call in generated grammar.y.rs".into());
+    }
+    let patched = generated.replacen(RECONSTITUTE_OLD, RECONSTITUTE_NEW, 1);
+
+    const VEC_TYPE_OLD: &str = "let actions: ::std::vec::Vec<&dyn Fn(";
+    const VEC_TYPE_NEW: &str = "let actions: &[&dyn Fn(";
+    const VEC_INIT_OLD: &str = "-> __GtActionsKind<'input>> = ::std::vec![";
+    const VEC_INIT_NEW: &str = "-> __GtActionsKind<'input>] = &[";
+    const BUILDER_OLD: &str = "::lrpar::RTParserBuilder::new(&grm, &stable)";
+    const BUILDER_NEW: &str = "::lrpar::RTParserBuilder::new(grm, stable)";
+    const CALL_OLD: &str = ".parse_actions(lexer, &actions, p)";
+    const CALL_NEW: &str = ".parse_actions(lexer, actions, p)";
+    if !patched.contains(VEC_TYPE_OLD)
+        || !patched.contains(VEC_INIT_OLD)
+        || !patched.contains(BUILDER_OLD)
+        || !patched.contains(CALL_OLD)
+    {
+        return Err("expected lrpar actions vec in generated grammar.y.rs".into());
+    }
+    let patched = patched
+        .replacen(VEC_TYPE_OLD, VEC_TYPE_NEW, 1)
+        .replacen(VEC_INIT_OLD, VEC_INIT_NEW, 1)
+        .replacen(BUILDER_OLD, BUILDER_NEW, 1)
+        .replacen(CALL_OLD, CALL_NEW, 1);
+    std::fs::write(path, patched)?;
     Ok(())
 }
