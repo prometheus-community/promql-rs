@@ -159,7 +159,7 @@ positive_duration_expr -> Result<Expr, ()>:
   ;
 
 offset_expr -> Result<Expr, ()>:
-    expr 'OFFSET' offset_duration_expr { actions::offset_from_expr($lexer, $1, $3) }
+    expr 'OFFSET' offset_duration_expr { actions::offset_from_expr($lexer, p, $span, $1, $3) }
   ;
 
 anchored_expr -> Result<Expr, ()>:
@@ -171,8 +171,8 @@ smoothed_expr -> Result<Expr, ()>:
   ;
 
 step_invariant_expr -> Result<Expr, ()>:
-    expr 'AT' signed_or_unsigned_number { actions::at_timestamp_val($lexer, $1, $3?) }
-  | expr 'AT' at_modifier_preprocessors 'LPAREN' 'RPAREN' { actions::at_modifier($lexer, $1, $3?) }
+    expr 'AT' signed_or_unsigned_number { actions::at_timestamp_val($lexer, p, $span, $1, $3?) }
+  | expr 'AT' at_modifier_preprocessors 'LPAREN' 'RPAREN' { actions::at_modifier($lexer, p, $span, $1, $3?) }
   ;
 
 at_modifier_preprocessors -> Result<AtModifier, ()>:
