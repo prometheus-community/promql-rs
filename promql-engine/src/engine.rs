@@ -238,7 +238,7 @@ impl Engine {
         // while explicit instant sorts can order vectors. Preserve the existing
         // direct logical-root policy before optimization: a sort below a
         // projection or aggregate is internal work, not a result-order promise.
-        let result_order = if matches!(&plan, LogicalPlan::Sort(_)) {
+        let result_order = if crate::plan::result_is_sorted(&plan) {
             ResultOrder::Preserve
         } else {
             ResultOrder::LabelSet
