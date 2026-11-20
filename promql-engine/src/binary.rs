@@ -63,6 +63,7 @@ use datafusion::physical_expr::expressions::Literal;
 use promql_parser::token::ItemType;
 
 use crate::aggregate::Grid;
+use crate::drop_name;
 use crate::matcher::METRIC_NAME;
 use crate::series;
 
@@ -200,6 +201,12 @@ impl Op {
             op if op.is_comparison() => return_bool,
             _ => true,
         }
+    }
+
+    /// Upstream's `changesMetricSchema`: the arithmetic operators, whose
+    /// `VectorBinop` result loses its metadata labels at once, not later.
+    pub fn changes_metric_schema(&self) -> bool {
+        !self.is_set() && !self.is_comparison()
     }
 
     /// One pair of floats, upstream's `vectorElemBinop` with the
@@ -807,7 +814,7 @@ impl Pairing {
             // `on` keeps only what it names and `ignoring` drops only
             // what it names, which is one test: the label goes where
             // being named is not what the modifier wanted.
-            let drop = (name == METRIC_NAME && self.op.drops_metric_name(self.return_bool))
+            let drop = (drop_name::is_metadata(name) && self.op.changes_metric_schema())
                 || (m.card == Card::OneToOne && m.on != m.labels.iter().any(|l| l == name));
             if drop {
                 out[index].clear();
@@ -2052,16 +2059,28 @@ mod tests {
             ]
         );
 
-        // `bool` takes the name away again, so the same two series are
-        // one result — which is what upstream's `resultMetric` does
-        // once `changesMetricSchema` holds.
+        // `bool` keeps the name too: upstream marks it `DropName` rather
+        // than dropping it, and the result's cleanup merges the two.
         let mut scored = pairing(Op::Gtr, true, Matching::default());
         scored.absorb(LHS, &b, &[0], &[5.0]).unwrap();
         scored.absorb(LHS, &a, &[10_000], &[7.0]).unwrap();
         scored.absorb(RHS, &c, &[0, 10_000], &[1.0, 1.0]).unwrap();
         assert_eq!(
             pairs_of(scored.evaluate().unwrap()),
-            [(lset("", "", "one", ""), vec![(0, 1.0), (10_000, 1.0)])]
+            [
+                (lset("a", "", "one", ""), vec![(10_000, 1.0)]),
+                (lset("b", "", "one", ""), vec![(0, 1.0)]),
+            ]
+        );
+
+        // Arithmetic is `changesMetricSchema`, which drops the name at once.
+        let mut summed = pairing(Op::Add, false, Matching::default());
+        summed.absorb(LHS, &b, &[0], &[5.0]).unwrap();
+        summed.absorb(LHS, &a, &[10_000], &[7.0]).unwrap();
+        summed.absorb(RHS, &c, &[0, 10_000], &[1.0, 1.0]).unwrap();
+        assert_eq!(
+            pairs_of(summed.evaluate().unwrap()),
+            [(lset("", "", "one", ""), vec![(0, 6.0), (10_000, 8.0)])]
         );
     }
 

@@ -368,10 +368,22 @@ fn a_kept_name_splits_a_match_group_into_a_series_each() {
     let batches = engine
         .range_query(&source, r#"{__name__=~"a|b"} != bool c"#, &range)
         .expect("the query runs");
+    // One label set once the names are dropped, in rows the consumer
+    // merges, as upstream's `mergeSeriesWithSameLabelset` does.
     let series = promql_engine::series::decode(&batches).expect("the canonical shape decodes");
-    assert_eq!(series.len(), 1);
-    assert_eq!(series[0].timestamps(), [0, 700_000]);
-    assert_eq!(series[0].values(), [1.0, 1.0]);
+    assert!(series.iter().all(|s| s.label("__name__").is_empty()));
+    assert!(series.iter().all(|s| s.label("x") == "1"));
+    let mut points: Vec<_> = series
+        .iter()
+        .flat_map(|s| {
+            s.timestamps()
+                .iter()
+                .copied()
+                .zip(s.values().iter().copied())
+        })
+        .collect();
+    points.sort_by_key(|(t, _)| *t);
+    assert_eq!(points, [(0, 1.0), (700_000, 1.0)]);
 }
 
 /// Two metrics that agree on `pod` and nothing else, plus a per-pod

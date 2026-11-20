@@ -1,0 +1,23 @@
+---
+source: promql-engine/tests/plan/name_label_dropping.rs
+expression: "sum by (__name__) (http_requests_total or rate(http_requests_total[5m]))"
+---
+Projection: promql_drop_name(cleanup_2.labels, Boolean(false))
+  SubqueryAlias: cleanup_2
+    Projection: labels{__name__: __group____name__, __promql_drop_name__: __group____promql_drop_name__}
+      Aggregate: groupBy=[[block_start, block_end, labels.__name__ AS __group____name__]], aggr=[[sum(samples, 600000..1200000 step 30s) AS samples, max(get_field(labels, Utf8("__promql_drop_name__"))) FILTER (WHERE cardinality(samples) > UInt64(0)) AS __group____promql_drop_name__]]
+        Projection: __pairs__.labels, __pairs__.samples, TimestampMillisecond(-9223372036854775808, None), TimestampMillisecond(9223372036854775807, None)
+          Unnest: lists[] structs[__pairs__]
+            Unnest: lists[__pairs__|depth=1] structs[]
+              Aggregate: groupBy=[[labels.job AS __group__job]], aggr=[[promql_binary(samples, __rhs, labels, Utf8("or"), Utf8(""), Int64(600000), Int64(1200000), Int64(30000)) AS __pairs__]]
+                Union
+                  Projection: binary_0.labels{__name__, __promql_drop_name__: Utf8(""), job} AS labels, binary_0.samples, Boolean(false) AS __rhs
+                    SubqueryAlias: binary_0
+                      Projection: labels, samples, block_start, block_end
+                        SeriesEval: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+                          TableScan: selector_0 http_requests_total
+                  Projection: binary_1.labels{__name__, __promql_drop_name__: Utf8("1"), job} AS labels, binary_1.samples, Boolean(true) AS __rhs
+                    SubqueryAlias: binary_1
+                      Projection: labels{__name__, job}
+                        SeriesEval: rate(samples[5m], 600000..1200000 step 30s) per series per block
+                          TableScan: selector_1 http_requests_total

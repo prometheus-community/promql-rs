@@ -263,6 +263,11 @@ fn register_elementwise<'a>(mut suite: Suite<'a>) -> Suite<'a> {
         ("abs_selector", "abs(http_requests_total)"),
         ("clamp_selector", "clamp(http_requests_total, 0, 1000)"),
         ("abs_rate_5m", "abs(rate(http_requests_total[5m]))"),
+        // `rate` keeps the name for the rewrite, and the result drops it.
+        (
+            "label_replace_rate_5m",
+            r#"label_replace(rate(http_requests_total[5m]), "metric", "$1", "__name__", "(.+)")"#,
+        ),
     ] {
         suite = suite.bench(
             format!("EngineElementwise/query={qname}/shape={}", shape.id()),

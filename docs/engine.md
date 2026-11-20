@@ -250,6 +250,31 @@ and file-scan repartitioning stay off: a raw-row or byte-range split can cut
 through an identity. Parallelism below evaluation is the source's partition
 count and `SelectHints.shard`, never `target_partitions`.
 
+## Delayed name removal
+
+Prometheus runs `promqltest` with `EnableDelayedNameRemoval`: an operator
+that drops `__name__` sets the series' `DropName` instead, and
+`cleanupMetricLabels` removes `__name__`, `__type__` and `__unit__` once, on
+the result. The planner carries `DropName` as a flag on each plan node when
+all its rows agree, which costs nothing at run time. Where rows can differ,
+in `or` over sides that disagree or `label_replace` writing `__name__`, it
+becomes the reserved label `__promql_drop_name__` (`"1"` or `""`) in the
+`labels` struct, which every operator that copies labels carries without a
+new column. Stores never see it.
+
+Functions, unary minus, vector-scalar operators and `bool` comparisons mark.
+The planner passes down which metadata labels the operators above can still
+read: none at the root or under `absent`, the `by` labels, `__type__` and
+`__unit__` under `without` unless listed, and for arithmetic only its match
+signature and `group_left` labels, since it drops the rest itself. A marking
+call whose input carries none of those drops the metadata at once. Vector-vector arithmetic drops it at once (`changesMetricSchema`), and
+other vector-vector results carry `DropName: returnBool`. `sum by (__name__)`
+keeps the mark if any member with a sample had it, over the whole row rather
+than per step. `label_replace` and `label_join` writing `__name__` clear it.
+Otherwise a `promql_drop_name` projection over the root, above a root sort,
+applies the cleanup and leaves an empty `__name__` field, which the shape
+reads as absent. Only a root sort is planned: a nested one orders nothing.
+
 ## Public results and execution APIs
 
 The [query API migration guide](query-api.md) covers breaking call-site changes,
