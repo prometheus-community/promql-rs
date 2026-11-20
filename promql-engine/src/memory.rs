@@ -17,49 +17,47 @@
 //! store that never heard of blocks would have it. [`MemorySeriesSource::blocks`]
 //! is the test mode that cuts like a store with fixed block ranges.
 //!
-//! The shape of that `select` is the part worth copying, not the fact
-//! that the data happens to sit in memory: a mask per matcher over a
-//! whole label column, one `filter`, one pass that copies the samples
-//! inside the range, and nothing that walks a row. A store reading
-//! Parquet or answering over gRPC has the same three steps with its own
-//! scan underneath.
-//!
-//! Only the first of those steps is this module's: the last two are
-//! [`crate::series::drop_unused_labels`] and [`crate::series::clip`],
-//! which live with the shape they operate on so every store gets them
-//! rather than writing them again.
+//! `select` resolves non-empty equality matchers through an inverted
+//! postings index built once at construction, falling back to
+//! [`crate::matcher`]'s column masks when no equality matcher narrows the
+//! scan. Matched rows then go through a single gather pass that drops
+//! unused label columns and binary-searches each matched row's sample
+//! offsets to copy only `[start_ms, end_ms]`. Stores that hold an
+//! already-filtered `RecordBatch` can still reach for
+//! [`crate::series::drop_unused_labels`] and [`crate::series::clip`].
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::BTreeMap;
-#[cfg(test)]
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{
-    Array, ArrayRef, AsArray, FixedSizeBinaryArray, ListArray, RecordBatch, UInt32Array,
-    UInt64Array,
+    new_empty_array, Array, ArrayRef, AsArray, FixedSizeBinaryArray, Float64Array, ListArray,
+    RecordBatch, StructArray, TimestampMillisecondArray, UInt32Array, UInt64Array,
 };
 use datafusion::arrow::buffer::OffsetBuffer;
-use datafusion::arrow::compute::{concat_batches, filter_record_batch, take, take_record_batch};
-use datafusion::arrow::datatypes::{DataType, Field, Schema, TimestampMillisecondType};
+use datafusion::arrow::compute::{concat_batches, take, take_record_batch};
+use datafusion::arrow::datatypes::{
+    DataType, Field, FieldRef, Fields, Float64Type, Schema, TimestampMillisecondType,
+};
 use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::row::{RowConverter, SortField};
 use datafusion::catalog::Session;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::ExecutionPlan;
-use promql_parser::ast::{LabelMatcher, SeriesDescription};
+use promql_parser::ast::{LabelMatcher, MatchOp, SeriesDescription};
 
 use crate::error::{EngineError, SeriesError};
 use crate::matcher::{mask_all, CompiledMatcher};
 #[cfg(test)]
 use crate::series::decode;
 use crate::series::{
-    clip, drop_empty, drop_unused_labels, encode, label_names_of, sample_item, with_block, Block,
-    Series, LABELS, SAMPLES, SERIES_ID, TIMESTAMP,
+    clip, drop_empty, encode, label_names_of, sample_fields, sample_item, samples_type,
+    timestamp_type, with_block, Block, Series, BLOCK_END, BLOCK_START, LABELS, SAMPLES, SERIES_ID,
+    TIMESTAMP, VALUE,
 };
 use crate::source::{SelectHints, SeriesSource};
 
@@ -68,6 +66,14 @@ pub struct MemorySeriesSource {
     /// A deterministic stored order for assigning reference IDs. The source
     /// contract promises adjacency, not label or ID sorting.
     batch: RecordBatch,
+    /// Precomputed field for [`SERIES_ID`], matching [`Self::ids`].
+    id_field: FieldRef,
+    /// Precomputed [`SERIES_ID`] column over `batch` rows so `select` can
+    /// `take` matched rows without rebuilding IDs for the whole store.
+    series_id: ArrayRef,
+    /// Inverted postings map `label_name -> non_empty_value -> sorted row indices`
+    /// over `batch` for `O(1)` lookup on non-empty equality matchers.
+    postings: HashMap<String, HashMap<String, Vec<u32>>>,
     /// Test mode: see [`Self::chunked`].
     chunk_ms: Option<i64>,
     /// Test mode: see [`Self::blocks`].
@@ -112,21 +118,33 @@ impl MemorySeriesSource {
     /// every query. The block stamped here is a placeholder; `select`
     /// replaces it with the block of the select.
     pub fn try_new(series: Vec<Series>) -> std::result::Result<Self, SeriesError> {
-        let batch = encode(&label_names_of(&series), &series, WHOLE)?;
+        let batch = sort_by_labels(&encode(&label_names_of(&series), &series, WHOLE)?)?;
+        let ids = SeriesIdEncoding::UInt64;
+        let (id_field, series_id) = build_series_ids(batch.num_rows(), ids)?;
+        let postings = build_postings(&batch);
         Ok(Self {
-            batch: sort_by_labels(&batch)?,
+            batch,
+            id_field,
+            series_id,
+            postings,
             chunk_ms: None,
             block_ms: None,
             partitions: 1,
             rows_per_batch: ROWS_PER_BATCH,
-            ids: SeriesIdEncoding::UInt64,
+            ids,
         })
     }
 
     /// Select the encoding of stable opaque IDs, without changing identity,
     /// chunk adjacency, full labels or partition assignment.
     pub fn with_ids(mut self, id: SeriesIdEncoding) -> Self {
-        self.ids = id;
+        if self.ids != id {
+            let (id_field, series_id) = build_series_ids(self.batch.num_rows(), id)
+                .expect("stored row count fits FixedSizeBinary");
+            self.id_field = id_field;
+            self.series_id = series_id;
+            self.ids = id;
+        }
         self
     }
 
@@ -265,36 +283,27 @@ impl SeriesSource for MemorySeriesSource {
         matchers: &[LabelMatcher],
         hints: SelectHints,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Compile all matchers upfront so invalid regular expressions fail
+        // even when an earlier equality matcher matches zero series.
         let compiled: Vec<CompiledMatcher> = matchers
             .iter()
             .map(CompiledMatcher::compile)
             .collect::<std::result::Result<_, _>>()
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        // Obligation 1, filter.
-        let labels = self.batch.column_by_name(LABELS).expect("canonical");
-        let mask = mask_all(&compiled, labels.as_struct())?;
-        // Assign IDs before filtering: a series keeps its ID when another
-        // selector narrows the label-name union or excludes earlier rows.
-        let raw = add_ids(&self.batch, self.ids)?;
-        let selected = filter_record_batch(&raw, &mask)?;
-        let selected = drop_unused_labels(&selected).map_err(external)?;
+        // Obligation 1, filter and gather only matched rows and reachable samples.
+        let rows = self.select_rows(matchers, &compiled)?;
+        let selected = self.gather_and_clip(rows, &hints)?;
 
         // Obligation 2, blocks: by default one over the whole window-end
         // domain, `[start_ms + window_ms, end_ms]`, its end exclusive.
+        // `gather_and_clip` already clipped samples to `[start_ms, end_ms]`
+        // and stamped that default block, so only fixed-width block mode needs
+        // an additional pass.
         let blocks = match self.block_ms {
-            Some(block_ms) => cut_into_blocks(&selected, &hints, block_ms),
-            None => {
-                let block = Block {
-                    start_ms: hints.start_ms.saturating_add(hints.window_ms),
-                    end_ms: hints.end_ms.saturating_add(1),
-                };
-                clip(&selected, hints.start_ms, hints.end_ms)
-                    .and_then(|clipped| with_block(&clipped, block))
-                    .map(|one| vec![one])
-            }
-        }
-        .map_err(external)?;
+            Some(block_ms) => cut_into_blocks(&selected, &hints, block_ms).map_err(external)?,
+            None => vec![selected.clone()],
+        };
 
         // Partition full label sets before chunking so a series' repeated
         // reach-back in later blocks lands in the same partition. Chunking
@@ -312,7 +321,10 @@ impl SeriesSource for MemorySeriesSource {
         let partitions = partitions
             .iter()
             .map(|parts| {
-                let part = concat_batches(&schema, parts)?;
+                let part = match parts.as_slice() {
+                    [only] => only.clone(),
+                    _ => concat_batches(&schema, parts)?,
+                };
                 match self.chunk_ms {
                     Some(chunk_ms) => split_into_chunks(&part, chunk_ms, self.rows_per_batch),
                     None => Ok(slice_rows(&part, self.rows_per_batch)),
@@ -323,38 +335,278 @@ impl SeriesSource for MemorySeriesSource {
     }
 }
 
-/// Identity is assigned over the immutable stored rows, not the selected
-/// labels: selections may have different label-name unions and row indices.
-fn add_ids(batch: &RecordBatch, id: SeriesIdEncoding) -> Result<RecordBatch> {
-    let values = (0..batch.num_rows()).map(|i| u64::MAX - i as u64);
+impl MemorySeriesSource {
+    /// Resolve `matchers` to strictly ascending row indices in `self.batch`.
+    ///
+    /// Non-empty equality matchers intersect sorted postings lists in `O(k)`
+    /// without scanning unrelated rows; any remaining matchers evaluate only
+    /// on the surviving candidates. Selectors without non-empty equality
+    /// matchers fall back to [`mask_all`] over the full label columns.
+    fn select_rows(
+        &self,
+        matchers: &[LabelMatcher],
+        compiled: &[CompiledMatcher],
+    ) -> Result<Vec<u32>> {
+        let num_rows = self.batch.num_rows();
+        if num_rows == 0 {
+            return Ok(Vec::new());
+        }
+        if compiled.is_empty() {
+            return Ok((0..num_rows as u32).collect());
+        }
+
+        let mut eq_lists: Vec<&[u32]> = Vec::new();
+        let mut has_non_eq = false;
+        for m in matchers {
+            if m.op == MatchOp::Equal && !m.value.is_empty() {
+                let Some(list) = self
+                    .postings
+                    .get(&m.name)
+                    .and_then(|by_val| by_val.get(&m.value))
+                else {
+                    return Ok(Vec::new());
+                };
+                eq_lists.push(list.as_slice());
+            } else {
+                has_non_eq = true;
+            }
+        }
+
+        let labels = self
+            .batch
+            .column_by_name(LABELS)
+            .expect("canonical")
+            .as_struct();
+        if eq_lists.is_empty() {
+            let mask = mask_all(compiled, labels)?;
+            return Ok(mask.values().set_indices().map(|i| i as u32).collect());
+        }
+
+        eq_lists.sort_unstable_by_key(|s| s.len());
+        let mut candidates = eq_lists[0].to_vec();
+        for &other in &eq_lists[1..] {
+            intersect_sorted(&mut candidates, other);
+            if candidates.is_empty() {
+                return Ok(candidates);
+            }
+        }
+
+        if has_non_eq {
+            for (m, cm) in matchers.iter().zip(compiled) {
+                if m.op == MatchOp::Equal && !m.value.is_empty() {
+                    continue;
+                }
+                match labels.column_by_name(&m.name) {
+                    None => {
+                        if !cm.matches("") {
+                            candidates.clear();
+                            return Ok(candidates);
+                        }
+                    }
+                    Some(col) => {
+                        let views = col.as_string_view();
+                        candidates.retain(|&row| cm.matches(views.value(row as usize)));
+                        if candidates.is_empty() {
+                            return Ok(candidates);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(candidates)
+    }
+
+    /// Gather `rows` from `self.batch`, drop label columns empty across `rows`,
+    /// binary-search `[hints.start_ms, hints.end_ms]` per row to copy only
+    /// reachable samples, attach precomputed `series_id`, and stamp the default
+    /// single-select block.
+    fn gather_and_clip(&self, rows: Vec<u32>, hints: &SelectHints) -> Result<RecordBatch> {
+        let num_selected = rows.len();
+        let all_rows = num_selected == self.batch.num_rows();
+        let row_indices = UInt32Array::from(rows);
+        let row_slice = row_indices.values();
+
+        let labels = self
+            .batch
+            .column_by_name(LABELS)
+            .expect("canonical")
+            .as_struct();
+        let used: Vec<usize> = (0..labels.num_columns())
+            .filter(|&i| {
+                let views = labels.column(i).as_string_view().views();
+                row_slice.iter().any(|&r| views[r as usize] as u32 != 0)
+            })
+            .collect();
+        let used_fields: Fields = used.iter().map(|&i| labels.fields()[i].clone()).collect();
+        let labels_field = Field::new(LABELS, DataType::Struct(used_fields.clone()), false);
+        let labels_col: ArrayRef = if used_fields.is_empty() {
+            Arc::new(StructArray::new_empty_fields(num_selected, None))
+        } else {
+            let cols = used
+                .iter()
+                .map(|&i| {
+                    if all_rows {
+                        Ok(Arc::clone(labels.column(i)))
+                    } else {
+                        take(labels.column(i), &row_indices, None)
+                    }
+                })
+                .collect::<std::result::Result<Vec<_>, ArrowError>>()?;
+            Arc::new(StructArray::new(used_fields, cols, None))
+        };
+
+        let samples = self
+            .batch
+            .column_by_name(SAMPLES)
+            .expect("canonical")
+            .as_list::<i32>();
+        let entries = samples.values().as_struct();
+        let timestamps = entries
+            .column_by_name(TIMESTAMP)
+            .expect("canonical")
+            .as_primitive::<TimestampMillisecondType>()
+            .values();
+        let values = entries
+            .column_by_name(VALUE)
+            .expect("canonical")
+            .as_primitive::<Float64Type>()
+            .values();
+        let offsets = samples.offsets();
+
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(num_selected);
+        let mut total_samples = 0usize;
+        let mut untouched = all_rows;
+        for &r in row_slice {
+            let r = r as usize;
+            let (from, to) = (offsets[r] as usize, offsets[r + 1] as usize);
+            let window = &timestamps[from..to];
+            let lo = from + window.partition_point(|t| *t < hints.start_ms);
+            let hi = (from + window.partition_point(|t| *t <= hints.end_ms)).max(lo);
+            untouched &= lo == from && hi == to;
+            total_samples += hi - lo;
+            ranges.push((lo, hi));
+        }
+
+        let samples_col: ArrayRef = if untouched {
+            Arc::clone(self.batch.column_by_name(SAMPLES).expect("canonical"))
+        } else if total_samples == 0 {
+            let clipped = vec![0i32; num_selected + 1];
+            Arc::new(ListArray::new(
+                sample_item(),
+                OffsetBuffer::new(clipped.into()),
+                new_empty_array(&DataType::Struct(sample_fields())),
+                None,
+            ))
+        } else {
+            let mut out_ts = Vec::with_capacity(total_samples);
+            let mut out_vals = Vec::with_capacity(total_samples);
+            let mut clipped = Vec::with_capacity(num_selected + 1);
+            clipped.push(0i32);
+            for (lo, hi) in ranges {
+                out_ts.extend_from_slice(&timestamps[lo..hi]);
+                out_vals.extend_from_slice(&values[lo..hi]);
+                clipped.push(out_ts.len() as i32);
+            }
+            let sample_entries = StructArray::new(
+                sample_fields(),
+                vec![
+                    Arc::new(TimestampMillisecondArray::from(out_ts)),
+                    Arc::new(Float64Array::from(out_vals)),
+                ],
+                None,
+            );
+            Arc::new(ListArray::new(
+                sample_item(),
+                OffsetBuffer::new(clipped.into()),
+                Arc::new(sample_entries),
+                None,
+            ))
+        };
+
+        let block = Block {
+            start_ms: hints.start_ms.saturating_add(hints.window_ms),
+            end_ms: hints.end_ms.saturating_add(1),
+        };
+        let [block_start, block_end] = block.columns(num_selected);
+        let series_id = if all_rows {
+            Arc::clone(&self.series_id)
+        } else {
+            take(&self.series_id, &row_indices, None)?
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Arc::new(labels_field),
+            Arc::new(Field::new(SAMPLES, samples_type(), false)),
+            Arc::new(Field::new(BLOCK_START, timestamp_type(), false)),
+            Arc::new(Field::new(BLOCK_END, timestamp_type(), false)),
+            Arc::clone(&self.id_field),
+        ]));
+        Ok(RecordBatch::try_new(
+            schema,
+            vec![labels_col, samples_col, block_start, block_end, series_id],
+        )?)
+    }
+}
+
+/// Retain in `candidates` only elements present in `other`; both slices are
+/// strictly ascending.
+fn intersect_sorted(candidates: &mut Vec<u32>, mut other: &[u32]) {
+    candidates.retain(|&row| {
+        let idx = other.partition_point(|&x| x < row);
+        other = &other[idx..];
+        other.first() == Some(&row)
+    });
+}
+
+/// Build the inverted postings map `label_name -> non_empty_value -> rows`
+/// over the sorted `batch` once at store construction.
+fn build_postings(batch: &RecordBatch) -> HashMap<String, HashMap<String, Vec<u32>>> {
+    let labels = batch.column_by_name(LABELS).expect("canonical").as_struct();
+    let mut postings = HashMap::with_capacity(labels.num_columns());
+    for (field, col) in labels.fields().iter().zip(labels.columns()) {
+        let views = col.as_string_view();
+        let raw_views = views.views();
+        let mut by_val: HashMap<String, Vec<u32>> = HashMap::new();
+        for (row, &view) in raw_views.iter().enumerate() {
+            if view as u32 != 0 {
+                by_val
+                    .entry(views.value(row).to_owned())
+                    .or_default()
+                    .push(row as u32);
+            }
+        }
+        if !by_val.is_empty() {
+            postings.insert(field.name().clone(), by_val);
+        }
+    }
+    postings
+}
+
+/// Precompute opaque [`SERIES_ID`] values over the immutable stored rows so
+/// `select` can gather matched IDs with `take` instead of rebuilding IDs for
+/// the entire store on every query.
+fn build_series_ids(
+    num_rows: usize,
+    id: SeriesIdEncoding,
+) -> std::result::Result<(FieldRef, ArrayRef), ArrowError> {
+    let values = (0..num_rows).map(|i| u64::MAX - i as u64);
     let (ty, column): (DataType, ArrayRef) = match id {
         SeriesIdEncoding::UInt64 => (
             DataType::UInt64,
-            Arc::new(UInt64Array::from(values.collect::<Vec<_>>())),
+            Arc::new(UInt64Array::from_iter_values(values)),
         ),
         SeriesIdEncoding::FixedSizeBinary => {
-            let bytes = values.map(|id| {
-                let mut bytes = [0xA5; 16];
-                bytes[8..].copy_from_slice(&id.to_be_bytes());
-                Some(bytes)
-            });
+            let mut bytes = vec![0xA5u8; num_rows * 16];
+            for (slot, val) in bytes.chunks_exact_mut(16).zip(values) {
+                slot[8..].copy_from_slice(&val.to_be_bytes());
+            }
             (
                 DataType::FixedSizeBinary(16),
-                Arc::new(FixedSizeBinaryArray::try_from_sparse_iter_with_size(
-                    bytes, 16,
-                )?),
+                Arc::new(FixedSizeBinaryArray::try_new(16, bytes.into(), None)?),
             )
         }
     };
-    let mut fields = batch.schema().fields().to_vec();
-    fields.push(Arc::new(Field::new(SERIES_ID, ty, false)));
-    let schema = Arc::new(Schema::new_with_metadata(
-        fields,
-        batch.schema().metadata().clone(),
-    ));
-    let mut columns = batch.columns().to_vec();
-    columns.push(column);
-    Ok(RecordBatch::try_new(schema, columns)?)
+    Ok((Arc::new(Field::new(SERIES_ID, ty, false)), column))
 }
 
 /// Carry a series error out of `select` as an engine error, which
@@ -1208,14 +1460,79 @@ mod tests {
     #[tokio::test]
     async fn an_invalid_regex_fails_the_selection() {
         let ctx = SessionContext::new();
-        let err = source()
-            .select(
-                &ctx.state(),
-                &[matcher("pod", MatchOp::RegexEqual, "(")],
-                SelectHints::range(0, 1_000_000),
-            )
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("regular expression"), "{err}");
+        for matchers in [
+            vec![matcher("pod", MatchOp::RegexEqual, "(")],
+            vec![
+                matcher("pod", MatchOp::Equal, "missing"),
+                matcher("route", MatchOp::RegexEqual, "("),
+            ],
+        ] {
+            let err = source()
+                .select(&ctx.state(), &matchers, SelectHints::range(0, 1_000_000))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("regular expression"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn postings_intersection_agrees_with_mixed_and_absent_matchers() {
+        let ctx = SessionContext::new();
+        let src = source();
+        let cases: &[(&[LabelMatcher], &[&str])] = &[
+            (
+                &[
+                    matcher("__name__", MatchOp::Equal, "http_requests_total"),
+                    matcher("pod", MatchOp::Equal, "envoy-2"),
+                ],
+                &["envoy-2"],
+            ),
+            (
+                &[
+                    matcher("__name__", MatchOp::Equal, "http_requests_total"),
+                    matcher("route", MatchOp::Equal, ""),
+                ],
+                &["envoy-1"],
+            ),
+            (
+                &[
+                    matcher("__name__", MatchOp::Equal, "http_requests_total"),
+                    matcher("absent_label", MatchOp::Equal, ""),
+                    matcher("pod", MatchOp::RegexEqual, "envoy-[12]"),
+                    matcher("route", MatchOp::NotEqual, "/"),
+                ],
+                &["envoy-1"],
+            ),
+            (
+                &[
+                    matcher("__name__", MatchOp::Equal, "http_requests_total"),
+                    matcher("absent_label", MatchOp::NotEqual, ""),
+                ],
+                &[],
+            ),
+            (&[matcher("route", MatchOp::Equal, "")], &["envoy-1", ""]),
+        ];
+        for (matchers, expected_pods) in cases {
+            let plan = src
+                .select(&ctx.state(), matchers, SelectHints::range(0, 30_000))
+                .await
+                .unwrap();
+            crate::series::validate(&plan.schema()).unwrap();
+            let batches = collect(plan, ctx.task_ctx()).await.unwrap();
+            let decoded = crate::series::decode(&batches).unwrap();
+            let got: Vec<&str> = decoded.iter().map(|s| s.label("pod")).collect();
+            assert_eq!(&got, expected_pods, "matchers: {matchers:?}");
+        }
+
+        for encoding in [SeriesIdEncoding::UInt64, SeriesIdEncoding::FixedSizeBinary] {
+            let empty = MemorySeriesSource::default().with_ids(encoding);
+            let plan = empty
+                .select(&ctx.state(), &[], SelectHints::range(0, 30_000))
+                .await
+                .unwrap();
+            crate::series::validate(&plan.schema()).unwrap();
+            let batches = collect(plan, ctx.task_ctx()).await.unwrap();
+            assert!(crate::series::decode(&batches).unwrap().is_empty());
+        }
     }
 }
