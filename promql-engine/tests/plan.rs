@@ -88,6 +88,8 @@ mod aggregators;
 mod at_modifier;
 #[path = "plan/functions.rs"]
 mod functions;
+#[path = "plan/name_label_dropping.rs"]
+mod name_label_dropping;
 #[path = "plan/operators.rs"]
 mod operators;
 #[path = "plan/range_queries.rs"]
