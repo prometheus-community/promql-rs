@@ -117,7 +117,15 @@ pub fn quantile(q: f64, histogram: &FloatHistogram) -> QuantileResult {
 
     let mut nan_skew = false;
     if histogram.sum.is_nan() {
+        // Upstream reuses its `bucket` variable as this loop's variable, so
+        // once a NaN sum sends it round the rest of the histogram, the
+        // interpolation below runs on the last bucket rather than the one
+        // the rank landed in -- and on the raw bucket, without the zero-
+        // bucket adjustment made above. That reads like an upstream slip:
+        // `HistogramFraction`'s matching loop binds a fresh `b`. It is the
+        // pinned behavior, though, so Go wins and we reassign too.
         for remaining in buckets {
+            bucket = remaining;
             count += remaining.count;
         }
         nan_skew = count < histogram.count;
@@ -308,7 +316,10 @@ pub fn classic_quantile(q: f64, buckets: &mut [ClassicBucket]) -> ClassicQuantil
         rank -= buckets[bucket_index - 1].count;
     }
     classic_quantile_value(
-        bucket_start + (bucket_end - bucket_start) * rank / count,
+        // `BucketQuantile` divides before it multiplies. Keeping that order
+        // keeps the rounding, and keeps the product finite: `rank / count`
+        // is at most 1, where a wide bucket times a large rank overflows.
+        bucket_start + (bucket_end - bucket_start) * (rank / count),
         forced_monotonicity,
     )
 }

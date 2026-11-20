@@ -328,12 +328,23 @@ impl Group {
             if let (true, Some((_, one_value)), Some(fill)) = (todo.is_empty(), one, &fill_many) {
                 todo.push((None, fill.clone(), one_value.clone()));
             }
-            if one_to_one && todo.len() > 1 {
-                return Err(DataFusionError::Execution(MULTIPLE_MATCHES.into()));
-            }
-
             let one_labels = one.map_or(&nothing, |(s, _)| &s.labels);
+            // Upstream's `matchedSigsPresent` for this group at this step.
+            let mut matched = false;
             for (many, many_value, one_value) in todo {
+                let (lhs, rhs) = match one_side {
+                    LHS => (one_value, many_value),
+                    _ => (many_value, one_value),
+                };
+                // `vectorElemBinop` returns before the match bookkeeping on
+                // an error and after it on a comparison that does not hold,
+                // so a pair the operator declines claims nothing while a
+                // sample that does not survive still claims. `elem` answers
+                // `None` for exactly the pairings upstream errors on.
+                let Some((value, keep)) = elem(self.operator, &lhs, &rhs) else {
+                    continue;
+                };
+
                 let base = match many {
                     Some(many) => many.labels.clone(),
                     None => rules.signature_of(one_labels),
@@ -343,6 +354,13 @@ impl Group {
                     _ => one_labels.clone(),
                 };
                 let labels = rules.result_labels(&base, &one_part);
+
+                if one_to_one {
+                    if matched {
+                        return Err(DataFusionError::Execution(MULTIPLE_MATCHES.into()));
+                    }
+                    matched = true;
+                }
                 let bucket = *by_labels.entry(labels.clone()).or_insert_with(|| {
                     buckets.push(Bucket {
                         labels,
@@ -351,20 +369,11 @@ impl Group {
                     buckets.len() - 1
                 });
                 let bucket = &mut buckets[bucket];
-                // Claimed before the operator decides whether the sample
-                // survives, as upstream checks the match first.
                 if bucket.claimed == Some(t) {
                     return Err(DataFusionError::Execution(GROUPING_NOT_UNIQUE.into()));
                 }
                 bucket.claimed = Some(t);
 
-                let (lhs, rhs) = match one_side {
-                    LHS => (one_value, many_value),
-                    _ => (many_value, one_value),
-                };
-                let Some((value, keep)) = elem(self.operator, &lhs, &rhs) else {
-                    continue;
-                };
                 match (rules.return_bool, keep) {
                     (true, keep) => bucket.push(t, Value::Float(f64::from(u8::from(keep)))),
                     (false, true) => bucket.push(t, value),

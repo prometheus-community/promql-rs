@@ -125,8 +125,16 @@ impl Buckets {
             .push(ClassicBucket { upper_bound, count });
     }
 
-    fn add_native(&mut self, t: i64, h: FloatHistogram) {
-        self.steps.entry(t).or_default().native.get_or_insert(h);
+    /// The first native histogram at a step wins and later ones are
+    /// dropped. `decode` runs only for the one that is kept: decoding
+    /// copies every bucket out of the batch, and paying that for a sample
+    /// about to be discarded is the whole cost of a crowded group.
+    fn add_native(&mut self, t: i64, decode: impl FnOnce() -> FloatHistogram) {
+        self.steps
+            .entry(t)
+            .or_default()
+            .native
+            .get_or_insert_with(decode);
     }
 }
 
@@ -145,7 +153,7 @@ impl Accumulator for Buckets {
         let offsets = histograms.value_offsets();
         for row in 0..histograms.len() {
             for i in offsets[row] as usize..offsets[row + 1] as usize {
-                self.add_native(columns.timestamps[i], columns.decode(i));
+                self.add_native(columns.timestamps[i], || columns.decode(i));
             }
         }
         let le = values.get(2).ok_or_else(|| {
@@ -253,7 +261,7 @@ impl Accumulator for Buckets {
             natives.value_offsets()[natives.len()] as usize,
         );
         for i in first..last {
-            self.add_native(columns.timestamps[i], columns.decode(i));
+            self.add_native(columns.timestamps[i], || columns.decode(i));
         }
         Ok(())
     }

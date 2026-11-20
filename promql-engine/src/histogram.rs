@@ -287,23 +287,33 @@ impl Mean {
 
     /// Fold one more histogram in. An error is two histograms that do not
     /// add, an exponential one and one with custom buckets.
+    ///
+    /// `count` is committed only once the fold succeeds, so an errored
+    /// `Mean` never claims a sample it did not fold. The accumulator is not
+    /// rolled back the same way: on the incremental path it has already
+    /// been scaled by the time the add can fail, and undoing that would
+    /// cost a copy of it per sample. An error is final for the value --
+    /// every caller drops the `Mean` -- and only `count` stays readable.
     pub(crate) fn add(&mut self, h: &FloatHistogram) -> Result<(), HistogramError> {
-        self.count += 1.0;
+        let count = self.count + 1.0;
         if !self.incremental {
             let mut next = self.acc.clone();
             next.add(h)?;
             if !next.has_overflow() {
                 self.acc = next;
+                self.count = count;
                 return Ok(());
             }
             self.incremental = true;
-            self.acc.div(self.count - 1.0);
+            self.acc.div(self.count);
         }
         // `mean*q + h/count`, the compensation scaled with the mean.
-        self.acc.mul((self.count - 1.0) / self.count);
+        self.acc.mul(self.count / count);
         let mut share = h.clone();
-        share.div(self.count);
-        self.acc.add(&share).map(|_| ())
+        share.div(count);
+        self.acc.add(&share)?;
+        self.count = count;
+        Ok(())
     }
 
     /// Fold another mean in, for the two halves of a two-stage
@@ -350,13 +360,10 @@ impl Mean {
 /// The heap a decoded histogram owns, with its `Arc` header: what a window
 /// buffer or a result vector is charged for holding one.
 pub(crate) fn heap_size(h: &FloatHistogram) -> usize {
-    std::mem::size_of::<FloatHistogram>()
-        + 2 * std::mem::size_of::<usize>()
-        + (h.negative_spans.capacity() + h.positive_spans.capacity()) * std::mem::size_of::<Span>()
-        + (h.negative_buckets.capacity()
-            + h.positive_buckets.capacity()
-            + h.custom_values.capacity())
-            * std::mem::size_of::<f64>()
+    // The buffer terms come from `FloatHistogram::heap_size` rather than
+    // being restated here, so a vector added to the type cannot be counted
+    // by one definition and missed by the other.
+    std::mem::size_of::<FloatHistogram>() + 2 * std::mem::size_of::<usize>() + h.heap_size()
 }
 
 #[derive(Debug)]
