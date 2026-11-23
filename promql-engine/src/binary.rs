@@ -4454,4 +4454,127 @@ mod tests {
         ));
         assert!(plain(Op::Add).merge_batch(&bad_many).is_err());
     }
+
+    type BatchRow<'a> = (&'a [(&'a str, &'a str)], &'a [i64], &'a [f64], bool);
+
+    fn encode_binary_batch(schema: &[String], rows: &[BatchRow<'_>]) -> [ArrayRef; 3] {
+        use crate::Series;
+        let series_vec: Vec<Series> = rows
+            .iter()
+            .map(|(lbls, ts, vs, _)| Series::new(lbls, ts.to_vec(), vs.to_vec()).unwrap())
+            .collect();
+        let batch = series::encode(
+            schema,
+            &series_vec,
+            series::Block {
+                start_ms: 0,
+                end_ms: 30_001,
+            },
+        )
+        .unwrap();
+        let sides = BooleanArray::from(rows.iter().map(|r| r.3).collect::<Vec<_>>());
+        [
+            Arc::clone(batch.column_by_name(series::SAMPLES).unwrap()),
+            Arc::new(sides),
+            Arc::clone(batch.column_by_name(series::LABELS).unwrap()),
+        ]
+    }
+
+    #[test]
+    fn grouped_filtering_comparison_aligns_buckets_across_multiple_groups() {
+        let schema = names(&SCHEMA);
+        let matching = Matching {
+            card: Card::ManyToOne,
+            on: true,
+            labels: names(&["pod"]),
+            ..Matching::default()
+        };
+        let make_acc = || GroupedBinary::from_pairing(pairing(Op::Gtr, false, matching.clone()));
+
+        // Group 0: two LHS buckets (one emptied, one partially kept).
+        // Group 1: paired but every step filtered out.
+        // Group 2: unmatched LHS-only group.
+        // Group 3: keeps every step.
+        let batch = encode_binary_batch(
+            &schema,
+            &[
+                (
+                    &[(METRIC_NAME, "req"), ("path", "/drop"), ("pod", "g0")],
+                    &[0, 10_000],
+                    &[1.0, 2.0],
+                    false,
+                ),
+                (
+                    &[(METRIC_NAME, "req"), ("path", "/keep"), ("pod", "g0")],
+                    &[0, 10_000],
+                    &[2.0, 9.0],
+                    false,
+                ),
+                (
+                    &[(METRIC_NAME, "lim"), ("pod", "g0")],
+                    &[0, 10_000],
+                    &[5.0, 5.0],
+                    true,
+                ),
+                (
+                    &[(METRIC_NAME, "req"), ("pod", "g1")],
+                    &[0, 10_000],
+                    &[1.0, 2.0],
+                    false,
+                ),
+                (
+                    &[(METRIC_NAME, "lim"), ("pod", "g1")],
+                    &[0, 10_000],
+                    &[10.0, 10.0],
+                    true,
+                ),
+                (&[(METRIC_NAME, "req"), ("pod", "g2")], &[0], &[99.0], false),
+                (
+                    &[(METRIC_NAME, "req"), ("pod", "g3")],
+                    &[0, 10_000],
+                    &[8.0, 9.0],
+                    false,
+                ),
+                (
+                    &[(METRIC_NAME, "lim"), ("pod", "g3")],
+                    &[0, 10_000],
+                    &[1.0, 2.0],
+                    true,
+                ),
+            ],
+        );
+        let mut acc = make_acc();
+        acc.update_batch(&batch, &[0, 0, 0, 1, 1, 2, 3, 3], None, 4)
+            .unwrap();
+        let out = acc.evaluate(EmitTo::All).unwrap();
+        assert_eq!(
+            pairs_at(&out, 0),
+            [(lset("req", "/keep", "g0", ""), vec![(10_000, 9.0)])]
+        );
+        assert!(pairs_at(&out, 1).is_empty());
+        assert!(pairs_at(&out, 2).is_empty());
+        assert_eq!(
+            pairs_at(&out, 3),
+            [(lset("req", "", "g3", ""), vec![(0, 8.0), (10_000, 9.0)])]
+        );
+
+        // Every sample across all groups filtered out (`kept_buckets` empty).
+        let all_dropped = encode_binary_batch(
+            &schema,
+            &[
+                (&[(METRIC_NAME, "req"), ("pod", "g0")], &[0], &[1.0], false),
+                (&[(METRIC_NAME, "lim"), ("pod", "g0")], &[0], &[5.0], true),
+                (&[(METRIC_NAME, "req"), ("pod", "g1")], &[0], &[2.0], false),
+                (&[(METRIC_NAME, "lim"), ("pod", "g1")], &[0], &[5.0], true),
+            ],
+        );
+        let mut empty_acc = make_acc();
+        empty_acc
+            .update_batch(&all_dropped, &[0, 0, 1, 1], None, 2)
+            .unwrap();
+        let empty_out = empty_acc.evaluate(EmitTo::All).unwrap();
+        assert_eq!(empty_out.len(), 2);
+        assert!(pairs_at(&empty_out, 0).is_empty());
+        assert!(pairs_at(&empty_out, 1).is_empty());
+    }
 }
