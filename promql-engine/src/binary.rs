@@ -631,7 +631,7 @@ struct Many {
 struct OneLanes {
     counts: Vec<u8>,
     values: Vec<f64>,
-    /// Which of [`Pairing::one_pool`] the "one" side's sample at each
+    /// Which of [`GroupState::one_pool`] the "one" side's sample at each
     /// step came from, `-1` where it put none. Kept `None` while at most
     /// one series has contributed to the "one" side, in which case every
     /// populated step belongs to `one_pool[0]`.
@@ -653,147 +653,21 @@ struct Bucket {
     claimed: Option<usize>,
 }
 
-/// One match group: the "one" side as lanes, the "many" side as a
-/// series each.
-#[derive(Debug)]
-struct Pairing {
+/// Query-constant operator, matching, step grid, and label schema shared
+/// across all match groups without repeating metadata or atomic refcounts
+/// inside each group.
+#[derive(Debug, Clone)]
+struct BinaryConfig {
     op: Op,
     return_bool: bool,
-    matching: Arc<Matching>,
+    matching: Matching,
     grid: Grid,
     /// The label columns, in the order the input struct carries them,
     /// which is the order every label vector here is in.
-    schema: Arc<[String]>,
-    one: Option<OneLanes>,
-    one_pool: Vec<Vec<String>>,
-    many: Vec<Many>,
-    /// The match group's own labels, for the message a duplicate has to
-    /// name. Every row of the group renders the same text, so the first
-    /// one to arrive settles it.
-    group: Option<String>,
-    /// Up to two label sets from the "one" side, again only for that
-    /// message: upstream prints the pair that collided and there is
-    /// nothing to say about a third.
-    one_metrics: Vec<String>,
+    schema: Vec<String>,
 }
 
-impl Pairing {
-    fn new(op: Op, return_bool: bool, matching: Matching, grid: Grid, schema: Vec<String>) -> Self {
-        Self::new_shared(op, return_bool, Arc::new(matching), grid, schema.into())
-    }
-
-    fn new_shared(
-        op: Op,
-        return_bool: bool,
-        matching: Arc<Matching>,
-        grid: Grid,
-        schema: Arc<[String]>,
-    ) -> Self {
-        Self {
-            op,
-            return_bool,
-            matching,
-            grid,
-            schema,
-            one: None,
-            one_pool: Vec::new(),
-            many: Vec::new(),
-            group: None,
-            one_metrics: Vec::new(),
-        }
-    }
-
-    fn intern_one(&mut self, labels: &[String]) -> i32 {
-        if let Some(index) = self.one_pool.iter().position(|held| held == labels) {
-            return index as i32;
-        }
-        self.one_pool.push(labels.to_vec());
-        (self.one_pool.len() - 1) as i32
-    }
-
-    fn intern_many(&mut self, side: usize, labels: &[String]) -> usize {
-        if let Some(index) = self
-            .many
-            .iter()
-            .position(|held| held.side == side && held.labels == labels)
-        {
-            return index;
-        }
-        self.many.push(Many {
-            side,
-            labels: labels.to_vec(),
-            counts: vec![0; self.grid.len()],
-            values: vec![f64::NAN; self.grid.len()],
-        });
-        self.many.len() - 1
-    }
-
-    /// One input series folded into the group's lanes.
-    fn absorb(
-        &mut self,
-        side: usize,
-        labels: &[String],
-        timestamps: &[i64],
-        values: &[f64],
-    ) -> Result<()> {
-        // A filtering comparison upstream of a binary operator can leave a
-        // series row with zero samples; ignore it so it does not allocate dead
-        // lanes or appear in duplicate-series diagnostics.
-        if timestamps.is_empty() {
-            return Ok(());
-        }
-        let grid = self.grid;
-        if !self.op.is_set() && side == self.matching.one_side() {
-            self.remember(labels);
-            let row = self.intern_one(labels);
-            let steps = grid.len();
-            let one = self.one.get_or_insert_with(|| OneLanes {
-                counts: vec![0; steps],
-                values: vec![f64::NAN; steps],
-                rows: None,
-            });
-            if row != 0 && one.rows.is_none() {
-                one.rows = Some(
-                    one.counts
-                        .iter()
-                        .map(|&c| if c > 0 { 0 } else { -1 })
-                        .collect(),
-                );
-            }
-            return grid.runs(timestamps, |index, from, len| {
-                for count in &mut one.counts[index..index + len] {
-                    *count = count.saturating_add(1);
-                }
-                one.values[index..index + len].copy_from_slice(&values[from..from + len]);
-                if let Some(rows) = &mut one.rows {
-                    rows[index..index + len].fill(row);
-                }
-            });
-        }
-        let many = self.intern_many(side, labels);
-        let series = &mut self.many[many];
-        let (counts, lanes) = (&mut series.counts, &mut series.values);
-        grid.runs(timestamps, |index, from, len| {
-            for count in &mut counts[index..index + len] {
-                *count = count.saturating_add(1);
-            }
-            lanes[index..index + len].copy_from_slice(&values[from..from + len]);
-        })
-    }
-
-    /// Keep what a failure would have to quote.
-    fn remember(&mut self, labels: &[String]) {
-        if self.group.is_none() {
-            self.group = Some(self.signature_text(labels));
-        }
-        if self.one_metrics.len() < 2 {
-            let metric = print(&self.schema, labels, |_| true);
-            if self.one_metrics.first() != Some(&metric) {
-                self.one_metrics.push(metric);
-            }
-        }
-    }
-
+impl BinaryConfig {
     /// Whether a label is part of the match signature, upstream's
     /// `MatchLabels`: the `on` labels, or everything but `__name__` and
     /// the `ignoring` ones.
@@ -858,6 +732,117 @@ impl Pairing {
         }
         out
     }
+}
+
+/// One match group's mutable state: the "one" side as lanes, the "many"
+/// side as a series each.
+#[derive(Debug, Default)]
+struct GroupState {
+    one: Option<OneLanes>,
+    one_pool: Vec<Vec<String>>,
+    many: Vec<Many>,
+    /// The match group's own labels, for the message a duplicate has to
+    /// name. Every row of the group renders the same text, so the first
+    /// one to arrive settles it.
+    group: Option<String>,
+    /// Up to two label sets from the "one" side, again only for that
+    /// message: upstream prints the pair that collided and there is
+    /// nothing to say about a third.
+    one_metrics: Vec<String>,
+}
+
+impl GroupState {
+    fn intern_one(&mut self, labels: &[String]) -> i32 {
+        if let Some(index) = self.one_pool.iter().position(|held| held == labels) {
+            return index as i32;
+        }
+        self.one_pool.push(labels.to_vec());
+        (self.one_pool.len() - 1) as i32
+    }
+
+    fn intern_many(&mut self, steps: usize, side: usize, labels: &[String]) -> usize {
+        if let Some(index) = self
+            .many
+            .iter()
+            .position(|held| held.side == side && held.labels == labels)
+        {
+            return index;
+        }
+        self.many.push(Many {
+            side,
+            labels: labels.to_vec(),
+            counts: vec![0; steps],
+            values: vec![f64::NAN; steps],
+        });
+        self.many.len() - 1
+    }
+
+    /// One input series folded into the group's lanes.
+    fn absorb(
+        &mut self,
+        config: &BinaryConfig,
+        side: usize,
+        labels: &[String],
+        timestamps: &[i64],
+        values: &[f64],
+    ) -> Result<()> {
+        // A filtering comparison upstream of a binary operator can leave a
+        // series row with zero samples; ignore it so it does not allocate dead
+        // lanes or appear in duplicate-series diagnostics.
+        if timestamps.is_empty() {
+            return Ok(());
+        }
+        let grid = config.grid;
+        let steps = grid.len();
+        if !config.op.is_set() && side == config.matching.one_side() {
+            self.remember(config, labels);
+            let row = self.intern_one(labels);
+            let one = self.one.get_or_insert_with(|| OneLanes {
+                counts: vec![0; steps],
+                values: vec![f64::NAN; steps],
+                rows: None,
+            });
+            if row != 0 && one.rows.is_none() {
+                one.rows = Some(
+                    one.counts
+                        .iter()
+                        .map(|&c| if c > 0 { 0 } else { -1 })
+                        .collect(),
+                );
+            }
+            return grid.runs(timestamps, |index, from, len| {
+                for count in &mut one.counts[index..index + len] {
+                    *count = count.saturating_add(1);
+                }
+                one.values[index..index + len].copy_from_slice(&values[from..from + len]);
+                if let Some(rows) = &mut one.rows {
+                    rows[index..index + len].fill(row);
+                }
+            });
+        }
+        let many = self.intern_many(steps, side, labels);
+        let series = &mut self.many[many];
+        let (counts, lanes) = (&mut series.counts, &mut series.values);
+        grid.runs(timestamps, |index, from, len| {
+            for count in &mut counts[index..index + len] {
+                *count = count.saturating_add(1);
+            }
+            lanes[index..index + len].copy_from_slice(&values[from..from + len]);
+        })
+    }
+
+    /// Keep what a failure would have to quote.
+    fn remember(&mut self, config: &BinaryConfig, labels: &[String]) {
+        if self.group.is_none() {
+            self.group = Some(config.signature_text(labels));
+        }
+        if self.one_metrics.len() < 2 {
+            let metric = print(&config.schema, labels, |_| true);
+            if self.one_metrics.first() != Some(&metric) {
+                self.one_metrics.push(metric);
+            }
+        }
+    }
 
     /// Upstream's message for two series on the "one" side of a match
     /// (`promql/engine.go:2999` at 83962c35).
@@ -871,9 +856,9 @@ impl Pairing {
     /// around the brackets rather than what is in them — DataFusion is
     /// free to hand the rows over in any order, and an assertion on the
     /// pair would be a flake waiting to happen.
-    fn duplicate(&self) -> DataFusionError {
+    fn duplicate(&self, config: &BinaryConfig) -> DataFusionError {
         let group = self.group.as_deref().unwrap_or("{}");
-        let side = self.matching.one_side_word();
+        let side = config.matching.one_side_word();
         // Upstream names the series it collided on first and the one
         // already held second; a side with fewer than two is out of
         // reach here, and an empty string is all there would be to say.
@@ -889,8 +874,8 @@ impl Pairing {
     /// Copy every populated sample from `target_side` directly into sorted
     /// output buckets when the opposing side of `unless` or `or` is absent
     /// across the whole match group.
-    fn copy_side_buckets(&self, target_side: usize) -> Vec<Bucket> {
-        let steps = self.grid.len();
+    fn copy_side_buckets(&self, config: &BinaryConfig, target_side: usize) -> Vec<Bucket> {
+        let steps = config.grid.len();
         let mut buckets: Vec<Bucket> = Vec::with_capacity(self.many.len());
         for series in &self.many {
             if series.side != target_side {
@@ -904,7 +889,7 @@ impl Pairing {
             let mut lhs = Vec::with_capacity(kept);
             for step in 0..steps {
                 if series.counts[step] > 0 {
-                    timestamps.push(self.grid.timestamp(step));
+                    timestamps.push(config.grid.timestamp(step));
                     lhs.push(series.values[step]);
                 }
             }
@@ -932,7 +917,7 @@ impl Pairing {
     /// That is why upstream's "vector cannot contain metrics with the
     /// same labelset" has no way to happen here, and why merging by
     /// label set is safe.
-    fn sets(&self) -> Vec<Bucket> {
+    fn sets(&self, config: &BinaryConfig) -> Vec<Bucket> {
         let mut lhs_count = 0usize;
         let mut rhs_count = 0usize;
         for series in &self.many {
@@ -943,19 +928,19 @@ impl Pairing {
             }
         }
         // Skip the per-step scan when an entire side of the match group is empty.
-        match self.op {
+        match config.op {
             Op::And if lhs_count == 0 || rhs_count == 0 => return Vec::new(),
             Op::Unless if lhs_count == 0 => return Vec::new(),
-            Op::Unless if rhs_count == 0 => return self.copy_side_buckets(LHS),
+            Op::Unless if rhs_count == 0 => return self.copy_side_buckets(config, LHS),
             Op::Or if lhs_count == 0 && rhs_count == 0 => return Vec::new(),
-            Op::Or if rhs_count == 0 => return self.copy_side_buckets(LHS),
-            Op::Or if lhs_count == 0 => return self.copy_side_buckets(RHS),
+            Op::Or if rhs_count == 0 => return self.copy_side_buckets(config, LHS),
+            Op::Or if lhs_count == 0 => return self.copy_side_buckets(config, RHS),
             _ => {}
         }
 
         // Resolve each series to its output bucket once up front so the step
         // loop indexes into `buckets` without hashing label vectors per step.
-        let bucket_cap = if self.op == Op::Or {
+        let bucket_cap = if config.op == Op::Or {
             self.many.len()
         } else {
             lhs_count
@@ -964,7 +949,7 @@ impl Pairing {
         let mut by_labels: HashMap<&[String], usize> = HashMap::with_capacity(bucket_cap);
         let mut series_bucket: Vec<usize> = Vec::with_capacity(self.many.len());
         for series in &self.many {
-            if self.op != Op::Or && series.side == RHS {
+            if config.op != Op::Or && series.side == RHS {
                 series_bucket.push(usize::MAX);
                 continue;
             }
@@ -984,7 +969,7 @@ impl Pairing {
             series_bucket.push(idx);
         }
 
-        for step in 0..self.grid.len() {
+        for step in 0..config.grid.len() {
             let present = |side: usize| {
                 self.many
                     .iter()
@@ -995,7 +980,7 @@ impl Pairing {
                 if series.counts[step] == 0 {
                     continue;
                 }
-                let keep = match self.op {
+                let keep = match config.op {
                     Op::And => series.side == LHS && right,
                     Op::Unless => series.side == LHS && !right,
                     // Everything on the left, and the right only where
@@ -1007,7 +992,7 @@ impl Pairing {
                     continue;
                 }
                 let b = &mut buckets[series_bucket[idx]];
-                b.timestamps.push(self.grid.timestamp(step));
+                b.timestamps.push(config.grid.timestamp(step));
                 b.lhs.push(series.values[step]);
             }
         }
@@ -1030,11 +1015,11 @@ impl Pairing {
     /// Seeing that would take a second pass over every group. With a
     /// fill the step is not empty -- the fill is the missing side --
     /// so it is walked like any other.
-    fn pairs(&self) -> Result<Vec<Bucket>> {
-        if self.op.is_set() {
-            return Ok(self.sets());
+    fn pairs(&self, config: &BinaryConfig) -> Result<Vec<Bucket>> {
+        if config.op.is_set() {
+            return Ok(self.sets(config));
         }
-        let (fill_one, fill_many) = (self.matching.fill_one(), self.matching.fill_many());
+        let (fill_one, fill_many) = (config.matching.fill_one(), config.matching.fill_many());
         // Short-circuit match groups where a required side never arrived.
         if self.many.is_empty() && fill_one.is_none() && fill_many.is_none() {
             return Ok(Vec::new());
@@ -1050,13 +1035,13 @@ impl Pairing {
                 if one.rows.is_none() {
                     if let Some(one_labels) = self.one_pool.first() {
                         let many = &self.many[0];
-                        let steps = self.grid.len();
+                        let steps = config.grid.len();
                         let mut paired = 0usize;
                         for step in 0..steps {
                             if many.counts[step] > 0 {
                                 let oc = one.counts[step];
                                 if oc > 1 {
-                                    return Err(self.duplicate());
+                                    return Err(self.duplicate(config));
                                 }
                                 if oc == 1 {
                                     paired += 1;
@@ -1069,10 +1054,10 @@ impl Pairing {
                         let mut timestamps = Vec::with_capacity(paired);
                         let mut lhs = Vec::with_capacity(paired);
                         let mut rhs = Vec::with_capacity(paired);
-                        let one_is_lhs = self.matching.one_side() == LHS;
+                        let one_is_lhs = config.matching.one_side() == LHS;
                         for step in 0..steps {
                             if many.counts[step] > 0 && one.counts[step] == 1 {
-                                timestamps.push(self.grid.timestamp(step));
+                                timestamps.push(config.grid.timestamp(step));
                                 let (mv, ov) = (many.values[step], one.values[step]);
                                 let (l, r) = if one_is_lhs { (ov, mv) } else { (mv, ov) };
                                 lhs.push(l);
@@ -1080,7 +1065,7 @@ impl Pairing {
                             }
                         }
                         return Ok(vec![Bucket {
-                            labels: self.result_labels(&many.labels, one_labels),
+                            labels: config.result_labels(&many.labels, one_labels),
                             timestamps,
                             lhs,
                             rhs,
@@ -1096,12 +1081,12 @@ impl Pairing {
         let mut by_pair: HashMap<(Option<usize>, i32), usize> = HashMap::new();
         // Direct bucket lookup table for `one_row == 0` indexed by `many`.
         let mut row0_buckets: Vec<usize> = vec![usize::MAX; self.many.len()];
-        let one_to_one = self.matching.card == Card::OneToOne;
-        let nothing: Vec<String> = vec![String::new(); self.schema.len()];
+        let one_to_one = config.matching.card == Card::OneToOne;
+        let nothing: Vec<String> = vec![String::new(); config.schema.len()];
         // Reuse `todo` across steps instead of allocating a new `Vec` per step.
         let mut todo: Vec<(Option<usize>, f64, f64)> = Vec::with_capacity(self.many.len().max(1));
 
-        for step in 0..self.grid.len() {
+        for step in 0..config.grid.len() {
             let any_many = self.many.iter().any(|series| series.counts[step] > 0);
             let one_count = self.one.as_ref().map_or(0, |o| o.counts[step]);
             let one_here = one_count > 0;
@@ -1109,7 +1094,7 @@ impl Pairing {
                 continue;
             }
             if one_count > 1 {
-                return Err(self.duplicate());
+                return Err(self.duplicate(config));
             }
 
             // What pairs at this step: the "many" row, or `None` where
@@ -1169,18 +1154,18 @@ impl Pairing {
                         // nothing else, on whichever side it stands in.
                         let base = match many {
                             Some(m) => self.many[m].labels.clone(),
-                            None => self.signature_of(one_labels),
+                            None => config.signature_of(one_labels),
                         };
                         let one = match many {
-                            Some(_) if !one_here => self.signature_of(&base),
+                            Some(_) if !one_here => config.signature_of(&base),
                             _ => one_labels.clone(),
                         };
-                        let labels = self.result_labels(&base, &one);
+                        let labels = config.result_labels(&base, &one);
                         let cap = match many {
                             Some(m) if fill_one.is_none() => {
                                 self.many[m].counts.iter().filter(|&&c| c > 0).count()
                             }
-                            _ => self.grid.len(),
+                            _ => config.grid.len(),
                         };
                         let bucket = *by_labels.entry(labels.clone()).or_insert_with(|| {
                             buckets.push(Bucket {
@@ -1208,12 +1193,12 @@ impl Pairing {
                 }
                 buckets[bucket].claimed = Some(step);
 
-                let (lhs, rhs) = match self.matching.one_side() {
+                let (lhs, rhs) = match config.matching.one_side() {
                     LHS => (one_value, many_value),
                     _ => (many_value, one_value),
                 };
                 let bucket = &mut buckets[bucket];
-                bucket.timestamps.push(self.grid.timestamp(step));
+                bucket.timestamps.push(config.grid.timestamp(step));
                 bucket.lhs.push(lhs);
                 bucket.rhs.push(rhs);
             }
@@ -1231,10 +1216,9 @@ fn corrupt(what: &str) -> DataFusionError {
     DataFusionError::Internal(format!("{NAME}: partial state holds {what}"))
 }
 
-impl Pairing {
-    /// Approximate heap bytes owned uniquely by this group, excluding the
-    /// `Arc`-shared `matching` and `schema` allocations.
-    fn heap_size(&self) -> usize {
+impl GroupState {
+    /// Approximate heap bytes owned uniquely by this group.
+    fn heap_size(&self, config: &BinaryConfig) -> usize {
         let one_bytes = match &self.one {
             Some(one) => {
                 one.counts.capacity() * std::mem::size_of::<u8>()
@@ -1246,21 +1230,27 @@ impl Pairing {
             }
             None => 0,
         };
-        let many_lane = self.grid.len() * (std::mem::size_of::<u8>() + std::mem::size_of::<f64>());
+        let many_lane =
+            config.grid.len() * (std::mem::size_of::<u8>() + std::mem::size_of::<f64>());
         one_bytes
             + self.many.capacity() * std::mem::size_of::<Many>()
             + self.many.len() * many_lane
             + (self.many.len() + self.one_pool.capacity())
-                * self.schema.len()
+                * config.schema.len()
                 * std::mem::size_of::<String>()
             + self.one_metrics.capacity() * std::mem::size_of::<String>()
             + self.group.as_ref().map_or(0, String::capacity)
     }
 
     /// Merge row `row` of `parsed` partial-state columns into this group.
-    fn merge_row(&mut self, parsed: &ParsedStates<'_>, row: usize) -> Result<()> {
-        let steps = self.grid.len();
-        let width = self.schema.len();
+    fn merge_row(
+        &mut self,
+        config: &BinaryConfig,
+        parsed: &ParsedStates<'_>,
+        row: usize,
+    ) -> Result<()> {
+        let steps = config.grid.len();
+        let width = config.schema.len();
 
         let (oc_lo, oc_hi) = parsed.one_counts.range(row);
         let (ov_lo, ov_hi) = parsed.one_values.range(row);
@@ -1348,7 +1338,7 @@ impl Pairing {
             let labels =
                 rectangle_slice(parsed.many_labels.values, ml_lo, ml_hi, width, series_rows)?;
             for (index, labels) in labels.iter().enumerate() {
-                let many = self.intern_many(m_sides[index] as usize, labels);
+                let many = self.intern_many(steps, m_sides[index] as usize, labels);
                 let dst = &mut self.many[many];
                 let base = index * steps;
                 for step in 0..steps {
@@ -1381,38 +1371,74 @@ impl Pairing {
     }
 }
 
-impl Accumulator for Pairing {
-    fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
-        let inputs = BatchInputs::parse(&self.schema, values)?;
-        let mut row_labels: Vec<String> = Vec::with_capacity(self.schema.len());
-        for row in 0..inputs.list.len() {
-            if inputs.list.is_null(row) {
-                continue;
-            }
-            let which = inputs.side_at(row);
-            inputs.labels.read_into(row, &mut row_labels);
-            let (lo, hi) = inputs.sample_range(row);
-            self.absorb(
-                which,
-                &row_labels,
-                &inputs.timestamps[lo..hi],
-                &inputs.samples[lo..hi],
-            )?;
+/// The same lanes driven as a single group for [`Accumulator`] callers
+/// (such as SQL without grouping columns or window frames). Delegating to
+/// [`GroupedBinary`] keeps both traits on one update and merge path.
+#[derive(Debug)]
+struct Pairing {
+    grouped: GroupedBinary,
+    /// Every row belongs to group zero.
+    zeros: Vec<usize>,
+}
+
+impl Pairing {
+    fn from_config(config: BinaryConfig) -> Self {
+        let mut grouped = GroupedBinary::new(config);
+        grouped.grow(1);
+        Self {
+            grouped,
+            zeros: Vec::new(),
         }
-        Ok(())
     }
 
-    /// The operands [`Pairing::pairs`] gathered, computed by one kernel
+    #[cfg(test)]
+    fn new(op: Op, return_bool: bool, matching: Matching, grid: Grid, schema: Vec<String>) -> Self {
+        Self::from_config(BinaryConfig {
+            op,
+            return_bool,
+            matching,
+            grid,
+            schema,
+        })
+    }
+
+    #[cfg(test)]
+    fn group(&self) -> &GroupState {
+        &self.grouped.groups[0]
+    }
+
+    #[cfg(test)]
+    fn absorb(
+        &mut self,
+        side: usize,
+        labels: &[String],
+        timestamps: &[i64],
+        values: &[f64],
+    ) -> Result<()> {
+        let g = &mut self.grouped.groups[0];
+        let before = g.heap_size(&self.grouped.config);
+        let res = g.absorb(&self.grouped.config, side, labels, timestamps, values);
+        self.grouped.heap_size =
+            self.grouped.heap_size - before + g.heap_size(&self.grouped.config);
+        res
+    }
+}
+
+impl Accumulator for Pairing {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        let num_rows = values.first().map_or(0, Array::len);
+        self.zeros.resize(num_rows, 0);
+        self.grouped.update_batch(values, &self.zeros, None, 1)
+    }
+
+    /// The operands [`GroupState::pairs`] gathered, computed by one kernel
     /// call over every bucket end to end rather than once per step. A
     /// filtering comparison keeps the left operand where it holds, which
     /// may leave a bucket empty, and an empty bucket is no series.
+    ///
+    /// Borrowed reads retain state so a window frame can evaluate again.
     fn evaluate(&mut self) -> Result<ScalarValue> {
-        let out = evaluate_groups(
-            self.op,
-            self.return_bool,
-            &self.schema,
-            std::slice::from_ref(self),
-        )?;
+        let out = evaluate_groups(&self.grouped.config, &self.grouped.groups[..1])?;
         Ok(ScalarValue::List(Arc::new(out)))
     }
 
@@ -1421,16 +1447,12 @@ impl Accumulator for Pairing {
     /// partial travels as the same handful of primitive lanes whatever
     /// the query's label schema is.
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
-        let arrays = emit_groups_state(
-            std::slice::from_ref(self),
-            self.grid.len(),
-            self.schema.len(),
-        )?;
-        let mut scalars = Vec::with_capacity(arrays.len());
-        for array in &arrays[..STATE_LANES.len()] {
+        let lanes = emit_groups_lanes(&self.grouped.config, &self.grouped.groups[..1])?;
+        let mut scalars = Vec::with_capacity(lanes.len() + 1);
+        for array in lanes {
             scalars.push(ScalarValue::List(Arc::new(array.as_list::<i32>().clone())));
         }
-        scalars.push(ScalarValue::Utf8(self.group.clone()));
+        scalars.push(ScalarValue::Utf8(self.grouped.groups[0].group.clone()));
         Ok(scalars)
     }
 
@@ -1439,15 +1461,15 @@ impl Accumulator for Pairing {
     /// one partial saw that sample, so any partial that saw something
     /// carries the value.
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
-        let parsed = ParsedStates::parse(states)?;
-        for row in 0..parsed.num_rows {
-            self.merge_row(&parsed, row)?;
-        }
-        Ok(())
+        let num_rows = states.first().map_or(0, Array::len);
+        self.zeros.resize(num_rows, 0);
+        self.grouped.merge_batch(states, &self.zeros, 1)
     }
 
     fn size(&self) -> usize {
-        std::mem::size_of::<Self>() + self.heap_size()
+        std::mem::size_of::<Self>()
+            + self.grouped.heap_bytes()
+            + self.zeros.capacity() * std::mem::size_of::<usize>()
     }
 }
 
@@ -1456,44 +1478,29 @@ impl Accumulator for Pairing {
 /// directly across all match groups without `ScalarValue` round-trips.
 #[derive(Debug)]
 struct GroupedBinary {
-    op: Op,
-    return_bool: bool,
-    matching: Arc<Matching>,
-    grid: Grid,
-    schema: Arc<[String]>,
-    groups: Vec<Pairing>,
+    config: BinaryConfig,
+    groups: Vec<GroupState>,
     heap_size: usize,
 }
 
 impl GroupedBinary {
-    fn from_pairing(template: Pairing) -> Self {
+    fn new(config: BinaryConfig) -> Self {
         Self {
-            op: template.op,
-            return_bool: template.return_bool,
-            matching: template.matching,
-            grid: template.grid,
-            schema: template.schema,
+            config,
             groups: Vec::new(),
             heap_size: 0,
         }
     }
 
+    #[cfg(test)]
+    fn from_pairing(template: Pairing) -> Self {
+        Self::new(template.grouped.config)
+    }
+
     fn grow(&mut self, total_num_groups: usize) {
         if self.groups.len() < total_num_groups {
-            let op = self.op;
-            let return_bool = self.return_bool;
-            let matching = &self.matching;
-            let grid = self.grid;
-            let schema = &self.schema;
-            self.groups.resize_with(total_num_groups, || {
-                Pairing::new_shared(
-                    op,
-                    return_bool,
-                    Arc::clone(matching),
-                    grid,
-                    Arc::clone(schema),
-                )
-            });
+            self.groups
+                .resize_with(total_num_groups, GroupState::default);
         }
     }
 
@@ -1513,10 +1520,14 @@ impl GroupedBinary {
             EmitTo::First(n) => {
                 let drained = n.min(self.groups.len());
                 for group in self.groups.drain(..drained) {
-                    self.heap_size -= group.heap_size();
+                    self.heap_size -= group.heap_size(&self.config);
                 }
             }
         }
+    }
+
+    fn heap_bytes(&self) -> usize {
+        self.groups.capacity() * std::mem::size_of::<GroupState>() + self.heap_size
     }
 }
 
@@ -1529,8 +1540,8 @@ impl GroupsAccumulator for GroupedBinary {
         total_num_groups: usize,
     ) -> Result<()> {
         self.grow(total_num_groups);
-        let inputs = BatchInputs::parse(&self.schema, values)?;
-        let mut row_labels: Vec<String> = Vec::with_capacity(self.schema.len());
+        let inputs = BatchInputs::parse(&self.config.schema, values)?;
+        let mut row_labels: Vec<String> = Vec::with_capacity(self.config.schema.len());
 
         for (row, &group_idx) in group_indices.iter().enumerate() {
             if inputs.list.is_null(row)
@@ -1541,15 +1552,16 @@ impl GroupsAccumulator for GroupedBinary {
             let which = inputs.side_at(row);
             inputs.labels.read_into(row, &mut row_labels);
             let (lo, hi) = inputs.sample_range(row);
-            let pairing = &mut self.groups[group_idx];
-            let before = pairing.heap_size();
-            let res = pairing.absorb(
+            let group = &mut self.groups[group_idx];
+            let before = group.heap_size(&self.config);
+            let res = group.absorb(
+                &self.config,
                 which,
                 &row_labels,
                 &inputs.timestamps[lo..hi],
                 &inputs.samples[lo..hi],
             );
-            self.heap_size = self.heap_size - before + pairing.heap_size();
+            self.heap_size = self.heap_size - before + group.heap_size(&self.config);
             res?;
         }
         Ok(())
@@ -1557,14 +1569,14 @@ impl GroupsAccumulator for GroupedBinary {
 
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
         let n = self.emitted(emit_to);
-        let out = evaluate_groups(self.op, self.return_bool, &self.schema, &self.groups[..n])?;
+        let out = evaluate_groups(&self.config, &self.groups[..n])?;
         self.release(emit_to);
         Ok(Arc::new(out))
     }
 
     fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
         let n = self.emitted(emit_to);
-        let out = emit_groups_state(&self.groups[..n], self.grid.len(), self.schema.len())?;
+        let out = emit_groups_state(&self.config, &self.groups[..n])?;
         self.release(emit_to);
         Ok(out)
     }
@@ -1577,11 +1589,18 @@ impl GroupsAccumulator for GroupedBinary {
     ) -> Result<()> {
         self.grow(total_num_groups);
         let parsed = ParsedStates::parse(values)?;
+        if parsed.num_rows != group_indices.len() {
+            return Err(DataFusionError::Internal(format!(
+                "{NAME}: partial state has {} rows, expected {}",
+                parsed.num_rows,
+                group_indices.len()
+            )));
+        }
         for (row, &group_idx) in group_indices.iter().enumerate() {
-            let pairing = &mut self.groups[group_idx];
-            let before = pairing.heap_size();
-            let res = pairing.merge_row(&parsed, row);
-            self.heap_size = self.heap_size - before + pairing.heap_size();
+            let group = &mut self.groups[group_idx];
+            let before = group.heap_size(&self.config);
+            let res = group.merge_row(&self.config, &parsed, row);
+            self.heap_size = self.heap_size - before + group.heap_size(&self.config);
             res?;
         }
         Ok(())
@@ -1596,11 +1615,7 @@ impl GroupsAccumulator for GroupedBinary {
     ) -> Result<Vec<ArrayRef>> {
         let num_rows = values.first().map_or(0, Array::len);
         let mut temp = GroupedBinary {
-            op: self.op,
-            return_bool: self.return_bool,
-            matching: Arc::clone(&self.matching),
-            grid: self.grid,
-            schema: Arc::clone(&self.schema),
+            config: self.config.clone(),
             groups: Vec::with_capacity(num_rows),
             heap_size: 0,
         };
@@ -1610,9 +1625,7 @@ impl GroupsAccumulator for GroupedBinary {
     }
 
     fn size(&self) -> usize {
-        std::mem::size_of::<Self>()
-            + self.groups.capacity() * std::mem::size_of::<Pairing>()
-            + self.heap_size
+        std::mem::size_of::<Self>() + self.heap_bytes()
     }
 }
 
@@ -1624,17 +1637,15 @@ fn checked_i32_offset(offset: usize) -> Result<i32> {
 
 /// Evaluate `groups` in one pass, running [`Op::kernel`] once across all
 /// paired sample lanes and assembling one outer `ListArray` row per group.
-fn evaluate_groups(
-    op: Op,
-    return_bool: bool,
-    schema: &[String],
-    groups: &[Pairing],
-) -> Result<ListArray> {
+fn evaluate_groups(config: &BinaryConfig, groups: &[GroupState]) -> Result<ListArray> {
+    let op = config.op;
+    let return_bool = config.return_bool;
+    let schema = &config.schema;
     let mut group_buckets: Vec<Vec<Bucket>> = Vec::with_capacity(groups.len());
     let mut total_buckets = 0usize;
     let mut total_samples = 0usize;
     for group in groups {
-        let buckets = group.pairs()?;
+        let buckets = group.pairs(config)?;
         for b in &buckets {
             total_samples += b.timestamps.len();
         }
@@ -1766,9 +1777,11 @@ fn evaluate_groups(
     ))
 }
 
-/// Serialize `groups` into the ten partial-state columns declared by
-/// [`Binary::state_fields`] without intermediate `ScalarValue` wrappers.
-fn emit_groups_state(groups: &[Pairing], steps: usize, width: usize) -> Result<Vec<ArrayRef>> {
+/// Serialize the nine list-typed partial-state lanes of `groups` without
+/// intermediate `ScalarValue` wrappers.
+fn emit_groups_lanes(config: &BinaryConfig, groups: &[GroupState]) -> Result<Vec<ArrayRef>> {
+    let steps = config.grid.len();
+    let width = config.schema.len();
     let n = groups.len();
     let mut cap_one_steps = 0usize;
     let mut cap_one_rows = 0usize;
@@ -1865,7 +1878,6 @@ fn emit_groups_state(groups: &[Pairing], steps: usize, width: usize) -> Result<V
 
     let one_steps_buf = OffsetBuffer::new(one_steps_offsets.into());
     let many_steps_buf = OffsetBuffer::new(many_steps_offsets.into());
-    let group_array = StringArray::from_iter(groups.iter().map(|g| g.group.as_deref()));
 
     let list =
         |name: &str, dt: DataType, offsets: OffsetBuffer<i32>, values: ArrayRef| -> ArrayRef {
@@ -1927,8 +1939,17 @@ fn emit_groups_state(groups: &[Pairing], steps: usize, width: usize) -> Result<V
             OffsetBuffer::new(many_sides_offsets.into()),
             Arc::new(UInt8Array::from(many_sides_vec)),
         ),
-        Arc::new(group_array),
     ])
+}
+
+/// Serialize `groups` into the ten partial-state columns declared by
+/// [`Binary::state_fields`] without intermediate `ScalarValue` wrappers.
+fn emit_groups_state(config: &BinaryConfig, groups: &[GroupState]) -> Result<Vec<ArrayRef>> {
+    let mut arrays = emit_groups_lanes(config, groups)?;
+    arrays.push(Arc::new(StringArray::from_iter(
+        groups.iter().map(|g| g.group.as_deref()),
+    )));
+    Ok(arrays)
 }
 
 /// Decoded input columns for one `update_batch` call, bound once per batch.
@@ -2322,7 +2343,7 @@ fn names_of(labels: &DataType) -> Option<Vec<String>> {
 
 /// The operator, the matching and the grid, read back off the planned
 /// call.
-fn from_args(args: &AccumulatorArgs) -> Result<Pairing> {
+fn from_args(args: &AccumulatorArgs) -> Result<BinaryConfig> {
     let literal = |i: usize| {
         args.exprs
             .get(i)
@@ -2370,7 +2391,13 @@ fn from_args(args: &AccumulatorArgs) -> Result<Pairing> {
         .ok_or_else(|| {
             DataFusionError::Plan(format!("{NAME}: third argument must be a label struct"))
         })?;
-    Ok(Pairing::new(op, return_bool, matching, grid, schema))
+    Ok(BinaryConfig {
+        op,
+        return_bool,
+        matching,
+        grid,
+        schema,
+    })
 }
 
 impl AggregateUDFImpl for Binary {
@@ -2409,7 +2436,7 @@ impl AggregateUDFImpl for Binary {
         if args.is_distinct {
             return plan_err!("{NAME}: DISTINCT is not supported");
         }
-        Ok(Box::new(from_args(&args)?))
+        Ok(Box::new(Pairing::from_config(from_args(&args)?)))
     }
 
     fn groups_accumulator_supported(&self, args: AccumulatorArgs) -> bool {
@@ -2423,7 +2450,7 @@ impl AggregateUDFImpl for Binary {
         if args.is_distinct {
             return plan_err!("{NAME}: DISTINCT is not supported");
         }
-        Ok(Box::new(GroupedBinary::from_pairing(from_args(&args)?)))
+        Ok(Box::new(GroupedBinary::new(from_args(&args)?)))
     }
 
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
@@ -3649,7 +3676,10 @@ mod tests {
         let s1_first = p1.state(EmitTo::First(1)).unwrap();
         assert_eq!(
             p1.heap_size,
-            p1.groups.iter().map(Pairing::heap_size).sum::<usize>()
+            p1.groups
+                .iter()
+                .map(|g| g.heap_size(&p1.config))
+                .sum::<usize>()
         );
         assert!(p1.heap_size > 0);
         let s1_rest = p1.state(EmitTo::All).unwrap();
@@ -3676,7 +3706,7 @@ mod tests {
             final_acc
                 .groups
                 .iter()
-                .map(Pairing::heap_size)
+                .map(|g| g.heap_size(&final_acc.config))
                 .sum::<usize>()
         );
         // Merge into the shifted group index after `EmitTo::First(1)`.
@@ -3802,10 +3832,10 @@ mod tests {
             .unwrap();
         p.absorb(RHS, &lset("filtered_rhs", "", "a", ""), &[], &[])
             .unwrap();
-        assert!(p.one.is_none());
-        assert!(p.one_pool.is_empty());
-        assert!(p.one_metrics.is_empty());
-        assert!(p.many.is_empty());
+        assert!(p.group().one.is_none());
+        assert!(p.group().one_pool.is_empty());
+        assert!(p.group().one_metrics.is_empty());
+        assert!(p.group().many.is_empty());
 
         p.absorb(LHS, &lset("req", "", "a", ""), &[0], &[1.0])
             .unwrap();
@@ -3838,7 +3868,7 @@ mod tests {
             .unwrap();
         gr.absorb(RHS, &lset("errors", "/x", "a", ""), &[0], &[3.0])
             .unwrap();
-        assert!(gr.one.as_ref().unwrap().rows.is_none());
+        assert!(gr.group().one.as_ref().unwrap().rows.is_none());
         assert_eq!(
             pairs_of(gr.evaluate().unwrap()),
             [(lset("", "/x", "a", "eu"), vec![(0, 7.0)])]
@@ -3853,7 +3883,7 @@ mod tests {
             .unwrap();
         dup.absorb(RHS, &lset("err", "", "a", ""), &[0], &[3.0])
             .unwrap();
-        assert!(dup.one.as_ref().unwrap().rows.is_none());
+        assert!(dup.group().one.as_ref().unwrap().rows.is_none());
         assert!(dup
             .evaluate()
             .unwrap_err()
@@ -3900,7 +3930,7 @@ mod tests {
                     .collect();
                 merged.merge_batch(&arrays).unwrap();
             }
-            assert_eq!(merged.one.as_ref().unwrap().counts[0], u8::MAX);
+            assert_eq!(merged.group().one.as_ref().unwrap().counts[0], u8::MAX);
             assert!(merged
                 .evaluate()
                 .unwrap_err()
@@ -3924,7 +3954,7 @@ mod tests {
             },
         );
         fill_r.absorb(LHS, &lhs, &[0], &[2.0]).unwrap();
-        assert!(fill_r.one.is_none());
+        assert!(fill_r.group().one.is_none());
         assert_eq!(
             pairs_of(fill_r.evaluate().unwrap()),
             [(lset("", "/x", "a", ""), vec![(0, 7.0)])]
@@ -3952,7 +3982,7 @@ mod tests {
             },
         );
         fill_l.absorb(RHS, &rhs, &[0], &[3.0]).unwrap();
-        assert!(fill_l.many.is_empty());
+        assert!(fill_l.group().many.is_empty());
         assert_eq!(
             pairs_of(fill_l.evaluate().unwrap()),
             [(lset("", "", "a", "eu"), vec![(0, 13.0)])]
