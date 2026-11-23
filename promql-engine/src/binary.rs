@@ -1346,41 +1346,38 @@ impl GroupState {
         if m_sides.len() != series_rows {
             return Err(corrupt("a side per series that is not one per series"));
         }
-        if series_rows > 0 {
-            let (ml_lo, ml_hi) = parsed.many_labels.range(row);
-            let labels =
-                rectangle_slice(parsed.many_labels.values, ml_lo, ml_hi, width, series_rows)?;
-            for (index, labels) in labels.iter().enumerate() {
-                let many = self.intern_many(steps, m_sides[index] as usize, labels);
-                let dst = &mut self.many[many];
-                let base = index * steps;
-                for step in 0..steps {
-                    let c = m_counts[base + step];
-                    if c > 0 {
-                        dst.counts[step] = dst.counts[step].saturating_add(c);
-                        dst.values[step] = m_values[base + step];
-                    }
+        let (ml_lo, ml_hi) = parsed.many_labels.range(row);
+        let labels = rectangle_slice(parsed.many_labels.values, ml_lo, ml_hi, width, series_rows)?;
+        for (index, labels) in labels.iter().enumerate() {
+            let side = usize::from(m_sides[index]);
+            if side > RHS || (!config.op.is_set() && side == config.matching.one_side()) {
+                return Err(corrupt("an invalid side in many_sides"));
+            }
+            let many = self.intern_many(steps, side, labels);
+            let dst = &mut self.many[many];
+            let base = index * steps;
+            for step in 0..steps {
+                let c = m_counts[base + step];
+                if c > 0 {
+                    dst.counts[step] = dst.counts[step].saturating_add(c);
+                    dst.values[step] = m_values[base + step];
                 }
             }
         }
 
-        if let Some(metrics) = &parsed.one_metrics {
-            let (lo, hi) = metrics.range(row);
-            for i in lo..hi {
-                let val = metrics.values.value(i);
-                if self.one_metrics.len() < 2
-                    && self.one_metrics.first().map(String::as_str) != Some(val)
-                {
-                    let owned = val.to_string();
-                    self.label_bytes += owned.capacity();
-                    self.one_metrics.push(owned);
-                }
+        let (lo, hi) = parsed.one_metrics.range(row);
+        for i in lo..hi {
+            let val = parsed.one_metrics.values.value(i);
+            if self.one_metrics.len() < 2
+                && self.one_metrics.first().map(String::as_str) != Some(val)
+            {
+                let owned = val.to_string();
+                self.label_bytes += owned.capacity();
+                self.one_metrics.push(owned);
             }
         }
-        if let Some(group) = parsed.group {
-            if self.group.is_none() && group.is_valid(row) {
-                self.group = Some(group.value(row).to_string());
-            }
+        if self.group.is_none() && parsed.group.is_valid(row) {
+            self.group = Some(parsed.group.value(row).to_string());
         }
         Ok(())
     }
@@ -2102,12 +2099,12 @@ struct ParsedStates<'a> {
     one_values: PrimList<'a, f64>,
     one_rows: PrimList<'a, i32>,
     one_pool: TextList<'a>,
-    one_metrics: Option<TextList<'a>>,
+    one_metrics: TextList<'a>,
     many_labels: TextList<'a>,
     many_counts: PrimList<'a, u8>,
     many_values: PrimList<'a, f64>,
     many_sides: PrimList<'a, u8>,
-    group: Option<&'a StringArray>,
+    group: &'a StringArray,
 }
 
 impl<'a> ParsedStates<'a> {
@@ -2116,32 +2113,30 @@ impl<'a> ParsedStates<'a> {
         let one_values = prim_list::<Float64Type>(states.get(1), STATE_ONE_VALUES)?;
         let one_rows = prim_list::<Int32Type>(states.get(2), STATE_ONE_ROWS)?;
         let one_pool = text_list(states.get(3), STATE_ONE_POOL)?;
-        let one_metrics = states
-            .get(4)
-            .and_then(|s| s.as_list_opt::<i32>())
-            .and_then(|list| {
-                list.values().as_string_opt::<i32>().map(|values| TextList {
-                    offsets: list.offsets(),
-                    values,
-                    len: list.len(),
-                })
-            });
+        let one_metrics = text_list(states.get(4), STATE_ONE_METRICS)?;
         let many_labels = text_list(states.get(5), STATE_MANY_LABELS)?;
         let many_counts = prim_list::<UInt8Type>(states.get(6), STATE_MANY_COUNTS)?;
         let many_values = prim_list::<Float64Type>(states.get(7), STATE_MANY_VALUES)?;
         let many_sides = prim_list::<UInt8Type>(states.get(8), STATE_MANY_SIDES)?;
-        let group = states.get(9).and_then(|s| s.as_string_opt::<i32>());
+        let group = states
+            .get(9)
+            .and_then(|s| s.as_string_opt::<i32>())
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "{NAME}: partial state column {STATE_GROUP} is not Utf8"
+                ))
+            })?;
 
         let num_rows = one_counts.len;
         if one_values.len != num_rows
             || one_rows.len != num_rows
             || one_pool.len != num_rows
+            || one_metrics.len != num_rows
             || many_labels.len != num_rows
             || many_counts.len != num_rows
             || many_values.len != num_rows
             || many_sides.len != num_rows
-            || one_metrics.as_ref().is_some_and(|m| m.len != num_rows)
-            || group.is_some_and(|g| g.len() != num_rows)
+            || group.len() != num_rows
         {
             return Err(DataFusionError::Internal(format!(
                 "{NAME}: partial state columns have mismatched row counts"
@@ -2179,6 +2174,11 @@ fn rectangle_slice(
 ) -> Result<Vec<Vec<String>>> {
     let len = hi - lo;
     if width == 0 {
+        if len != 0 {
+            return Err(DataFusionError::Internal(format!(
+                "{NAME}: {len} label values for a zero-width schema"
+            )));
+        }
         // Every label set is the empty one, so a pool of them holds
         // exactly one entry and a rectangle holds as many as the
         // caller counted.
@@ -2268,12 +2268,22 @@ fn prim_list<'a, T: datafusion::arrow::datatypes::ArrowPrimitiveType>(
     let list = state.and_then(|s| s.as_list_opt::<i32>()).ok_or_else(|| {
         DataFusionError::Internal(format!("{NAME}: partial state column {name} is not a list"))
     })?;
+    if list.null_count() > 0 {
+        return Err(DataFusionError::Internal(format!(
+            "{NAME}: partial state column {name} has nulls"
+        )));
+    }
     let prim = list.values().as_primitive_opt::<T>().ok_or_else(|| {
         DataFusionError::Internal(format!(
             "{NAME}: partial state column {name} holds {}",
             list.values().data_type()
         ))
     })?;
+    if prim.null_count() > 0 {
+        return Err(DataFusionError::Internal(format!(
+            "{NAME}: partial state column {name} values have nulls"
+        )));
+    }
     Ok(PrimList {
         offsets: list.offsets(),
         values: prim.values(),
@@ -2285,12 +2295,22 @@ fn text_list<'a>(state: Option<&'a ArrayRef>, name: &str) -> Result<TextList<'a>
     let list = state.and_then(|s| s.as_list_opt::<i32>()).ok_or_else(|| {
         DataFusionError::Internal(format!("{NAME}: partial state column {name} is not a list"))
     })?;
+    if list.null_count() > 0 {
+        return Err(DataFusionError::Internal(format!(
+            "{NAME}: partial state column {name} has nulls"
+        )));
+    }
     let values = list.values().as_string_opt::<i32>().ok_or_else(|| {
         DataFusionError::Internal(format!(
             "{NAME}: partial state column {name} holds {}",
             list.values().data_type()
         ))
     })?;
+    if values.null_count() > 0 {
+        return Err(DataFusionError::Internal(format!(
+            "{NAME}: partial state column {name} values have nulls"
+        )));
+    }
     Ok(TextList {
         offsets: list.offsets(),
         values,
