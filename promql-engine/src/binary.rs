@@ -1666,22 +1666,234 @@ impl GroupsAccumulator for GroupedBinary {
         Ok(())
     }
 
-    /// Convert each input row directly into a single-row partial state when
-    /// DataFusion bypasses high-cardinality partial aggregation.
+    /// Convert each input row directly into a single-row partial state in one
+    /// pass when DataFusion bypasses high-cardinality partial aggregation,
+    /// avoiding temporary per-row [`GroupState`] allocations and double copies.
     fn convert_to_state(
         &self,
         values: &[ArrayRef],
         opt_filter: Option<&BooleanArray>,
     ) -> Result<Vec<ArrayRef>> {
-        let num_rows = values.first().map_or(0, Array::len);
-        let mut temp = GroupedBinary {
-            config: self.config.clone(),
-            groups: Vec::with_capacity(num_rows),
-            heap_size: 0,
-        };
-        let indices: Vec<usize> = (0..num_rows).collect();
-        temp.update_batch(values, &indices, opt_filter, num_rows)?;
-        temp.state(EmitTo::All)
+        let inputs = BatchInputs::parse(&self.config.schema, values)?;
+        let num_rows = inputs.list.len();
+        let steps = self.config.grid.len();
+        let width = self.config.schema.len();
+        let is_set = self.config.op.is_set();
+        let one_side = self.config.matching.one_side();
+
+        let mut cap_one_rows = 0usize;
+        let mut cap_one_pool_bytes = 0usize;
+        let mut cap_one_metrics_bytes = 0usize;
+        let mut cap_group_bytes = 0usize;
+        let mut cap_many_rows = 0usize;
+        let mut cap_many_labels_bytes = 0usize;
+
+        for row in 0..num_rows {
+            if inputs.list.is_null(row)
+                || opt_filter.is_some_and(|f| f.is_null(row) || !f.value(row))
+            {
+                continue;
+            }
+            let (lo, hi) = inputs.sample_range(row);
+            if lo == hi {
+                continue;
+            }
+            if !is_set && inputs.side_at(row) == one_side {
+                cap_one_rows = checked_add_i32(cap_one_rows, 1)?;
+                for val in inputs.labels.row_values(row) {
+                    cap_one_pool_bytes = checked_add_i32(cap_one_pool_bytes, val.len())?;
+                }
+                cap_one_metrics_bytes = checked_add_i32(
+                    cap_one_metrics_bytes,
+                    printed_len(&self.config.schema, inputs.labels.row_values(row), |_| true),
+                )?;
+                cap_group_bytes = checked_add_i32(
+                    cap_group_bytes,
+                    printed_len(&self.config.schema, inputs.labels.row_values(row), |n| {
+                        self.config.in_signature(n)
+                    }),
+                )?;
+            } else {
+                cap_many_rows = checked_add_i32(cap_many_rows, 1)?;
+                for val in inputs.labels.row_values(row) {
+                    cap_many_labels_bytes = checked_add_i32(cap_many_labels_bytes, val.len())?;
+                }
+            }
+        }
+
+        let cap_one_steps = checked_mul_i32(cap_one_rows, steps)?;
+        let cap_one_pool = checked_mul_i32(cap_one_rows, width)?;
+        let cap_many_steps = checked_mul_i32(cap_many_rows, steps)?;
+        let cap_many_labels = checked_mul_i32(cap_many_rows, width)?;
+
+        let mut one_counts_vec: Vec<u8> = Vec::with_capacity(cap_one_steps);
+        let mut one_values_vec: Vec<f64> = Vec::with_capacity(cap_one_steps);
+        let mut one_steps_offsets: Vec<i32> = Vec::with_capacity(num_rows + 1);
+        one_steps_offsets.push(0);
+
+        let mut one_pool_builder = StringBuilder::with_capacity(cap_one_pool, cap_one_pool_bytes);
+        let mut one_pool_offsets: Vec<i32> = Vec::with_capacity(num_rows + 1);
+        one_pool_offsets.push(0);
+        let mut one_pool_pos = 0usize;
+
+        let mut one_metrics_builder =
+            StringBuilder::with_capacity(cap_one_rows, cap_one_metrics_bytes);
+        let mut one_metrics_offsets: Vec<i32> = Vec::with_capacity(num_rows + 1);
+        one_metrics_offsets.push(0);
+        let mut one_metrics_pos = 0usize;
+
+        let mut many_labels_builder =
+            StringBuilder::with_capacity(cap_many_labels, cap_many_labels_bytes);
+        let mut many_labels_offsets: Vec<i32> = Vec::with_capacity(num_rows + 1);
+        many_labels_offsets.push(0);
+        let mut many_labels_pos = 0usize;
+
+        let mut many_counts_vec: Vec<u8> = Vec::with_capacity(cap_many_steps);
+        let mut many_values_vec: Vec<f64> = Vec::with_capacity(cap_many_steps);
+        let mut many_steps_offsets: Vec<i32> = Vec::with_capacity(num_rows + 1);
+        many_steps_offsets.push(0);
+
+        let mut many_sides_vec: Vec<u8> = Vec::with_capacity(cap_many_rows);
+        let mut many_sides_offsets: Vec<i32> = Vec::with_capacity(num_rows + 1);
+        many_sides_offsets.push(0);
+
+        let mut group_builder = StringBuilder::with_capacity(num_rows, cap_group_bytes);
+        let mut scratch = String::new();
+
+        for row in 0..num_rows {
+            let skipped = inputs.list.is_null(row)
+                || opt_filter.is_some_and(|f| f.is_null(row) || !f.value(row));
+            let (lo, hi) = if skipped {
+                (0, 0)
+            } else {
+                inputs.sample_range(row)
+            };
+            if lo < hi {
+                let which = inputs.side_at(row);
+                let ts = &inputs.timestamps[lo..hi];
+                let vs = &inputs.samples[lo..hi];
+                if !is_set && which == one_side {
+                    let base = one_counts_vec.len();
+                    one_counts_vec.resize(base + steps, 0);
+                    one_values_vec.resize(base + steps, f64::NAN);
+                    self.config.grid.runs(ts, |index, from, len| {
+                        for count in &mut one_counts_vec[base + index..base + index + len] {
+                            *count = count.saturating_add(1);
+                        }
+                        one_values_vec[base + index..base + index + len]
+                            .copy_from_slice(&vs[from..from + len]);
+                    })?;
+                    for val in inputs.labels.row_values(row) {
+                        one_pool_builder.append_value(val);
+                    }
+                    one_pool_pos += width;
+                    print_into(
+                        &mut scratch,
+                        &self.config.schema,
+                        inputs.labels.row_values(row),
+                        |_| true,
+                    );
+                    one_metrics_builder.append_value(&scratch);
+                    one_metrics_pos += 1;
+                    print_into(
+                        &mut scratch,
+                        &self.config.schema,
+                        inputs.labels.row_values(row),
+                        |n| self.config.in_signature(n),
+                    );
+                    group_builder.append_value(&scratch);
+                } else {
+                    let base = many_counts_vec.len();
+                    many_counts_vec.resize(base + steps, 0);
+                    many_values_vec.resize(base + steps, f64::NAN);
+                    self.config.grid.runs(ts, |index, from, len| {
+                        for count in &mut many_counts_vec[base + index..base + index + len] {
+                            *count = count.saturating_add(1);
+                        }
+                        many_values_vec[base + index..base + index + len]
+                            .copy_from_slice(&vs[from..from + len]);
+                    })?;
+                    for val in inputs.labels.row_values(row) {
+                        many_labels_builder.append_value(val);
+                    }
+                    many_labels_pos += width;
+                    many_sides_vec.push(which as u8);
+                    group_builder.append_null();
+                }
+            } else {
+                group_builder.append_null();
+            }
+
+            one_steps_offsets.push(one_counts_vec.len() as i32);
+            one_pool_offsets.push(one_pool_pos as i32);
+            one_metrics_offsets.push(one_metrics_pos as i32);
+            many_labels_offsets.push(many_labels_pos as i32);
+            many_steps_offsets.push(many_counts_vec.len() as i32);
+            many_sides_offsets.push(many_sides_vec.len() as i32);
+        }
+
+        let one_steps_buf = OffsetBuffer::new(one_steps_offsets.into());
+        let many_steps_buf = OffsetBuffer::new(many_steps_offsets.into());
+
+        // Single-row partial states hold at most one series on the "one" side,
+        // so `one_rows` is always empty.
+        Ok(vec![
+            state_list(
+                STATE_ONE_COUNTS,
+                DataType::UInt8,
+                one_steps_buf.clone(),
+                Arc::new(UInt8Array::from(one_counts_vec)),
+            ),
+            state_list(
+                STATE_ONE_VALUES,
+                DataType::Float64,
+                one_steps_buf,
+                Arc::new(Float64Array::from(one_values_vec)),
+            ),
+            state_list(
+                STATE_ONE_ROWS,
+                DataType::Int32,
+                OffsetBuffer::new(vec![0i32; num_rows + 1].into()),
+                Arc::new(Int32Array::from(Vec::<i32>::new())),
+            ),
+            state_list(
+                STATE_ONE_POOL,
+                DataType::Utf8,
+                OffsetBuffer::new(one_pool_offsets.into()),
+                Arc::new(one_pool_builder.finish()),
+            ),
+            state_list(
+                STATE_ONE_METRICS,
+                DataType::Utf8,
+                OffsetBuffer::new(one_metrics_offsets.into()),
+                Arc::new(one_metrics_builder.finish()),
+            ),
+            state_list(
+                STATE_MANY_LABELS,
+                DataType::Utf8,
+                OffsetBuffer::new(many_labels_offsets.into()),
+                Arc::new(many_labels_builder.finish()),
+            ),
+            state_list(
+                STATE_MANY_COUNTS,
+                DataType::UInt8,
+                many_steps_buf.clone(),
+                Arc::new(UInt8Array::from(many_counts_vec)),
+            ),
+            state_list(
+                STATE_MANY_VALUES,
+                DataType::Float64,
+                many_steps_buf,
+                Arc::new(Float64Array::from(many_values_vec)),
+            ),
+            state_list(
+                STATE_MANY_SIDES,
+                DataType::UInt8,
+                OffsetBuffer::new(many_sides_offsets.into()),
+                Arc::new(UInt8Array::from(many_sides_vec)),
+            ),
+            Arc::new(group_builder.finish()),
+        ])
     }
 
     fn size(&self) -> usize {
@@ -1987,67 +2199,66 @@ fn emit_groups_lanes(config: &BinaryConfig, groups: &[GroupState]) -> Result<Vec
     let one_steps_buf = OffsetBuffer::new(one_steps_offsets.into());
     let many_steps_buf = OffsetBuffer::new(many_steps_offsets.into());
 
-    let list =
-        |name: &str, dt: DataType, offsets: OffsetBuffer<i32>, values: ArrayRef| -> ArrayRef {
-            Arc::new(ListArray::new(state_item(name, dt), offsets, values, None))
-        };
-
     Ok(vec![
-        list(
+        state_list(
             STATE_ONE_COUNTS,
             DataType::UInt8,
             one_steps_buf.clone(),
             Arc::new(UInt8Array::from(one_counts_vec)),
         ),
-        list(
+        state_list(
             STATE_ONE_VALUES,
             DataType::Float64,
             one_steps_buf,
             Arc::new(Float64Array::from(one_values_vec)),
         ),
-        list(
+        state_list(
             STATE_ONE_ROWS,
             DataType::Int32,
             OffsetBuffer::new(one_rows_offsets.into()),
             Arc::new(Int32Array::from(one_rows_vec)),
         ),
-        list(
+        state_list(
             STATE_ONE_POOL,
             DataType::Utf8,
             OffsetBuffer::new(one_pool_offsets.into()),
             Arc::new(one_pool_builder.finish()),
         ),
-        list(
+        state_list(
             STATE_ONE_METRICS,
             DataType::Utf8,
             OffsetBuffer::new(one_metrics_offsets.into()),
             Arc::new(one_metrics_builder.finish()),
         ),
-        list(
+        state_list(
             STATE_MANY_LABELS,
             DataType::Utf8,
             OffsetBuffer::new(many_labels_offsets.into()),
             Arc::new(many_labels_builder.finish()),
         ),
-        list(
+        state_list(
             STATE_MANY_COUNTS,
             DataType::UInt8,
             many_steps_buf.clone(),
             Arc::new(UInt8Array::from(many_counts_vec)),
         ),
-        list(
+        state_list(
             STATE_MANY_VALUES,
             DataType::Float64,
             many_steps_buf,
             Arc::new(Float64Array::from(many_values_vec)),
         ),
-        list(
+        state_list(
             STATE_MANY_SIDES,
             DataType::UInt8,
             OffsetBuffer::new(many_sides_offsets.into()),
             Arc::new(UInt8Array::from(many_sides_vec)),
         ),
     ])
+}
+
+fn state_list(name: &str, dt: DataType, offsets: OffsetBuffer<i32>, values: ArrayRef) -> ArrayRef {
+    Arc::new(ListArray::new(state_item(name, dt), offsets, values, None))
 }
 
 /// Serialize `groups` into the ten partial-state columns declared by
@@ -2169,6 +2380,13 @@ impl<'a> LabelColumns<'a> {
 
     fn is_null(&self, row: usize) -> bool {
         self.nulls.is_some_and(|n| n.is_null(row))
+    }
+
+    fn row_values(&self, row: usize) -> impl Iterator<Item = &str> {
+        let is_null = self.is_null(row);
+        self.cols
+            .iter()
+            .map(move |col| if is_null { "" } else { col.value(row) })
     }
 
     fn read_into(&self, row: usize, out: &mut Vec<String>) {
@@ -2330,9 +2548,21 @@ fn collect_array_labels(flat: &StringArray, base: usize, width: usize) -> Vec<St
 /// A label set as Prometheus prints one, keeping the names `wanted`
 /// answers for. An empty value is how the canonical shape spells a
 /// label that is not there, so it prints as nothing at all.
-fn print(schema: &[String], labels: &[String], mut wanted: impl FnMut(&str) -> bool) -> String {
-    let mut out = String::from("{");
-    for (name, value) in schema.iter().zip(labels) {
+fn print(schema: &[String], labels: &[String], wanted: impl FnMut(&str) -> bool) -> String {
+    let mut out = String::new();
+    print_into(&mut out, schema, labels.iter().map(String::as_str), wanted);
+    out
+}
+
+fn print_into<'a>(
+    out: &mut String,
+    schema: &[String],
+    values: impl Iterator<Item = &'a str>,
+    mut wanted: impl FnMut(&str) -> bool,
+) {
+    out.clear();
+    out.push('{');
+    for (name, value) in schema.iter().zip(values) {
         if value.is_empty() || !wanted(name) {
             continue;
         }
@@ -2345,7 +2575,26 @@ fn print(schema: &[String], labels: &[String], mut wanted: impl FnMut(&str) -> b
         out.push('"');
     }
     out.push('}');
-    out
+}
+
+fn printed_len<'a>(
+    schema: &[String],
+    values: impl Iterator<Item = &'a str>,
+    mut wanted: impl FnMut(&str) -> bool,
+) -> usize {
+    let mut len = 2;
+    let mut count = 0usize;
+    for (name, value) in schema.iter().zip(values) {
+        if value.is_empty() || !wanted(name) {
+            continue;
+        }
+        if count > 0 {
+            len += 2;
+        }
+        len += name.len() + 3 + value.len();
+        count += 1;
+    }
+    len
 }
 
 const STATE_ONE_COUNTS: &str = "one_counts";
