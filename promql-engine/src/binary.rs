@@ -2528,12 +2528,18 @@ fn rectangle_rows(lo: usize, hi: usize, width: usize, expected: usize) -> Result
         // caller counted.
         return Ok(if expected == NO_ROWS { 1 } else { expected });
     }
-    if !len.is_multiple_of(width) || (expected != NO_ROWS && len / width != expected) {
+    if !len.is_multiple_of(width) {
         return Err(DataFusionError::Internal(format!(
             "{NAME}: {len} label values are not a multiple of the {width} columns"
         )));
     }
-    Ok(len / width)
+    let rows = len / width;
+    if expected != NO_ROWS && rows != expected {
+        return Err(DataFusionError::Internal(format!(
+            "{NAME}: {rows} label rows, expected {expected}"
+        )));
+    }
+    Ok(rows)
 }
 
 fn labels_match_array(held: &[String], flat: &StringArray, base: usize, width: usize) -> bool {
@@ -5864,7 +5870,7 @@ mod tests {
             .merge_batch(&trailing_labels)
             .unwrap_err()
             .to_string()
-            .contains("not a multiple of"));
+            .contains("1 label rows, expected 0"));
 
         // 9. Multiple `one_pool` label sets when `one_rows` is empty.
         let mut multi_pool_no_rows = valid.clone();
@@ -5887,5 +5893,19 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("multiple one-side label sets without per-step rows"));
+
+        // 10. Label rectangle length not a multiple of schema width.
+        let mut ragged_pool = valid.clone();
+        ragged_pool[3] = Arc::new(ListArray::new(
+            state_item(STATE_ONE_POOL, DataType::Utf8),
+            OffsetBuffer::new(vec![0, 3].into()),
+            Arc::new(StringArray::from(vec!["err", "", "a"])),
+            None,
+        ));
+        assert!(plain(Op::Add)
+            .merge_batch(&ragged_pool)
+            .unwrap_err()
+            .to_string()
+            .contains("3 label values are not a multiple of the 4 columns"));
     }
 }
