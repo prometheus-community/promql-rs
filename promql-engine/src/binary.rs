@@ -1162,10 +1162,11 @@ impl GroupState {
                         };
                         let labels = config.result_labels(&base, &one);
                         let cap = match many {
-                            Some(m) if fill_one.is_none() => {
-                                self.many[m].counts.iter().filter(|&&c| c > 0).count()
-                            }
-                            _ => config.grid.len(),
+                            Some(m) => self.many[m].counts.iter().filter(|&&c| c > 0).count(),
+                            None => self
+                                .one
+                                .as_ref()
+                                .map_or(0, |o| o.counts.iter().filter(|&&c| c > 0).count()),
                         };
                         let bucket = *by_labels.entry(labels.clone()).or_insert_with(|| {
                             buckets.push(Bucket {
