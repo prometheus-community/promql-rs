@@ -749,6 +749,14 @@ struct GroupState {
     /// message: upstream prints the pair that collided and there is
     /// nothing to say about a third.
     one_metrics: Vec<String>,
+    /// Heap bytes owned by inner `Vec<String>` buffers in `one_pool` and
+    /// `many`, plus `String::capacity()` across `one_pool`, `many`, and
+    /// `one_metrics`, tracked incrementally so `heap_size` stays O(1).
+    label_bytes: usize,
+}
+
+fn label_vec_heap_bytes(labels: &[String], cap: usize) -> usize {
+    cap * std::mem::size_of::<String>() + labels.iter().map(String::capacity).sum::<usize>()
 }
 
 impl GroupState {
@@ -756,7 +764,9 @@ impl GroupState {
         if let Some(index) = self.one_pool.iter().position(|held| held == labels) {
             return index as i32;
         }
-        self.one_pool.push(labels.to_vec());
+        let owned = labels.to_vec();
+        self.label_bytes += label_vec_heap_bytes(&owned, owned.capacity());
+        self.one_pool.push(owned);
         (self.one_pool.len() - 1) as i32
     }
 
@@ -768,9 +778,11 @@ impl GroupState {
         {
             return index;
         }
+        let owned = labels.to_vec();
+        self.label_bytes += label_vec_heap_bytes(&owned, owned.capacity());
         self.many.push(Many {
             side,
-            labels: labels.to_vec(),
+            labels: owned,
             counts: vec![0; steps],
             values: vec![f64::NAN; steps],
         });
@@ -839,6 +851,7 @@ impl GroupState {
         if self.one_metrics.len() < 2 {
             let metric = print(&config.schema, labels, |_| true);
             if self.one_metrics.first() != Some(&metric) {
+                self.label_bytes += metric.capacity();
                 self.one_metrics.push(metric);
             }
         }
@@ -1236,10 +1249,9 @@ impl GroupState {
         one_bytes
             + self.many.capacity() * std::mem::size_of::<Many>()
             + self.many.len() * many_lane
-            + (self.many.len() + self.one_pool.capacity())
-                * config.schema.len()
-                * std::mem::size_of::<String>()
+            + self.one_pool.capacity() * std::mem::size_of::<Vec<String>>()
             + self.one_metrics.capacity() * std::mem::size_of::<String>()
+            + self.label_bytes
             + self.group.as_ref().map_or(0, String::capacity)
     }
 
@@ -1359,7 +1371,9 @@ impl GroupState {
                 if self.one_metrics.len() < 2
                     && self.one_metrics.first().map(String::as_str) != Some(val)
                 {
-                    self.one_metrics.push(val.to_string());
+                    let owned = val.to_string();
+                    self.label_bytes += owned.capacity();
+                    self.one_metrics.push(owned);
                 }
             }
         }
