@@ -5181,4 +5181,130 @@ mod tests {
             .to_string();
         assert!(err.contains("zero-width schema"), "{err}");
     }
+
+    #[test]
+    fn set_operators_cover_shared_or_buckets_sorting_disjoint_eviction_and_grouped_merges() {
+        // `Op::Or` with identical LHS and RHS labels merges both sides into one bucket.
+        let same = lset("up", "", "a", "");
+        let mut or_same = plain(Op::Or);
+        or_same.absorb(LHS, &same, &[0], &[1.0]).unwrap();
+        or_same
+            .absorb(RHS, &same, &[0, 10_000], &[9.0, 7.0])
+            .unwrap();
+        assert_eq!(
+            pairs_of(or_same.evaluate().unwrap()),
+            [(same.clone(), vec![(0, 1.0), (10_000, 7.0)])]
+        );
+
+        // Empty group for `Op::Or` short-circuits to empty.
+        let mut or_empty = plain(Op::Or);
+        assert!(pairs_of(or_empty.evaluate().unwrap()).is_empty());
+
+        // `copy_side_buckets` sorts out-of-order multi-step series and skips empty steps.
+        let sb = lset("m", "/b", "a", "");
+        let sa = lset("m", "/a", "a", "");
+        let mut unless_only_lhs = pairing(Op::Unless, false, on(&["pod"]));
+        unless_only_lhs
+            .absorb(LHS, &sb, &[0, 20_000], &[2.0, 4.0])
+            .unwrap();
+        unless_only_lhs.absorb(LHS, &sa, &[10_000], &[1.0]).unwrap();
+        assert_eq!(
+            pairs_of(unless_only_lhs.evaluate().unwrap()),
+            [
+                (sa.clone(), vec![(10_000, 1.0)]),
+                (sb.clone(), vec![(0, 2.0), (20_000, 4.0)]),
+            ]
+        );
+
+        let mut or_only_rhs = pairing(Op::Or, false, on(&["pod"]));
+        or_only_rhs
+            .absorb(RHS, &sb, &[0, 20_000], &[2.0, 4.0])
+            .unwrap();
+        or_only_rhs.absorb(RHS, &sa, &[10_000], &[1.0]).unwrap();
+        assert_eq!(
+            pairs_of(or_only_rhs.evaluate().unwrap()),
+            [
+                (sa, vec![(10_000, 1.0)]),
+                (sb, vec![(0, 2.0), (20_000, 4.0)]),
+            ]
+        );
+
+        // `Op::And` with both sides present at disjoint steps evicts preallocated buckets.
+        let mut and_disjoint = plain(Op::And);
+        and_disjoint
+            .absorb(LHS, &lset("l", "", "a", ""), &[0], &[1.0])
+            .unwrap();
+        and_disjoint
+            .absorb(RHS, &lset("r", "", "a", ""), &[10_000], &[2.0])
+            .unwrap();
+        assert!(pairs_of(and_disjoint.evaluate().unwrap()).is_empty());
+
+        // Grouped set-op round-trip through both `state` + `merge_batch` and `convert_to_state`.
+        let schema = names(&SCHEMA);
+        let p1 = encode_binary_batch(
+            &schema,
+            &[
+                (
+                    &[(METRIC_NAME, "up"), ("pod", "g0")],
+                    &[0, 10_000],
+                    &[1.0, 2.0],
+                    false,
+                ),
+                (&[(METRIC_NAME, "up"), ("pod", "g1")], &[0], &[5.0], false),
+            ],
+        );
+        let p2 = encode_binary_batch(
+            &schema,
+            &[(
+                &[(METRIC_NAME, "up"), ("pod", "g0")],
+                &[0, 20_000],
+                &[9.0, 7.0],
+                true,
+            )],
+        );
+        for (op, want0, want1) in [
+            (
+                Op::And,
+                vec![(lset("up", "", "g0", ""), vec![(0, 1.0)])],
+                vec![],
+            ),
+            (
+                Op::Unless,
+                vec![(lset("up", "", "g0", ""), vec![(10_000, 2.0)])],
+                vec![(lset("up", "", "g1", ""), vec![(0, 5.0)])],
+            ),
+            (
+                Op::Or,
+                vec![(
+                    lset("up", "", "g0", ""),
+                    vec![(0, 1.0), (10_000, 2.0), (20_000, 7.0)],
+                )],
+                vec![(lset("up", "", "g1", ""), vec![(0, 5.0)])],
+            ),
+        ] {
+            let mut a = GroupedBinary::from_pairing(plain(op));
+            a.update_batch(&p1, &[0, 1], None, 2).unwrap();
+            let sa = a.state(EmitTo::All).unwrap();
+            let mut b = GroupedBinary::from_pairing(plain(op));
+            b.update_batch(&p2, &[0], None, 1).unwrap();
+            let sb = b.state(EmitTo::All).unwrap();
+
+            let mut merged = GroupedBinary::from_pairing(plain(op));
+            merged.merge_batch(&sa, &[0, 1], 2).unwrap();
+            merged.merge_batch(&sb, &[0], 2).unwrap();
+            let out = merged.evaluate(EmitTo::All).unwrap();
+            assert_eq!(pairs_at(&out, 0), want0, "{op:?}");
+            assert_eq!(pairs_at(&out, 1), want1, "{op:?}");
+
+            let conv = GroupedBinary::from_pairing(plain(op));
+            let ca = conv.convert_to_state(&p1, None).unwrap();
+            let cb = conv.convert_to_state(&p2, None).unwrap();
+            let mut by = GroupedBinary::from_pairing(plain(op));
+            by.merge_batch(&ca, &[0, 1], 2).unwrap();
+            by.merge_batch(&cb, &[0], 2).unwrap();
+            let by_out = by.evaluate(EmitTo::All).unwrap();
+            assert_eq!(pairs_at(&by_out, 0), want0, "{op:?} bypass");
+            assert_eq!(pairs_at(&by_out, 1), want1, "{op:?} bypass");
+        }
+    }
 }
