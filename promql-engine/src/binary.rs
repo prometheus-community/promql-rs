@@ -5101,4 +5101,84 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn zero_width_label_schema_round_trips_through_state_bypass_and_evaluate() {
+        let empty_schema: Vec<String> = Vec::new();
+        let make_acc = || {
+            GroupedBinary::new(BinaryConfig {
+                op: Op::Add,
+                return_bool: false,
+                matching: Matching::default(),
+                grid: grid(),
+                schema: empty_schema.clone(),
+            })
+        };
+        let lhs0 = encode_binary_batch(&empty_schema, &[(&[], &[0, 10_000], &[2.0, 3.0], false)]);
+        let lhs1 = encode_binary_batch(&empty_schema, &[(&[], &[0], &[9.0], false)]);
+        let lhs_batch: [ArrayRef; 3] = [
+            datafusion::arrow::compute::concat(&[lhs0[0].as_ref(), lhs1[0].as_ref()]).unwrap(),
+            Arc::new(BooleanArray::from(vec![false, false])),
+            Arc::new(StructArray::new_empty_fields(2, None)),
+        ];
+        let rhs_batch =
+            encode_binary_batch(&empty_schema, &[(&[], &[0, 10_000], &[5.0, 7.0], true)]);
+
+        let pairs_empty_schema = |array: &ArrayRef, row: usize| -> Vec<Out> {
+            let list = array.as_list::<i32>();
+            let single = ListArray::new(
+                pair_item(&empty_schema),
+                OffsetBuffer::new(vec![0, list.value(row).len() as i32].into()),
+                list.value(row),
+                None,
+            );
+            pairs_of(ScalarValue::List(Arc::new(single)))
+        };
+
+        // Partial `state` -> `merge_batch` -> `evaluate`.
+        let mut p_lhs = make_acc();
+        p_lhs.update_batch(&lhs_batch, &[0, 1], None, 2).unwrap();
+        let s_lhs = p_lhs.state(EmitTo::All).unwrap();
+        let mut p_rhs = make_acc();
+        p_rhs.update_batch(&rhs_batch, &[0], None, 1).unwrap();
+        let s_rhs = p_rhs.state(EmitTo::All).unwrap();
+
+        let mut merged = make_acc();
+        merged.merge_batch(&s_lhs, &[0, 1], 2).unwrap();
+        merged.merge_batch(&s_rhs, &[0], 2).unwrap();
+        let out = merged.evaluate(EmitTo::All).unwrap();
+        assert_eq!(
+            pairs_empty_schema(&out, 0),
+            [(Vec::new(), vec![(0, 7.0), (10_000, 10.0)])]
+        );
+        assert!(pairs_empty_schema(&out, 1).is_empty());
+
+        // High-cardinality bypass `convert_to_state` -> `merge_batch` -> `evaluate`.
+        let converter = make_acc();
+        let b_lhs = converter.convert_to_state(&lhs_batch, None).unwrap();
+        let b_rhs = converter.convert_to_state(&rhs_batch, None).unwrap();
+        let mut from_bypass = make_acc();
+        from_bypass.merge_batch(&b_lhs, &[0, 1], 2).unwrap();
+        from_bypass.merge_batch(&b_rhs, &[0], 2).unwrap();
+        let bypass_out = from_bypass.evaluate(EmitTo::All).unwrap();
+        assert_eq!(
+            pairs_empty_schema(&bypass_out, 0),
+            [(Vec::new(), vec![(0, 7.0), (10_000, 10.0)])]
+        );
+        assert!(pairs_empty_schema(&bypass_out, 1).is_empty());
+
+        // Non-empty label values in a zero-width schema state must be rejected.
+        let mut corrupt_rhs = s_rhs.clone();
+        corrupt_rhs[3] = Arc::new(ListArray::new(
+            state_item(STATE_ONE_POOL, DataType::Utf8),
+            OffsetBuffer::new(vec![0, 1].into()),
+            Arc::new(StringArray::from(vec!["unexpected"])),
+            None,
+        ));
+        let err = make_acc()
+            .merge_batch(&corrupt_rhs, &[0], 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("zero-width schema"), "{err}");
+    }
 }
