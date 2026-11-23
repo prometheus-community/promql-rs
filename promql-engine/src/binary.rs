@@ -4456,6 +4456,9 @@ mod tests {
     }
 
     type BatchRow<'a> = (&'a [(&'a str, &'a str)], &'a [i64], &'a [f64], bool);
+    type SeriesBits = (Vec<String>, Vec<(i64, u64)>);
+    type GroupSeriesBits = (String, Vec<SeriesBits>);
+    type OwnedSeriesSpec = (Vec<(&'static str, String)>, Vec<i64>, Vec<f64>);
 
     fn encode_binary_batch(schema: &[String], rows: &[BatchRow<'_>]) -> [ArrayRef; 3] {
         use crate::Series;
@@ -4653,5 +4656,406 @@ mod tests {
                 (lset("", "", "a", "us"), vec![(10_000, 22.0)]),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn many_partitions_binary_aggregate_matches_single_partition() {
+        use datafusion::arrow::array::RecordBatch;
+        use datafusion::arrow::datatypes::Schema;
+        use datafusion::datasource::MemTable;
+        use datafusion::physical_plan::displayable;
+        use datafusion::prelude::{SessionConfig, SessionContext};
+
+        let label_names = names(&SCHEMA);
+        let part_specs: &[&[(&str, BatchRow<'_>)]] = &[
+            &[
+                (
+                    "p0",
+                    (
+                        &[(METRIC_NAME, "req"), ("path", "/a"), ("pod", "p0")],
+                        &[0, 10_000],
+                        &[10.0, 2.0],
+                        false,
+                    ),
+                ),
+                (
+                    "p1",
+                    (
+                        &[(METRIC_NAME, "req"), ("pod", "p1")],
+                        &[0, 20_000],
+                        &[5.0, 8.0],
+                        false,
+                    ),
+                ),
+            ],
+            &[
+                (
+                    "p0",
+                    (
+                        &[(METRIC_NAME, "err"), ("pod", "p0"), ("zone", "eu")],
+                        &[0, 10_000],
+                        &[4.0, 6.0],
+                        true,
+                    ),
+                ),
+                (
+                    "p2",
+                    (
+                        &[(METRIC_NAME, "err"), ("pod", "p2"), ("zone", "us")],
+                        &[10_000],
+                        &[9.0],
+                        true,
+                    ),
+                ),
+            ],
+            &[
+                (
+                    "p1",
+                    (
+                        &[(METRIC_NAME, "err"), ("pod", "p1"), ("zone", "ap")],
+                        &[0, 10_000],
+                        &[3.0, 7.0],
+                        true,
+                    ),
+                ),
+                (
+                    "p3",
+                    (
+                        &[(METRIC_NAME, "req"), ("pod", "p3")],
+                        &[0, 10_000],
+                        &[1.0, 2.0],
+                        false,
+                    ),
+                ),
+            ],
+            &[(
+                "p3",
+                (
+                    &[(METRIC_NAME, "err"), ("pod", "p3"), ("zone", "eu")],
+                    &[10_000, 20_000],
+                    &[2.0, 4.0],
+                    true,
+                ),
+            )],
+        ];
+
+        let table_schema = Arc::new(Schema::new(vec![
+            Field::new("pod", DataType::Utf8, false),
+            Field::new(series::SAMPLES, series::samples_type(), false),
+            Field::new(SIDE, DataType::Boolean, false),
+            Field::new(series::LABELS, series::labels_type(&label_names), false),
+        ]));
+        let batches: Vec<RecordBatch> = part_specs
+            .iter()
+            .map(|spec| {
+                let pods = StringArray::from(spec.iter().map(|(p, _)| *p).collect::<Vec<_>>());
+                let rows: Vec<BatchRow<'_>> = spec.iter().map(|(_, r)| *r).collect();
+                let [samples, side, labels] = encode_binary_batch(&label_names, &rows);
+                RecordBatch::try_new(
+                    Arc::clone(&table_schema),
+                    vec![Arc::new(pods), samples, side, labels],
+                )
+                .unwrap()
+            })
+            .collect();
+
+        let run = |op_lit: &str, match_lit: &str, partitions: usize| {
+            let schema = Arc::clone(&table_schema);
+            let batches = batches.clone();
+            let op_lit = op_lit.to_string();
+            let match_lit = match_lit.to_string();
+            async move {
+                let ctx = SessionContext::new_with_config(
+                    SessionConfig::new().with_target_partitions(partitions),
+                );
+                ctx.register_udaf(udaf());
+                let part_data: Vec<Vec<RecordBatch>> = if partitions == 1 {
+                    vec![batches]
+                } else {
+                    batches.into_iter().map(|b| vec![b]).collect()
+                };
+                ctx.register_table("t", Arc::new(MemTable::try_new(schema, part_data).unwrap()))
+                    .unwrap();
+                let frame = ctx
+                    .sql(&format!(
+                        "SELECT pod, {NAME}(samples, {SIDE}, labels, '{op_lit}', '{match_lit}', 0, 30000, 10000) AS out FROM t GROUP BY pod"
+                    ))
+                    .await
+                    .unwrap();
+                let plan = format!(
+                    "{}",
+                    displayable(frame.clone().create_physical_plan().await.unwrap().as_ref())
+                        .indent(false)
+                );
+                if partitions > 1 {
+                    assert!(plan.contains("mode=Partial"), "{plan}");
+                }
+                let mut got: Vec<GroupSeriesBits> = Vec::new();
+                for batch in frame.collect().await.unwrap() {
+                    let pods = batch.column(0).as_string::<i32>();
+                    let out = batch.column(1);
+                    for row in 0..batch.num_rows() {
+                        let series = pairs_at(out, row)
+                            .into_iter()
+                            .map(|(lbls, samples)| {
+                                (
+                                    lbls,
+                                    samples.into_iter().map(|(t, v)| (t, bits(v))).collect(),
+                                )
+                            })
+                            .collect();
+                        got.push((pods.value(row).to_string(), series));
+                    }
+                }
+                got.sort();
+                got
+            }
+        };
+
+        for (op_lit, match_lit) in [
+            ("+", ""),
+            (">", ""),
+            ("> bool", ""),
+            ("+", "on(pod) group_left(zone)"),
+            ("-", "on(pod) group_right(zone)"),
+            ("+", "on(pod) fill_left(0.0) fill_right(0.0)"),
+            ("and", "on(pod)"),
+            ("or", "on(pod)"),
+            ("unless", "on(pod)"),
+        ] {
+            let single = run(op_lit, match_lit, 1).await;
+            let multi = run(op_lit, match_lit, 4).await;
+            assert_eq!(single, multi, "{op_lit} {match_lit}");
+        }
+    }
+
+    #[tokio::test]
+    async fn native_adaptive_bypass_matches_non_bypass_for_binary_operators() {
+        use datafusion::arrow::array::RecordBatch;
+        use datafusion::arrow::datatypes::Schema;
+        use datafusion::datasource::{memory::MemorySourceConfig, source::DataSourceExec};
+        use datafusion::logical_expr::registry::FunctionRegistry;
+        use datafusion::physical_expr::{
+            aggregate::AggregateExprBuilder,
+            expressions::{col, lit as phys_lit},
+        };
+        use datafusion::physical_plan::{
+            aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy},
+            collect, ExecutionPlan,
+        };
+        use datafusion::prelude::{SessionConfig, SessionContext};
+
+        let label_names = names(&SCHEMA);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pod", DataType::Utf8, false),
+            Field::new(series::SAMPLES, series::samples_type(), true),
+            Field::new(SIDE, DataType::Boolean, false),
+            Field::new(series::LABELS, series::labels_type(&label_names), false),
+            Field::new("keep", DataType::Boolean, true),
+        ]));
+
+        // Two batches of 64 distinct keys each: LHS in batch 0, RHS in batch 1,
+        // mirroring a high-cardinality `Union -> Aggregate` plan where the
+        // partial probe trips adaptive bypass before the second side arrives.
+        let make_side_batch = |is_rhs: bool| -> RecordBatch {
+            let pods_owned: Vec<String> = (0..64).map(|g| format!("p{g:02}")).collect();
+            let zones = ["eu", "us"];
+            let mut rows_spec: Vec<OwnedSeriesSpec> = Vec::with_capacity(64);
+            for (g, pod) in pods_owned.iter().enumerate() {
+                let ts = if g % 13 == 0 {
+                    Vec::new()
+                } else if is_rhs {
+                    vec![0, 10_000]
+                } else {
+                    vec![0, 10_000, 20_000]
+                };
+                let vs: Vec<f64> = ts
+                    .iter()
+                    .enumerate()
+                    .map(|(k, _)| {
+                        if is_rhs {
+                            (g % 7 + k + 1) as f64
+                        } else {
+                            (g % 11 + k * 2) as f64
+                        }
+                    })
+                    .collect();
+                let mut lbls = vec![
+                    (METRIC_NAME, if is_rhs { "err" } else { "req" }.to_string()),
+                    ("pod", pod.clone()),
+                ];
+                if is_rhs {
+                    lbls.push(("zone", zones[g % 2].to_string()));
+                }
+                rows_spec.push((lbls, ts, vs));
+            }
+            let series_vec: Vec<crate::Series> = rows_spec
+                .iter()
+                .map(|(lbls, ts, vs)| {
+                    let borrowed: Vec<(&str, &str)> =
+                        lbls.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                    crate::Series::new(&borrowed, ts.clone(), vs.clone()).unwrap()
+                })
+                .collect();
+            let encoded = series::encode(
+                &label_names,
+                &series_vec,
+                series::Block {
+                    start_ms: 0,
+                    end_ms: 30_001,
+                },
+            )
+            .unwrap();
+            let raw_samples = encoded
+                .column_by_name(series::SAMPLES)
+                .unwrap()
+                .as_list::<i32>();
+            let samples: ArrayRef = Arc::new(ListArray::new(
+                series::sample_item(),
+                raw_samples.offsets().clone(),
+                raw_samples.values().clone(),
+                Some(NullBuffer::from(
+                    (0..64).map(|g| g % 11 != 0).collect::<Vec<_>>(),
+                )),
+            ));
+            let keep = BooleanArray::from(
+                (0..64)
+                    .map(|g| match g % 7 {
+                        0 => None,
+                        1 => Some(false),
+                        _ => Some(true),
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(pods_owned)),
+                    samples,
+                    Arc::new(BooleanArray::from(vec![is_rhs; 64])),
+                    Arc::clone(encoded.column_by_name(series::LABELS).unwrap()),
+                    Arc::new(keep),
+                ],
+            )
+            .unwrap()
+        };
+        let batches = vec![make_side_batch(false), make_side_batch(true)];
+
+        let run = |op_lit: &str, match_lit: &str, migration: bool, bypass: bool, filtered: bool| {
+            let schema = Arc::clone(&schema);
+            let batches = batches.clone();
+            let op_lit = op_lit.to_string();
+            let match_lit = match_lit.to_string();
+            async move {
+                let mut config = SessionConfig::new()
+                    .with_target_partitions(1)
+                    .with_batch_size(64);
+                let execution = &mut config.options_mut().execution;
+                execution.enable_migration_aggregate = migration;
+                execution.skip_partial_aggregation_probe_rows_threshold = 1;
+                execution.skip_partial_aggregation_probe_ratio_threshold =
+                    if bypass { 0.01 } else { 1.0 };
+                let ctx = SessionContext::new_with_config(config);
+                ctx.register_udaf(udaf());
+
+                let source =
+                    MemorySourceConfig::try_new(&[batches], Arc::clone(&schema), None).unwrap();
+                let input: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(source)));
+                let group = PhysicalGroupBy::new_single(vec![(
+                    col("pod", &schema).unwrap(),
+                    "pod".to_string(),
+                )]);
+                let expr = AggregateExprBuilder::new(
+                    ctx.udaf(NAME).unwrap(),
+                    vec![
+                        col(series::SAMPLES, &schema).unwrap(),
+                        col(SIDE, &schema).unwrap(),
+                        col(series::LABELS, &schema).unwrap(),
+                        phys_lit(op_lit.as_str()),
+                        phys_lit(match_lit.as_str()),
+                        phys_lit(0i64),
+                        phys_lit(30_000i64),
+                        phys_lit(10_000i64),
+                    ],
+                )
+                .schema(Arc::clone(&schema))
+                .alias("out")
+                .build()
+                .unwrap();
+                let partial = Arc::new(
+                    AggregateExec::try_new(
+                        AggregateMode::Partial,
+                        group.clone(),
+                        vec![Arc::new(expr)],
+                        vec![filtered.then(|| col("keep", &schema).unwrap())],
+                        input,
+                        Arc::clone(&schema),
+                    )
+                    .unwrap(),
+                );
+                let final_agg = Arc::new(
+                    AggregateExec::try_new(
+                        AggregateMode::Final,
+                        group,
+                        partial.aggr_expr().to_vec(),
+                        partial.filter_expr().to_vec(),
+                        Arc::clone(&partial) as Arc<dyn ExecutionPlan>,
+                        partial.input_schema(),
+                    )
+                    .unwrap(),
+                );
+                let output = collect(final_agg, ctx.task_ctx()).await.unwrap();
+                let skipped = partial
+                    .metrics()
+                    .unwrap()
+                    .sum_by_name("skipped_aggregation_rows")
+                    .map_or(0, |m| m.as_usize());
+                assert_eq!(
+                    skipped > 0,
+                    bypass,
+                    "{op_lit} {match_lit}, migration={migration}, filtered={filtered}, skipped={skipped}"
+                );
+                let mut got: Vec<GroupSeriesBits> = Vec::new();
+                for batch in output {
+                    let pods = batch.column(0).as_string::<i32>();
+                    let out = batch.column(1);
+                    for row in 0..batch.num_rows() {
+                        let series = pairs_at(out, row)
+                            .into_iter()
+                            .map(|(lbls, samples)| {
+                                (
+                                    lbls,
+                                    samples.into_iter().map(|(t, v)| (t, bits(v))).collect(),
+                                )
+                            })
+                            .collect();
+                        got.push((pods.value(row).to_string(), series));
+                    }
+                }
+                got.sort();
+                got
+            }
+        };
+
+        for migration in [false, true] {
+            for filtered in [false, true] {
+                for (op_lit, match_lit) in [
+                    ("+", ""),
+                    (">", ""),
+                    ("+", "on(pod) group_left(zone)"),
+                    ("-", "on(pod) group_right(zone)"),
+                    ("and", "on(pod)"),
+                    ("or", "on(pod)"),
+                    ("unless", "on(pod)"),
+                ] {
+                    let expected = run(op_lit, match_lit, migration, false, filtered).await;
+                    let got = run(op_lit, match_lit, migration, true, filtered).await;
+                    assert_eq!(
+                        got, expected,
+                        "{op_lit} {match_lit}, migration={migration}, filtered={filtered}"
+                    );
+                }
+            }
+        }
     }
 }
