@@ -5307,4 +5307,200 @@ mod tests {
             assert_eq!(pairs_at(&by_out, 1), want1, "{op:?} bypass");
         }
     }
+
+    #[test]
+    fn by_pair_cache_hits_single_sided_group_right_fills_and_fast_path_edges() {
+        // Multi-step `by_pair` cache hits for `(Some(0), 1)`, `(Some(0), -1)`,
+        // `(None, 0)`, and `(None, 1)`.
+        let matching = Matching {
+            card: Card::ManyToOne,
+            on: true,
+            labels: names(&["pod"]),
+            include: names(&["zone"]),
+            fill_lhs: Some(100.0),
+            fill_rhs: Some(50.0),
+        };
+        let mut p = pairing(Op::Add, false, matching);
+        let lhs = lset("req", "/a", "p", "");
+        let rhs0 = lset("err0", "", "p", "eu");
+        let rhs1 = lset("err1", "", "p", "us");
+        // Steps 0 & 10s: `one_row = 1` (us) with `many = Some(0)` -> hits `(Some(0), 1)`.
+        // Steps 20s & 30s: `one` absent with `fill_rhs` -> hits `(Some(0), -1)`.
+        p.absorb(
+            LHS,
+            &lhs,
+            &[0, 10_000, 20_000, 30_000],
+            &[1.0, 2.0, 3.0, 4.0],
+        )
+        .unwrap();
+        p.absorb(RHS, &rhs0, &[0], &[10.0]).unwrap();
+        p.absorb(RHS, &rhs1, &[10_000], &[20.0]).unwrap();
+        // Second series uses a clean group for `(Some(0), 1)` multi-step + `(None, 0/1)`.
+        let mut p2 = pairing(
+            Op::Add,
+            false,
+            Matching {
+                card: Card::ManyToOne,
+                on: true,
+                labels: names(&["pod"]),
+                include: names(&["zone"]),
+                fill_lhs: Some(100.0),
+                fill_rhs: Some(50.0),
+            },
+        );
+        p2.absorb(LHS, &lhs, &[0, 10_000, 20_000], &[1.0, 2.0, 3.0])
+            .unwrap();
+        p2.absorb(RHS, &rhs0, &[0], &[10.0]).unwrap();
+        p2.absorb(RHS, &rhs1, &[10_000, 20_000], &[20.0, 30.0])
+            .unwrap();
+        assert_eq!(
+            pairs_of(p2.evaluate().unwrap()),
+            [
+                (lset("", "/a", "p", "eu"), vec![(0, 11.0)]),
+                (
+                    lset("", "/a", "p", "us"),
+                    vec![(10_000, 22.0), (20_000, 33.0)]
+                ),
+            ]
+        );
+        // Verify `(Some(0), -1)` multi-step cache hit on `p`.
+        assert_eq!(
+            pairs_of(p.evaluate().unwrap()),
+            [
+                (
+                    lset("", "/a", "p", ""),
+                    vec![(20_000, 53.0), (30_000, 54.0)]
+                ),
+                (lset("", "/a", "p", "eu"), vec![(0, 11.0)]),
+                (lset("", "/a", "p", "us"), vec![(10_000, 22.0)]),
+            ]
+        );
+        // Verify `(None, 0)` and `(None, 1)` multi-step cache hits with `fill_lhs`.
+        let mut p_fill_many = pairing(
+            Op::Add,
+            false,
+            Matching {
+                card: Card::ManyToOne,
+                on: true,
+                labels: names(&["pod"]),
+                include: names(&["zone"]),
+                fill_lhs: Some(100.0),
+                fill_rhs: None,
+            },
+        );
+        p_fill_many
+            .absorb(RHS, &rhs0, &[0, 10_000], &[1.0, 2.0])
+            .unwrap();
+        p_fill_many
+            .absorb(RHS, &rhs1, &[20_000, 30_000], &[3.0, 4.0])
+            .unwrap();
+        assert_eq!(
+            pairs_of(p_fill_many.evaluate().unwrap()),
+            [
+                (lset("", "", "p", "eu"), vec![(0, 101.0), (10_000, 102.0)]),
+                (
+                    lset("", "", "p", "us"),
+                    vec![(20_000, 103.0), (30_000, 104.0)]
+                ),
+            ]
+        );
+
+        // RHS-only (`many.is_empty()`) with only `fill_rhs`: 1 series -> empty,
+        // 2 colliding series -> `DUPLICATE_SERIES`.
+        let fill_rhs_only = Matching {
+            on: true,
+            labels: names(&["pod"]),
+            fill_rhs: Some(0.0),
+            ..Matching::default()
+        };
+        let mut rhs_single = pairing(Op::Add, false, fill_rhs_only.clone());
+        rhs_single.absorb(RHS, &rhs0, &[0], &[1.0]).unwrap();
+        assert!(pairs_of(rhs_single.evaluate().unwrap()).is_empty());
+        let mut rhs_dup = pairing(Op::Add, false, fill_rhs_only);
+        rhs_dup.absorb(RHS, &rhs0, &[0], &[1.0]).unwrap();
+        rhs_dup.absorb(RHS, &rhs1, &[0], &[2.0]).unwrap();
+        assert!(rhs_dup
+            .evaluate()
+            .unwrap_err()
+            .to_string()
+            .contains(DUPLICATE_SERIES));
+
+        // Single-sided fills under `group_right` (`one_side == LHS`).
+        let mut gr_rhs_only = pairing(
+            Op::Sub,
+            false,
+            Matching {
+                card: Card::OneToMany,
+                on: true,
+                labels: names(&["pod"]),
+                include: names(&["zone"]),
+                fill_rhs: Some(10.0),
+                fill_lhs: None,
+            },
+        );
+        gr_rhs_only
+            .absorb(RHS, &lset("err", "/x", "p", ""), &[0], &[3.0])
+            .unwrap();
+        assert_eq!(
+            pairs_of(gr_rhs_only.evaluate().unwrap()),
+            [(lset("", "/x", "p", ""), vec![(0, 7.0)])]
+        );
+        let mut gr_lhs_only = pairing(
+            Op::Sub,
+            false,
+            Matching {
+                card: Card::OneToMany,
+                on: true,
+                labels: names(&["pod"]),
+                include: names(&["zone"]),
+                fill_lhs: Some(4.0),
+                fill_rhs: None,
+            },
+        );
+        gr_lhs_only
+            .absorb(LHS, &lset("tot", "", "p", "eu"), &[0], &[10.0])
+            .unwrap();
+        assert_eq!(
+            pairs_of(gr_lhs_only.evaluate().unwrap()),
+            [(lset("", "", "p", "eu"), vec![(0, 6.0)])]
+        );
+
+        // Fast path: duplicate on `one` at an unmatched step does not fail a matched step.
+        let mut unmatched_dup = plain(Op::Add);
+        unmatched_dup.absorb(LHS, &lhs, &[10_000], &[1.0]).unwrap();
+        unmatched_dup
+            .absorb(RHS, &rhs0, &[0, 10_000], &[2.0, 3.0])
+            .unwrap();
+        unmatched_dup.absorb(RHS, &rhs0, &[0], &[4.0]).unwrap();
+        assert!(unmatched_dup.group().one.as_ref().unwrap().rows.is_none());
+        assert_eq!(
+            samples_of(unmatched_dup.evaluate().unwrap()),
+            [(10_000, 4.0)]
+        );
+
+        // Fast path: `group_right` + filtering comparison keeps LHS (`one`) value
+        // while keeping RHS (`many`) labels + included labels.
+        let mut gr_filter = pairing(
+            Op::Gtr,
+            false,
+            Matching {
+                card: Card::OneToMany,
+                on: true,
+                labels: names(&["pod"]),
+                include: names(&["zone"]),
+                ..Matching::default()
+            },
+        );
+        gr_filter
+            .absorb(LHS, &lset("tot", "", "p", "eu"), &[0, 10_000], &[9.0, 2.0])
+            .unwrap();
+        gr_filter
+            .absorb(RHS, &lset("err", "/x", "p", ""), &[0, 10_000], &[5.0, 5.0])
+            .unwrap();
+        assert!(gr_filter.group().one.as_ref().unwrap().rows.is_none());
+        assert_eq!(
+            pairs_of(gr_filter.evaluate().unwrap()),
+            [(lset("err", "/x", "p", "eu"), vec![(0, 9.0)])]
+        );
+    }
 }
