@@ -194,17 +194,12 @@ impl Op {
     /// already there. `bool` replaces the value with a 1 or a 0, which
     /// is no longer that metric either, and drops it too.
     pub fn drops_metric_name(&self, return_bool: bool) -> bool {
-        match self {
-            // A set operator hands a sample back untouched, so there is
-            // nothing for `changesMetricSchema` to be true of.
-            op if op.is_set() => false,
-            op if op.is_comparison() => return_bool,
-            _ => true,
-        }
+        self.changes_metric_schema() || (self.is_comparison() && return_bool)
     }
 
     /// Upstream's `changesMetricSchema`: the arithmetic operators, whose
     /// `VectorBinop` result loses its metadata labels at once, not later.
+    /// A set operator hands a sample back untouched.
     pub fn changes_metric_schema(&self) -> bool {
         !self.is_set() && !self.is_comparison()
     }

@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{AsArray, BooleanArray, StringViewArray, StructArray};
+use datafusion::arrow::array::{ArrayRef, AsArray, BooleanArray, StringViewArray, StructArray};
 use datafusion::arrow::compute::kernels::cmp::eq;
 use datafusion::arrow::compute::kernels::zip::zip;
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Fields};
@@ -27,7 +27,7 @@ use crate::series::{self, LABELS, SAMPLES};
 pub const DROP_NAME: &str = "__promql_drop_name__";
 
 /// The value [`DROP_NAME`] holds on a row whose name is to be dropped.
-pub const DROP: &str = "1";
+const DROP: &str = "1";
 
 /// The labels upstream's `schema.IsMetadataLabel` is true of, which
 /// `DropReserved` removes together.
@@ -73,6 +73,14 @@ impl Reads {
         Reads([false, !listed.0[1], !listed.0[2]])
     }
 
+    /// What a `by`/`on` (`only`) or a `without`/`ignoring` list keeps.
+    pub fn kept_by(names: &[String], only: bool) -> Reads {
+        match only {
+            true => Reads::named(names),
+            false => Reads::all_but_name_and(names),
+        }
+    }
+
     pub fn or(self, other: Reads) -> Reads {
         Reads([0, 1, 2].map(|i| self.0[i] || other.0[i]))
     }
@@ -96,6 +104,21 @@ pub fn mark(input: &[String], reads: Option<Reads>) -> (Expr, Vec<String>, bool)
     }
     let (expr, names) = labels::keep(input, |n| n != DROP_NAME);
     let marked = has_metadata(&names);
+    (expr, names, marked)
+}
+
+/// [`mark`] where the operator drops the name, else the input's labels
+/// and flag carried through.
+pub fn mark_if(
+    drops: bool,
+    input: &[String],
+    marked: bool,
+    reads: Option<Reads>,
+) -> (Expr, Vec<String>, bool) {
+    if drops {
+        return mark(input, reads);
+    }
+    let (expr, names) = labels::keep(input, |_| true);
     (expr, names, marked)
 }
 
@@ -125,7 +148,7 @@ pub fn cleanup(all: bool) -> Expr {
     ScalarUDF::new_from_impl(Cleanup::default()).call(vec![col(LABELS), lit(all)])
 }
 
-pub const NAME: &str = "promql_drop_name";
+const NAME: &str = "promql_drop_name";
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct Cleanup {
@@ -176,18 +199,30 @@ impl ScalarUDFImpl for Cleanup {
             &args.args[1],
             ColumnarValue::Scalar(ScalarValue::Boolean(Some(true)))
         );
-        let kept = match (all, labels.column_by_name(DROP_NAME)) {
-            (true, _) => BooleanArray::from(vec![false; args.number_rows]),
-            (false, Some(mark)) => eq(mark, &StringViewArray::new_scalar(""))?,
+        let empty = StringViewArray::new_scalar("");
+        // `None`: no row keeps its metadata.
+        let kept: Option<BooleanArray> = match (all, labels.column_by_name(DROP_NAME)) {
+            (true, _) => None,
+            (false, Some(mark)) => Some(eq(mark, &empty)?),
             (false, None) => return Ok(ColumnarValue::Array(Arc::new(labels.clone()))),
         };
-        let empty = StringViewArray::new_scalar("");
+        // One column of `""` shared by every metadata label.
+        let blank: Option<ArrayRef> = kept.is_none().then(|| {
+            Arc::new(StringViewArray::from_iter_values(std::iter::repeat_n(
+                "",
+                args.number_rows,
+            ))) as ArrayRef
+        });
         let mut fields = Vec::with_capacity(labels.num_columns());
         let mut columns = Vec::with_capacity(labels.num_columns());
         for (field, column) in labels.fields().iter().zip(labels.columns()) {
             match field.name().as_str() {
                 DROP_NAME => continue,
-                name if is_metadata(name) => columns.push(zip(&kept, column, &empty)?),
+                name if is_metadata(name) => columns.push(match &kept {
+                    None => Arc::clone(blank.as_ref().expect("built where nothing is kept")),
+                    Some(kept) if kept.true_count() == kept.len() => Arc::clone(column),
+                    Some(kept) => zip(kept, column, &empty)?,
+                }),
                 _ => columns.push(Arc::clone(column)),
             }
             fields.push(Arc::clone(field));

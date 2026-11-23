@@ -577,9 +577,7 @@ impl Planner<'_> {
     fn expr<'f>(&'f mut self, expr: &'f Expr, above: Above<'f>) -> Planning<'f> {
         Box::pin(async move {
             match expr {
-                Expr::VectorSelector(vs) => {
-                    self.selector(vs, above, selector::Pick::Value, None).await
-                }
+                Expr::VectorSelector(vs) => self.selector(vs, above, selector::Pick::Value).await,
                 Expr::Paren(p) => self.expr(&p.expr, above).await,
                 Expr::Aggregate(a) => self.aggregate(a).await,
                 Expr::Call(c) => self.call(c, above).await,
@@ -655,7 +653,6 @@ impl Planner<'_> {
         vs: &VectorSelector,
         above: Above<'_>,
         pick: selector::Pick,
-        reads: Option<Reads>,
     ) -> Result<Planned, EngineError> {
         let params = Params {
             start_ms: self.query.start_ms,
@@ -675,7 +672,7 @@ impl Planner<'_> {
             selector::Pick::Value => (col(LABELS), label_names, false),
             // `funcTimestamp` emits with `DropName`.
             selector::Pick::Timestamp => {
-                let (expr, names, marked) = drop_name::mark(&label_names, reads);
+                let (expr, names, marked) = drop_name::mark(&label_names, above.reads);
                 (expr.alias(LABELS), names, marked)
             }
         };
@@ -704,7 +701,6 @@ impl Planner<'_> {
                         ..above
                     },
                     selector::Pick::Timestamp,
-                    above.reads,
                 )
                 .await
             }
@@ -801,8 +797,7 @@ impl Planner<'_> {
                 arg,
                 Above {
                     func: Some("scalar"),
-                    grouping: None,
-                    reads: None,
+                    ..Above::default()
                 },
             )
             .await?;
@@ -903,13 +898,12 @@ impl Planner<'_> {
                 marked: false,
             },
         };
-        let (labels_expr, label_names, marked) = match func.drops_metric_name() {
-            true => drop_name::mark(&input.label_names, above.reads),
-            false => {
-                let (expr, names) = labels::keep(&input.label_names, |_| true);
-                (expr, names, input.marked)
-            }
-        };
+        let (labels_expr, label_names, marked) = drop_name::mark_if(
+            func.drops_metric_name(),
+            &input.label_names,
+            input.marked,
+            above.reads,
+        );
         // A name of its own for what this function reads. Without it the
         // projection below can be merged into the one under it, and the
         // merged node would hold both the input's qualified `labels` and
@@ -993,8 +987,7 @@ impl Planner<'_> {
                 &call.args[0],
                 Above {
                     func: Some(name),
-                    grouping: None,
-                    reads: None,
+                    ..Above::default()
                 },
             )
             .await?;
@@ -1183,13 +1176,12 @@ impl Planner<'_> {
         // two branches that disagree about the name and DataFusion
         // calls it ambiguous. A computed struct is unqualified.
         // `VectorscalarBinop` marks rather than drops, unlike `VectorBinop`.
-        let (labels_expr, label_names, marked) = match op.drops_metric_name(return_bool) {
-            true => drop_name::mark(&input.label_names, reads),
-            false => {
-                let (expr, names) = labels::keep(&input.label_names, |_| true);
-                (expr, names, input.marked)
-            }
-        };
+        let (labels_expr, label_names, marked) = drop_name::mark_if(
+            op.drops_metric_name(return_bool),
+            &input.label_names,
+            input.marked,
+            reads,
+        );
         // The scalar goes in the slot that says which side it was on;
         // see `elementwise::Func::bind`.
         let (a, b) = if swap {
@@ -1236,10 +1228,7 @@ impl Planner<'_> {
     ) -> Result<Planned, EngineError> {
         // Arithmetic drops the operands' metadata itself
         // (`changesMetricSchema`), so it reads only what it matches on.
-        let signature = match matching.on {
-            true => Reads::named(&matching.labels),
-            false => Reads::all_but_name_and(&matching.labels),
-        };
+        let signature = Reads::kept_by(&matching.labels, matching.on);
         let above = Above {
             reads: op
                 .changes_metric_schema()
@@ -1269,7 +1258,7 @@ impl Planner<'_> {
         };
         names.retain(|n| n != DROP_NAME);
         if per_row {
-            names = drop_name::with_mark(&names);
+            names.push(DROP_NAME.to_string());
         }
         names.sort();
         names.dedup();
@@ -1401,8 +1390,7 @@ impl Planner<'_> {
                 vector,
                 Above {
                     func: Some(name),
-                    grouping: None,
-                    reads: None,
+                    ..Above::default()
                 },
             )
             .await?;
@@ -1634,10 +1622,7 @@ impl Planner<'_> {
                     grouping: grouping.as_ref(),
                     // Every aggregation planned here answers with its group
                     // labels only.
-                    reads: Some(match agg.without {
-                        true => Reads::all_but_name_and(&agg.grouping),
-                        false => Reads::named(&agg.grouping),
-                    }),
+                    reads: Some(Reads::kept_by(&agg.grouping, !agg.without)),
                 },
             )
             .await?;
