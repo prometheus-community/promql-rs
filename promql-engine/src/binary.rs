@@ -1695,6 +1695,22 @@ fn checked_i32_offset(offset: usize) -> Result<i32> {
     })
 }
 
+fn checked_add_i32(total: usize, delta: usize) -> Result<usize> {
+    let next = total
+        .checked_add(delta)
+        .ok_or_else(|| DataFusionError::Execution(format!("{NAME}: offset overflow")))?;
+    checked_i32_offset(next)?;
+    Ok(next)
+}
+
+fn checked_mul_i32(a: usize, b: usize) -> Result<usize> {
+    let prod = a
+        .checked_mul(b)
+        .ok_or_else(|| DataFusionError::Execution(format!("{NAME}: offset overflow")))?;
+    checked_i32_offset(prod)?;
+    Ok(prod)
+}
+
 /// Evaluate `groups` in one pass, running [`Op::kernel`] once across all
 /// paired sample lanes and assembling one outer `ListArray` row per group.
 fn evaluate_groups(config: &BinaryConfig, groups: &[GroupState]) -> Result<ListArray> {
@@ -1707,10 +1723,23 @@ fn evaluate_groups(config: &BinaryConfig, groups: &[GroupState]) -> Result<ListA
     for group in groups {
         let buckets = group.pairs(config)?;
         for b in &buckets {
-            total_samples += b.timestamps.len();
+            total_samples = total_samples
+                .checked_add(b.timestamps.len())
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!("{NAME}: sample count overflow"))
+                })?;
         }
-        total_buckets += buckets.len();
+        total_buckets = total_buckets
+            .checked_add(buckets.len())
+            .ok_or_else(|| DataFusionError::Execution(format!("{NAME}: bucket count overflow")))?;
         group_buckets.push(buckets);
+    }
+
+    // Fail before allocating flat sample/operand buffers when the final Arrow
+    // `ListArray` offsets are guaranteed to overflow `i32::MAX`.
+    if op.is_set() || !op.is_comparison() || return_bool {
+        checked_i32_offset(total_samples)?;
+        checked_i32_offset(total_buckets)?;
     }
 
     let mut ts_vec: Vec<i64> = Vec::with_capacity(total_samples);
@@ -1846,21 +1875,40 @@ fn emit_groups_lanes(config: &BinaryConfig, groups: &[GroupState]) -> Result<Vec
     let mut cap_one_steps = 0usize;
     let mut cap_one_rows = 0usize;
     let mut cap_one_pool = 0usize;
+    let mut cap_one_pool_bytes = 0usize;
     let mut cap_one_metrics = 0usize;
+    let mut cap_one_metrics_bytes = 0usize;
     let mut cap_many_series = 0usize;
+    let mut cap_many_labels_bytes = 0usize;
+    // Validate every Arrow `i32` list-element and UTF-8 byte total up front so
+    // oversized emissions fail before allocating multi-GiB buffers or panicking
+    // inside `StringBuilder`.
     for g in groups {
         if let Some(one) = &g.one {
-            cap_one_steps += steps;
+            cap_one_steps = checked_add_i32(cap_one_steps, steps)?;
             if one.rows.is_some() {
-                cap_one_rows += steps;
+                cap_one_rows = checked_add_i32(cap_one_rows, steps)?;
             }
         }
-        cap_one_pool += g.one_pool.len() * width;
-        cap_one_metrics += g.one_metrics.len();
-        cap_many_series += g.many.len();
+        cap_one_pool = checked_add_i32(cap_one_pool, checked_mul_i32(g.one_pool.len(), width)?)?;
+        for labels in &g.one_pool {
+            for label in labels {
+                cap_one_pool_bytes = checked_add_i32(cap_one_pool_bytes, label.len())?;
+            }
+        }
+        cap_one_metrics = checked_add_i32(cap_one_metrics, g.one_metrics.len())?;
+        for metric in &g.one_metrics {
+            cap_one_metrics_bytes = checked_add_i32(cap_one_metrics_bytes, metric.len())?;
+        }
+        cap_many_series = checked_add_i32(cap_many_series, g.many.len())?;
+        for series in &g.many {
+            for label in &series.labels {
+                cap_many_labels_bytes = checked_add_i32(cap_many_labels_bytes, label.len())?;
+            }
+        }
     }
-    let cap_many_steps = cap_many_series * steps;
-    let cap_many_labels = cap_many_series * width;
+    let cap_many_steps = checked_mul_i32(cap_many_series, steps)?;
+    let cap_many_labels = checked_mul_i32(cap_many_series, width)?;
 
     let mut one_counts_vec: Vec<u8> = Vec::with_capacity(cap_one_steps);
     let mut one_values_vec: Vec<f64> = Vec::with_capacity(cap_one_steps);
@@ -1871,19 +1919,19 @@ fn emit_groups_lanes(config: &BinaryConfig, groups: &[GroupState]) -> Result<Vec
     let mut one_rows_offsets: Vec<i32> = Vec::with_capacity(n + 1);
     one_rows_offsets.push(0);
 
-    let mut one_pool_builder = StringBuilder::with_capacity(cap_one_pool, cap_one_pool * 8);
+    let mut one_pool_builder = StringBuilder::with_capacity(cap_one_pool, cap_one_pool_bytes);
     let mut one_pool_offsets: Vec<i32> = Vec::with_capacity(n + 1);
     one_pool_offsets.push(0);
     let mut one_pool_pos = 0usize;
 
     let mut one_metrics_builder =
-        StringBuilder::with_capacity(cap_one_metrics, cap_one_metrics * 24);
+        StringBuilder::with_capacity(cap_one_metrics, cap_one_metrics_bytes);
     let mut one_metrics_offsets: Vec<i32> = Vec::with_capacity(n + 1);
     one_metrics_offsets.push(0);
     let mut one_metrics_pos = 0usize;
 
     let mut many_labels_builder =
-        StringBuilder::with_capacity(cap_many_labels, cap_many_labels * 8);
+        StringBuilder::with_capacity(cap_many_labels, cap_many_labels_bytes);
     let mut many_labels_offsets: Vec<i32> = Vec::with_capacity(n + 1);
     many_labels_offsets.push(0);
     let mut many_labels_pos = 0usize;
@@ -1905,8 +1953,8 @@ fn emit_groups_lanes(config: &BinaryConfig, groups: &[GroupState]) -> Result<Vec
                 one_rows_vec.extend_from_slice(rows);
             }
         }
-        one_steps_offsets.push(checked_i32_offset(one_counts_vec.len())?);
-        one_rows_offsets.push(checked_i32_offset(one_rows_vec.len())?);
+        one_steps_offsets.push(one_counts_vec.len() as i32);
+        one_rows_offsets.push(one_rows_vec.len() as i32);
 
         for labels in &g.one_pool {
             for label in labels {
@@ -1914,13 +1962,13 @@ fn emit_groups_lanes(config: &BinaryConfig, groups: &[GroupState]) -> Result<Vec
             }
             one_pool_pos += labels.len();
         }
-        one_pool_offsets.push(checked_i32_offset(one_pool_pos)?);
+        one_pool_offsets.push(one_pool_pos as i32);
 
         for metric in &g.one_metrics {
             one_metrics_builder.append_value(metric.as_str());
         }
         one_metrics_pos += g.one_metrics.len();
-        one_metrics_offsets.push(checked_i32_offset(one_metrics_pos)?);
+        one_metrics_offsets.push(one_metrics_pos as i32);
 
         for series in &g.many {
             for label in &series.labels {
@@ -1931,9 +1979,9 @@ fn emit_groups_lanes(config: &BinaryConfig, groups: &[GroupState]) -> Result<Vec
             many_values_vec.extend_from_slice(&series.values);
             many_sides_vec.push(series.side as u8);
         }
-        many_labels_offsets.push(checked_i32_offset(many_labels_pos)?);
-        many_steps_offsets.push(checked_i32_offset(many_counts_vec.len())?);
-        many_sides_offsets.push(checked_i32_offset(many_sides_vec.len())?);
+        many_labels_offsets.push(many_labels_pos as i32);
+        many_steps_offsets.push(many_counts_vec.len() as i32);
+        many_sides_offsets.push(many_sides_vec.len() as i32);
     }
 
     let one_steps_buf = OffsetBuffer::new(one_steps_offsets.into());
@@ -2005,10 +2053,18 @@ fn emit_groups_lanes(config: &BinaryConfig, groups: &[GroupState]) -> Result<Vec
 /// Serialize `groups` into the ten partial-state columns declared by
 /// [`Binary::state_fields`] without intermediate `ScalarValue` wrappers.
 fn emit_groups_state(config: &BinaryConfig, groups: &[GroupState]) -> Result<Vec<ArrayRef>> {
+    let mut group_bytes = 0usize;
+    for g in groups {
+        if let Some(group) = g.group.as_deref() {
+            group_bytes = checked_add_i32(group_bytes, group.len())?;
+        }
+    }
     let mut arrays = emit_groups_lanes(config, groups)?;
-    arrays.push(Arc::new(StringArray::from_iter(
-        groups.iter().map(|g| g.group.as_deref()),
-    )));
+    let mut group_builder = StringBuilder::with_capacity(groups.len(), group_bytes);
+    for g in groups {
+        group_builder.append_option(g.group.as_deref());
+    }
+    arrays.push(Arc::new(group_builder.finish()));
     Ok(arrays)
 }
 
