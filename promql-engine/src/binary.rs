@@ -48,7 +48,7 @@ use datafusion::arrow::array::{
     StringArray, StringBuilder, StringViewArray, StringViewBuilder, StructArray,
     TimestampMillisecondArray, UInt8Array,
 };
-use datafusion::arrow::buffer::{BooleanBuffer, OffsetBuffer};
+use datafusion::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer};
 use datafusion::arrow::compute::kernels::numeric;
 use datafusion::arrow::compute::{binary, FilterBuilder};
 use datafusion::arrow::datatypes::{
@@ -2041,7 +2041,9 @@ impl<'a> BatchInputs<'a> {
             .ok_or_else(|| {
                 DataFusionError::Internal(format!("{NAME}: third argument is not a label struct"))
             })?;
-        let entries = list.values().as_struct();
+        let entries = list.values().as_struct_opt().ok_or_else(|| {
+            DataFusionError::Internal(format!("{NAME}: samples list items are not structs"))
+        })?;
         let timestamps = child::<TimestampMillisecondArray>(entries, series::TIMESTAMP)?.values();
         let samples = child::<Float64Array>(entries, series::VALUE)?.values();
         Ok(Self {
@@ -2073,9 +2075,20 @@ enum LabelCol<'a> {
     Empty,
 }
 
+impl<'a> LabelCol<'a> {
+    fn value(&self, row: usize) -> &'a str {
+        match self {
+            LabelCol::View(a) if a.is_valid(row) => a.value(row),
+            LabelCol::Utf8(a) if a.is_valid(row) => a.value(row),
+            _ => "",
+        }
+    }
+}
+
 /// Pre-bound label struct columns in schema order so row loops avoid linear
 /// field-name lookups on every row.
 struct LabelColumns<'a> {
+    nulls: Option<&'a NullBuffer>,
     cols: Vec<LabelCol<'a>>,
 }
 
@@ -2092,7 +2105,14 @@ impl<'a> LabelColumns<'a> {
                 None => LabelCol::Empty,
             })
             .collect();
-        Self { cols }
+        Self {
+            nulls: labels.nulls(),
+            cols,
+        }
+    }
+
+    fn is_null(&self, row: usize) -> bool {
+        self.nulls.is_some_and(|n| n.is_null(row))
     }
 
     fn read_into(&self, row: usize, out: &mut Vec<String>) {
@@ -2101,13 +2121,15 @@ impl<'a> LabelColumns<'a> {
         } else {
             out.truncate(self.cols.len());
         }
+        if self.is_null(row) {
+            for dst in out.iter_mut() {
+                dst.clear();
+            }
+            return;
+        }
         for (dst, col) in out.iter_mut().zip(&self.cols) {
             dst.clear();
-            let val = match col {
-                LabelCol::View(a) if a.is_valid(row) => a.value(row),
-                LabelCol::Utf8(a) if a.is_valid(row) => a.value(row),
-                _ => "",
-            };
+            let val = col.value(row);
             if !val.is_empty() {
                 dst.push_str(val);
             }
