@@ -5503,4 +5503,362 @@ mod tests {
             [(lset("err", "/x", "p", "eu"), vec![(0, 9.0)])]
         );
     }
+
+    #[test]
+    fn batch_inputs_handle_utf8_parent_and_child_nulls_and_sliced_arrays() {
+        use datafusion::arrow::datatypes::Schema;
+
+        // Build 5 rows and slice off row 0 so all input arrays start at offset > 0:
+        // row 0 (sliced off): dummy
+        // row 1 (kept): LHS via NULL `side`, Utf8 `pod="a"`, Utf8View `zone=None`,
+        //               unsupported Int32 `path`, omitted `__name__`
+        // row 2 (kept): RHS, parent `StructArray` NULL with phantom child `"phantom"`
+        // row 3 (dropped by NULL `samples` list)
+        // row 4 (dropped by NULL `opt_filter`)
+        let raw = encode_binary_batch(
+            &names(&SCHEMA),
+            &[
+                (&[(METRIC_NAME, "drop0"), ("pod", "z")], &[0], &[1.0], false),
+                (&[(METRIC_NAME, "m1"), ("pod", "a")], &[0], &[2.0], false),
+                (&[(METRIC_NAME, "m2"), ("pod", "a")], &[0], &[3.0], true),
+                (&[(METRIC_NAME, "m3"), ("pod", "a")], &[0], &[99.0], true),
+                (&[(METRIC_NAME, "m4"), ("pod", "a")], &[0], &[99.0], true),
+            ],
+        );
+        let raw_list = raw[0].as_list::<i32>();
+        let samples_nullable: ArrayRef = Arc::new(ListArray::new(
+            series::sample_item(),
+            raw_list.offsets().clone(),
+            raw_list.values().clone(),
+            Some(NullBuffer::from(vec![true, true, true, false, true])),
+        ));
+        let side_nullable: ArrayRef = Arc::new(BooleanArray::from(vec![
+            Some(false),
+            None, // NULL side maps to LHS
+            Some(true),
+            Some(true),
+            Some(true),
+        ]));
+        let label_fields = Fields::from(vec![
+            Field::new("path", DataType::Int32, false),
+            Field::new("pod", DataType::Utf8, true),
+            Field::new("zone", DataType::Utf8View, true),
+        ]);
+        let labels_struct: ArrayRef = Arc::new(StructArray::new(
+            label_fields,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(StringArray::from(vec![
+                    Some("z"),
+                    Some("a"),
+                    Some("phantom"),
+                    Some("x"),
+                    Some("y"),
+                ])),
+                Arc::new(StringViewArray::from(vec![
+                    Some("z"),
+                    None,
+                    Some("phantom_zone"),
+                    Some("eu"),
+                    Some("us"),
+                ])),
+            ],
+            // Row 2 has a NULL parent struct despite valid child strings.
+            Some(NullBuffer::from(vec![true, true, false, true, true])),
+        ));
+        let filter = BooleanArray::from(vec![Some(true), Some(true), Some(true), Some(true), None]);
+
+        let sliced: [ArrayRef; 3] = [
+            samples_nullable.slice(1, 4),
+            side_nullable.slice(1, 4),
+            labels_struct.slice(1, 4),
+        ];
+        let sliced_filter = filter.slice(1, 4);
+        assert_ne!(sliced[0].as_list::<i32>().offsets()[0], 0);
+
+        let matching = Matching {
+            card: Card::ManyToOne,
+            on: true,
+            labels: names(&["pod"]),
+            include: names(&["zone"]),
+            ..Matching::default()
+        };
+        let mut acc = GroupedBinary::from_pairing(pairing(Op::Add, false, matching.clone()));
+        acc.update_batch(&sliced, &[0, 0, 0, 0], Some(&sliced_filter), 1)
+            .unwrap();
+        // Row 2's parent-struct NULL must yield empty labels (`zone == ""`), not `"phantom_zone"`.
+        assert_eq!(acc.groups[0].one_pool, vec![lset("", "", "", "")]);
+        let direct_out = acc.evaluate(EmitTo::All).unwrap();
+        assert_eq!(
+            pairs_at(&direct_out, 0),
+            [(lset("", "", "a", ""), vec![(0, 5.0)])]
+        );
+
+        // `convert_to_state` on the same sliced nullable inputs reaches the same answer.
+        let conv = GroupedBinary::from_pairing(pairing(Op::Add, false, matching.clone()));
+        let states = conv
+            .convert_to_state(&sliced, Some(&sliced_filter))
+            .unwrap();
+        let mut merged = GroupedBinary::from_pairing(pairing(Op::Add, false, matching));
+        merged.merge_batch(&states, &[0, 0, 0, 0], 1).unwrap();
+        assert_eq!(merged.groups[0].one_pool, vec![lset("", "", "", "")]);
+        assert_eq!(
+            pairs_at(&merged.evaluate(EmitTo::All).unwrap(), 0),
+            [(lset("", "", "a", ""), vec![(0, 5.0)])]
+        );
+
+        // Non-struct list items return `DataFusionError::Internal` rather than panicking.
+        let bad_list: ArrayRef = Arc::new(ListArray::new(
+            Arc::new(Field::new("item", DataType::Int32, false)),
+            OffsetBuffer::new(vec![0, 0].into()),
+            Arc::new(Int32Array::from(Vec::<i32>::new())),
+            None,
+        ));
+        let bad_cols: [ArrayRef; 3] = [
+            bad_list,
+            Arc::new(BooleanArray::from(vec![false])),
+            Arc::new(StructArray::new_empty_fields(1, None)),
+        ];
+        let err = BatchInputs::parse(&names(&SCHEMA), &bad_cols)
+            .err()
+            .expect("non-struct items must fail")
+            .to_string();
+        assert!(err.contains("samples list items are not structs"), "{err}");
+
+        // `GroupedBinary` boundary conditions: empty emission, `EmitTo::First(0 | >len)`,
+        // error `heap_size` invariant, and `is_distinct` guard on `Binary`.
+        for op in [Op::Add, Op::Gtr] {
+            let mut empty = GroupedBinary::from_pairing(plain(op));
+            assert_eq!(empty.state(EmitTo::All).unwrap()[0].len(), 0);
+            assert_eq!(empty.evaluate(EmitTo::All).unwrap().len(), 0);
+        }
+        let one_row = encode_binary_batch(
+            &names(&SCHEMA),
+            &[(&[(METRIC_NAME, "req"), ("pod", "a")], &[0], &[1.0], false)],
+        );
+        let mut bounded = GroupedBinary::from_pairing(plain(Op::Add));
+        bounded.update_batch(&one_row, &[0], None, 1).unwrap();
+        let before_size = bounded.size();
+        // `convert_to_state` on an empty batch leaves existing accumulator untouched.
+        let empty_batch: [ArrayRef; 3] = [
+            one_row[0].slice(0, 0),
+            one_row[1].slice(0, 0),
+            one_row[2].slice(0, 0),
+        ];
+        assert_eq!(
+            bounded.convert_to_state(&empty_batch, None).unwrap()[0].len(),
+            0
+        );
+        assert_eq!(bounded.size(), before_size);
+        assert_eq!(bounded.state(EmitTo::First(0)).unwrap()[0].len(), 0);
+        assert_eq!(bounded.size(), before_size);
+        assert_eq!(bounded.evaluate(EmitTo::First(99)).unwrap().len(), 1);
+        assert_eq!(bounded.heap_size, 0);
+
+        // Off-grid timestamp error in `update_batch` keeps `heap_size` consistent.
+        let bad_ts = encode_binary_batch(
+            &names(&SCHEMA),
+            &[(
+                &[(METRIC_NAME, "req"), ("pod", "a")],
+                &[5_000],
+                &[1.0],
+                false,
+            )],
+        );
+        let mut err_acc = GroupedBinary::from_pairing(plain(Op::Add));
+        assert!(err_acc.update_batch(&bad_ts, &[0], None, 1).is_err());
+        assert_eq!(
+            err_acc.heap_size,
+            err_acc
+                .groups
+                .iter()
+                .map(|g| g.heap_size(&err_acc.config))
+                .sum::<usize>()
+        );
+
+        // `Binary` rejects `is_distinct = true`.
+        let udaf = udaf();
+        let arrow_schema = Schema::new(vec![
+            Field::new(series::SAMPLES, series::samples_type(), false),
+            Field::new(SIDE, DataType::Boolean, false),
+            Field::new(series::LABELS, series::labels_type(&names(&SCHEMA)), false),
+        ]);
+        let exprs: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>> = vec![
+            Arc::new(datafusion::physical_expr::expressions::Column::new(
+                series::SAMPLES,
+                0,
+            )),
+            Arc::new(datafusion::physical_expr::expressions::Column::new(SIDE, 1)),
+            Arc::new(datafusion::physical_expr::expressions::Column::new(
+                series::LABELS,
+                2,
+            )),
+            Arc::new(Literal::new(ScalarValue::from("+"))),
+            Arc::new(Literal::new(ScalarValue::from(""))),
+            Arc::new(Literal::new(ScalarValue::Int64(Some(0)))),
+            Arc::new(Literal::new(ScalarValue::Int64(Some(30_000)))),
+            Arc::new(Literal::new(ScalarValue::Int64(Some(10_000)))),
+        ];
+        let expr_fields: Vec<FieldRef> = exprs
+            .iter()
+            .map(|e| e.return_field(&arrow_schema).unwrap())
+            .collect();
+        let distinct_args = AccumulatorArgs {
+            return_field: Arc::new(Field::new("out", output_type(&names(&SCHEMA)), false)),
+            schema: &arrow_schema,
+            ignore_nulls: false,
+            order_bys: &[],
+            is_reversed: false,
+            name: NAME,
+            is_distinct: true,
+            exprs: &exprs,
+            expr_fields: &expr_fields,
+        };
+        assert!(!udaf.groups_accumulator_supported(distinct_args.clone()));
+        let err = udaf
+            .create_groups_accumulator(distinct_args)
+            .err()
+            .expect("DISTINCT must fail")
+            .to_string();
+        assert!(err.contains("DISTINCT is not supported"), "{err}");
+    }
+
+    #[test]
+    fn parsed_states_and_merge_row_reject_nulls_mismatches_and_invalid_sides() {
+        let mut base = plain(Op::Add);
+        base.absorb(LHS, &lset("req", "", "a", ""), &[0], &[1.0])
+            .unwrap();
+        base.absorb(RHS, &lset("err", "", "a", ""), &[0], &[2.0])
+            .unwrap();
+        let valid: Vec<ArrayRef> = base
+            .state()
+            .unwrap()
+            .iter()
+            .map(|s| s.to_array().unwrap())
+            .collect();
+
+        // 1. Null list entry in a non-nullable state column.
+        let mut null_list = valid.clone();
+        let oc = valid[0].as_list::<i32>();
+        null_list[0] = Arc::new(ListArray::new(
+            state_item(STATE_ONE_COUNTS, DataType::UInt8),
+            oc.offsets().clone(),
+            oc.values().clone(),
+            Some(NullBuffer::from(vec![false])),
+        ));
+        assert!(plain(Op::Add)
+            .merge_batch(&null_list)
+            .unwrap_err()
+            .to_string()
+            .contains("has nulls"));
+
+        // 2. Null child element inside a nullable primitive/string lane.
+        let mut null_child = valid.clone();
+        null_child[3] = Arc::new(ListArray::new(
+            Arc::new(Field::new(STATE_ONE_POOL, DataType::Utf8, true)),
+            OffsetBuffer::new(vec![0, 4].into()),
+            Arc::new(StringArray::from(vec![
+                Some("err"),
+                None,
+                Some("a"),
+                Some(""),
+            ])),
+            None,
+        ));
+        assert!(plain(Op::Add)
+            .merge_batch(&null_child)
+            .unwrap_err()
+            .to_string()
+            .contains("values have nulls"));
+
+        // 3. Mismatched row counts across state columns.
+        let mut mismatched_rows = valid.clone();
+        mismatched_rows[9] = Arc::new(StringArray::from(vec!["{pod=\"a\"}", "{pod=\"b\"}"]));
+        assert!(plain(Op::Add)
+            .merge_batch(&mismatched_rows)
+            .unwrap_err()
+            .to_string()
+            .contains("mismatched row counts"));
+
+        // 4. Wrong element type (`Int64` instead of `UInt8`).
+        let mut wrong_type = valid.clone();
+        wrong_type[0] = Arc::new(ListArray::new(
+            state_item(STATE_ONE_COUNTS, DataType::Int64),
+            OffsetBuffer::new(vec![0, 0].into()),
+            Arc::new(datafusion::arrow::array::Int64Array::from(Vec::<i64>::new())),
+            None,
+        ));
+        assert!(plain(Op::Add)
+            .merge_batch(&wrong_type)
+            .unwrap_err()
+            .to_string()
+            .contains("holds Int64"));
+
+        // 5. Wrong step length in `one_values`.
+        let mut wrong_steps = valid.clone();
+        wrong_steps[1] = Arc::new(ListArray::new(
+            state_item(STATE_ONE_VALUES, DataType::Float64),
+            OffsetBuffer::new(vec![0, 2].into()),
+            Arc::new(Float64Array::from(vec![1.0, 2.0])),
+            None,
+        ));
+        assert!(plain(Op::Add)
+            .merge_batch(&wrong_steps)
+            .unwrap_err()
+            .to_string()
+            .contains("not the 4 of this grid"));
+
+        // 6. Positive out-of-bounds `one_rows` index.
+        let mut oob_rows = valid.clone();
+        oob_rows[2] = Arc::new(ListArray::new(
+            state_item(STATE_ONE_ROWS, DataType::Int32),
+            OffsetBuffer::new(vec![0, 4].into()),
+            Arc::new(Int32Array::from(vec![9, -1, -1, -1])),
+            None,
+        ));
+        assert!(plain(Op::Add)
+            .merge_batch(&oob_rows)
+            .unwrap_err()
+            .to_string()
+            .contains("row out of its pool"));
+
+        // 7. Invalid `many_sides` value (2, or `one_side` in a non-set op).
+        for bad_side in [2u8, RHS as u8] {
+            let mut bad_sides = valid.clone();
+            bad_sides[8] = Arc::new(ListArray::new(
+                state_item(STATE_MANY_SIDES, DataType::UInt8),
+                OffsetBuffer::new(vec![0, 1].into()),
+                Arc::new(UInt8Array::from(vec![bad_side])),
+                None,
+            ));
+            assert!(plain(Op::Add)
+                .merge_batch(&bad_sides)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid side in many_sides"));
+        }
+
+        // 8. Non-empty `many_labels` when `series_rows == 0`.
+        let mut empty_many = plain(Op::Add);
+        empty_many
+            .absorb(RHS, &lset("err", "", "a", ""), &[0], &[1.0])
+            .unwrap();
+        let mut trailing_labels: Vec<ArrayRef> = empty_many
+            .state()
+            .unwrap()
+            .iter()
+            .map(|s| s.to_array().unwrap())
+            .collect();
+        trailing_labels[5] = Arc::new(ListArray::new(
+            state_item(STATE_MANY_LABELS, DataType::Utf8),
+            OffsetBuffer::new(vec![0, 4].into()),
+            Arc::new(StringArray::from(vec!["req", "", "a", ""])),
+            None,
+        ));
+        assert!(plain(Op::Add)
+            .merge_batch(&trailing_labels)
+            .unwrap_err()
+            .to_string()
+            .contains("not a multiple of"));
+    }
 }
