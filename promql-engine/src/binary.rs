@@ -4350,6 +4350,49 @@ mod tests {
                 .to_string()
                 .contains(DUPLICATE_SERIES));
         }
+
+        // Same saturation check on `many.counts` across two partials for both
+        // arithmetic (`Op::Add`) and set (`Op::And`), plus disjoint-step merging
+        // of the same `(side, labels)` series in `many`.
+        for op in [Op::Add, Op::And] {
+            for total in [256usize, 257] {
+                let mut p1 = plain(op);
+                for _ in 0..200 {
+                    p1.absorb(LHS, &lhs, &[0], &[1.0]).unwrap();
+                }
+                p1.absorb(RHS, &rhs_a, &[0, 10_000], &[2.0, 4.0]).unwrap();
+                let mut p2 = plain(op);
+                for _ in 200..total {
+                    p2.absorb(LHS, &lhs, &[0], &[1.0]).unwrap();
+                }
+                p2.absorb(LHS, &lhs, &[10_000], &[5.0]).unwrap();
+
+                let mut merged = plain(op);
+                for mut part in [p1, p2] {
+                    let arrays: Vec<ArrayRef> = part
+                        .state()
+                        .unwrap()
+                        .iter()
+                        .map(|s| s.to_array().unwrap())
+                        .collect();
+                    merged.merge_batch(&arrays).unwrap();
+                }
+                let lhs_many = merged
+                    .group()
+                    .many
+                    .iter()
+                    .find(|s| s.side == LHS && s.labels == lhs)
+                    .unwrap();
+                assert_eq!(lhs_many.counts[0], u8::MAX);
+                assert_eq!(lhs_many.counts[1], 1);
+                let want = if op == Op::Add {
+                    vec![(0, 3.0), (10_000, 9.0)]
+                } else {
+                    vec![(0, 1.0), (10_000, 5.0)]
+                };
+                assert_eq!(samples_of(merged.evaluate().unwrap()), want, "{op:?}");
+            }
+        }
     }
 
     #[test]
