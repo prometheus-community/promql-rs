@@ -1322,6 +1322,11 @@ impl GroupState {
             }
             let (op_lo, op_hi) = parsed.one_pool.range(row);
             let pool_rows = rectangle_rows(op_lo, op_hi, width, NO_ROWS)?;
+            if rows.is_empty() && pool_rows > 1 {
+                return Err(corrupt(
+                    "multiple one-side label sets without per-step rows",
+                ));
+            }
             let mut seen: Vec<i32> = Vec::with_capacity(pool_rows);
             for index in 0..pool_rows {
                 seen.push(self.intern_one_array(
@@ -5860,5 +5865,27 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("not a multiple of"));
+
+        // 9. Multiple `one_pool` label sets when `one_rows` is empty.
+        let mut multi_pool_no_rows = valid.clone();
+        multi_pool_no_rows[2] = Arc::new(ListArray::new(
+            state_item(STATE_ONE_ROWS, DataType::Int32),
+            OffsetBuffer::new(vec![0, 0].into()),
+            Arc::new(Int32Array::from(Vec::<i32>::new())),
+            None,
+        ));
+        multi_pool_no_rows[3] = Arc::new(ListArray::new(
+            state_item(STATE_ONE_POOL, DataType::Utf8),
+            OffsetBuffer::new(vec![0, 8].into()),
+            Arc::new(StringArray::from(vec![
+                "err", "", "a", "", "err", "/x", "a", "",
+            ])),
+            None,
+        ));
+        assert!(plain(Op::Add)
+            .merge_batch(&multi_pool_no_rows)
+            .unwrap_err()
+            .to_string()
+            .contains("multiple one-side label sets without per-step rows"));
     }
 }
