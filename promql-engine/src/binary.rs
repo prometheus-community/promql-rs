@@ -4577,4 +4577,81 @@ mod tests {
         assert!(pairs_at(&empty_out, 0).is_empty());
         assert!(pairs_at(&empty_out, 1).is_empty());
     }
+
+    #[test]
+    fn one_rows_remaps_non_identity_pools_and_reabsorbs_row_zero() {
+        let matching = Matching {
+            card: Card::ManyToOne,
+            on: true,
+            labels: names(&["pod"]),
+            include: names(&["zone"]),
+            ..Matching::default()
+        };
+        let of = || pairing(Op::Add, false, matching.clone());
+        let lhs = lset("req", "", "a", "");
+        let rhs_a = lset("err_a", "", "a", "eu");
+        let rhs_b = lset("err_b", "", "a", "us");
+        let rhs_c = lset("err_c", "", "a", "ap");
+
+        // Re-absorbing row 0 at 20s after row 1 materialized `one.rows` at 10s.
+        let mut direct = of();
+        direct
+            .absorb(LHS, &lhs, &[0, 10_000, 20_000], &[1.0, 2.0, 3.0])
+            .unwrap();
+        direct.absorb(RHS, &rhs_a, &[0], &[10.0]).unwrap();
+        assert!(direct.group().one.as_ref().unwrap().rows.is_none());
+        direct.absorb(RHS, &rhs_b, &[10_000], &[20.0]).unwrap();
+        assert!(direct.group().one.as_ref().unwrap().rows.is_some());
+        direct.absorb(RHS, &rhs_a, &[20_000], &[30.0]).unwrap();
+        assert_eq!(
+            pairs_of(direct.evaluate().unwrap()),
+            [
+                (lset("", "", "a", "eu"), vec![(0, 11.0), (20_000, 33.0)]),
+                (lset("", "", "a", "us"), vec![(10_000, 22.0)]),
+            ]
+        );
+
+        // Merge partial 1 (`one.rows = None`, pool=[A]) -> partial 2
+        // (`one.rows = Some`, pool=[B, C] -> non-identity `seen = [1, 2]`,
+        // backfilling step 0 to row 0) -> partial 3 (`one.rows = None`,
+        // pool=[A] -> dst 0 written into already-materialized `one.rows`).
+        let mut p1 = of();
+        p1.absorb(
+            LHS,
+            &lhs,
+            &[0, 10_000, 20_000, 30_000],
+            &[1.0, 2.0, 3.0, 4.0],
+        )
+        .unwrap();
+        p1.absorb(RHS, &rhs_a, &[0], &[10.0]).unwrap();
+        assert!(p1.group().one.as_ref().unwrap().rows.is_none());
+
+        let mut p2 = of();
+        p2.absorb(RHS, &rhs_b, &[10_000], &[20.0]).unwrap();
+        p2.absorb(RHS, &rhs_c, &[20_000], &[30.0]).unwrap();
+        assert!(p2.group().one.as_ref().unwrap().rows.is_some());
+
+        let mut p3 = of();
+        p3.absorb(RHS, &rhs_a, &[30_000], &[40.0]).unwrap();
+        assert!(p3.group().one.as_ref().unwrap().rows.is_none());
+
+        let mut merged = of();
+        for mut part in [p1, p2, p3] {
+            let arrays: Vec<ArrayRef> = part
+                .state()
+                .unwrap()
+                .iter()
+                .map(|s| s.to_array().unwrap())
+                .collect();
+            merged.merge_batch(&arrays).unwrap();
+        }
+        assert_eq!(
+            pairs_of(merged.evaluate().unwrap()),
+            [
+                (lset("", "", "a", "ap"), vec![(20_000, 33.0)]),
+                (lset("", "", "a", "eu"), vec![(0, 11.0), (30_000, 44.0)]),
+                (lset("", "", "a", "us"), vec![(10_000, 22.0)]),
+            ]
+        );
+    }
 }
