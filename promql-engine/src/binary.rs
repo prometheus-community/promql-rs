@@ -770,6 +770,20 @@ impl GroupState {
         (self.one_pool.len() - 1) as i32
     }
 
+    fn intern_one_array(&mut self, flat: &StringArray, base: usize, width: usize) -> i32 {
+        if let Some(index) = self
+            .one_pool
+            .iter()
+            .position(|held| labels_match_array(held, flat, base, width))
+        {
+            return index as i32;
+        }
+        let owned = collect_array_labels(flat, base, width);
+        self.label_bytes += label_vec_heap_bytes(&owned, owned.capacity());
+        self.one_pool.push(owned);
+        (self.one_pool.len() - 1) as i32
+    }
+
     fn intern_many(&mut self, steps: usize, side: usize, labels: &[String]) -> usize {
         if let Some(index) = self
             .many
@@ -779,6 +793,30 @@ impl GroupState {
             return index;
         }
         let owned = labels.to_vec();
+        self.label_bytes += label_vec_heap_bytes(&owned, owned.capacity());
+        self.many.push(Many {
+            side,
+            labels: owned,
+            counts: vec![0; steps],
+            values: vec![f64::NAN; steps],
+        });
+        self.many.len() - 1
+    }
+
+    fn intern_many_array(
+        &mut self,
+        steps: usize,
+        side: usize,
+        flat: &StringArray,
+        base: usize,
+        width: usize,
+    ) -> usize {
+        if let Some(index) = self.many.iter().position(|held| {
+            held.side == side && labels_match_array(&held.labels, flat, base, width)
+        }) {
+            return index;
+        }
+        let owned = collect_array_labels(flat, base, width);
         self.label_bytes += label_vec_heap_bytes(&owned, owned.capacity());
         self.many.push(Many {
             side,
@@ -1283,10 +1321,14 @@ impl GroupState {
                 )));
             }
             let (op_lo, op_hi) = parsed.one_pool.range(row);
-            let pool = rectangle_slice(parsed.one_pool.values, op_lo, op_hi, width, NO_ROWS)?;
-            let mut seen: Vec<i32> = Vec::with_capacity(pool.len());
-            for labels in &pool {
-                seen.push(self.intern_one(labels));
+            let pool_rows = rectangle_rows(op_lo, op_hi, width, NO_ROWS)?;
+            let mut seen: Vec<i32> = Vec::with_capacity(pool_rows);
+            for index in 0..pool_rows {
+                seen.push(self.intern_one_array(
+                    parsed.one_pool.values,
+                    op_lo + index * width,
+                    width,
+                ));
             }
             let one = self.one.get_or_insert_with(|| OneLanes {
                 counts: vec![0; steps],
@@ -1347,13 +1389,19 @@ impl GroupState {
             return Err(corrupt("a side per series that is not one per series"));
         }
         let (ml_lo, ml_hi) = parsed.many_labels.range(row);
-        let labels = rectangle_slice(parsed.many_labels.values, ml_lo, ml_hi, width, series_rows)?;
-        for (index, labels) in labels.iter().enumerate() {
-            let side = usize::from(m_sides[index]);
+        rectangle_rows(ml_lo, ml_hi, width, series_rows)?;
+        for (index, &raw_side) in m_sides.iter().enumerate() {
+            let side = usize::from(raw_side);
             if side > RHS || (!config.op.is_set() && side == config.matching.one_side()) {
                 return Err(corrupt("an invalid side in many_sides"));
             }
-            let many = self.intern_many(steps, side, labels);
+            let many = self.intern_many_array(
+                steps,
+                side,
+                parsed.many_labels.values,
+                ml_lo + index * width,
+                width,
+            );
             let dst = &mut self.many[many];
             let base = index * steps;
             for step in 0..steps {
@@ -2164,14 +2212,9 @@ impl<'a> ParsedStates<'a> {
 /// impossible — so the caller says which case it is.
 const NO_ROWS: usize = usize::MAX;
 
-/// A flat slice of `[lo..hi]` label values read back as one label set per row.
-fn rectangle_slice(
-    flat: &StringArray,
-    lo: usize,
-    hi: usize,
-    width: usize,
-    rows: usize,
-) -> Result<Vec<Vec<String>>> {
+/// Validate a flat `[lo..hi]` label rectangle of `width` columns and return
+/// its row count without allocating.
+fn rectangle_rows(lo: usize, hi: usize, width: usize, expected: usize) -> Result<usize> {
     let len = hi - lo;
     if width == 0 {
         if len != 0 {
@@ -2182,20 +2225,28 @@ fn rectangle_slice(
         // Every label set is the empty one, so a pool of them holds
         // exactly one entry and a rectangle holds as many as the
         // caller counted.
-        return Ok(vec![Vec::new(); if rows == NO_ROWS { 1 } else { rows }]);
+        return Ok(if expected == NO_ROWS { 1 } else { expected });
     }
-    if !len.is_multiple_of(width) || (rows != NO_ROWS && len / width != rows) {
+    if !len.is_multiple_of(width) || (expected != NO_ROWS && len / width != expected) {
         return Err(DataFusionError::Internal(format!(
             "{NAME}: {len} label values are not a multiple of the {width} columns"
         )));
     }
-    Ok((0..len / width)
-        .map(|row| {
-            (0..width)
-                .map(|column| flat.value(lo + row * width + column).to_string())
-                .collect()
-        })
-        .collect())
+    Ok(len / width)
+}
+
+fn labels_match_array(held: &[String], flat: &StringArray, base: usize, width: usize) -> bool {
+    held.len() == width
+        && held
+            .iter()
+            .enumerate()
+            .all(|(col, value)| value.as_str() == flat.value(base + col))
+}
+
+fn collect_array_labels(flat: &StringArray, base: usize, width: usize) -> Vec<String> {
+    (0..width)
+        .map(|col| flat.value(base + col).to_string())
+        .collect()
 }
 
 /// A label set as Prometheus prints one, keeping the names `wanted`
