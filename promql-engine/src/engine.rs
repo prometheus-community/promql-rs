@@ -154,6 +154,7 @@ impl Engine {
         ctx.register_udf(elementwise::udf());
         ctx.register_udf(matrix::udf());
         ctx.register_udaf(binary::udaf());
+        ctx.register_udf(binary::unnested_udf());
         ctx.register_udf(sort::Natural::udf());
         ctx.register_udf(sort::Set::udf());
         Self {

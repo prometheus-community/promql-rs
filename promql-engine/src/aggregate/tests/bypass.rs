@@ -10,8 +10,8 @@ use datafusion::physical_expr::{
     expressions::{col, lit},
 };
 use datafusion::physical_plan::{
-    aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy},
-    collect, ExecutionPlan, InputOrderMode,
+    aggregates::{AggregateExec, AggregateMode, GroupClusteringMode, PhysicalGroupBy},
+    collect, ExecutionPlan,
 };
 
 type StateBits = Vec<(i64, u64, u64, u64, bool)>;
@@ -379,7 +379,7 @@ async fn native_with_input(
         )
         .unwrap(),
     );
-    assert_eq!(partial.input_order_mode(), &InputOrderMode::Linear);
+    assert_eq!(partial.group_clustering_mode(), &GroupClusteringMode::None);
     let final_agg = Arc::new(
         AggregateExec::try_new(
             AggregateMode::Final,

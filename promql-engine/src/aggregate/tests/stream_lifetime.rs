@@ -15,10 +15,9 @@ use datafusion::physical_expr::{
     LexOrdering, PhysicalExpr, PhysicalSortExpr,
 };
 use datafusion::physical_plan::{
-    aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy},
+    aggregates::{AggregateExec, AggregateMode, GroupClusteringMode, PhysicalGroupBy},
     stream::RecordBatchStreamAdapter,
-    DisplayAs, DisplayFormatType, ExecutionPlan, InputOrderMode, PlanProperties,
-    SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use futures::StreamExt;
 use std::sync::{
@@ -233,8 +232,8 @@ fn partial(input: Arc<dyn ExecutionPlan>) -> AggregateExec {
     )
     .unwrap();
     assert_eq!(
-        agg.input_order_mode(),
-        &InputOrderMode::PartiallySorted(vec![0])
+        agg.group_clustering_mode(),
+        &GroupClusteringMode::Partial(vec![0])
     );
     agg
 }
@@ -250,8 +249,8 @@ fn final_agg(template: &AggregateExec, input: Arc<dyn ExecutionPlan>) -> Aggrega
     )
     .unwrap();
     assert_eq!(
-        agg.input_order_mode(),
-        &InputOrderMode::PartiallySorted(vec![0])
+        agg.group_clustering_mode(),
+        &GroupClusteringMode::Partial(vec![0])
     );
     agg
 }
@@ -373,22 +372,16 @@ async fn ordinary_lifetime(is_partial: bool) {
                     }
                     output.push(batch);
                 }
-                // Preserve the DF55 observation, not a fabricated universal
-                // bound: oversized native input can accumulate pending groups.
+                // The DF56 observation, the same for both streams and both
+                // query lengths. Under DF55 the migration stream's pending
+                // groups grew with query length on oversized input, so a
+                // move here is DataFusion's, not a fabricated bound.
                 if input_size == 2 {
-                    assert_eq!(
-                        first_consumed,
-                        if migration { vec![2, 3] } else { vec![2, 2] }
-                    );
-                    assert_eq!(
-                        retained_at_last_input,
-                        Some(if migration { blocks + 1 } else { 3 })
-                    );
-                    if migration {
-                        assert_eq!(progress.peak_pending.load(Ordering::SeqCst), blocks + 2);
-                    }
-                } else if migration {
-                    assert_eq!(first_consumed, vec![3, 4]);
+                    assert_eq!(first_consumed, vec![2, 2]);
+                    assert_eq!(retained_at_last_input, Some(3));
+                    assert_eq!(progress.peak_pending.load(Ordering::SeqCst), 4);
+                } else {
+                    assert_eq!(first_consumed, vec![3, 3]);
                     assert_eq!(progress.peak_pending.load(Ordering::SeqCst), 3);
                 }
                 assert_eq!(progress.rows.load(Ordering::SeqCst), blocks * 2);
@@ -542,8 +535,8 @@ async fn migrated_ordered_upper_states_survive_memory_pressure_and_tiny_drains()
         exchange |= node.name() == "RepartitionExec";
         if let Some(agg) = node.downcast_ref::<AggregateExec>() {
             assert!(matches!(
-                agg.input_order_mode(),
-                InputOrderMode::PartiallySorted(_)
+                agg.group_clustering_mode(),
+                GroupClusteringMode::Partial(_)
             ));
             match agg.mode() {
                 AggregateMode::Partial => partial = Some(node.clone()),
@@ -620,8 +613,8 @@ async fn migrated_ordered_upper_states_survive_memory_pressure_and_tiny_drains()
             .unwrap(),
         );
         assert!(matches!(
-            agg.input_order_mode(),
-            InputOrderMode::PartiallySorted(_)
+            agg.group_clustering_mode(),
+            GroupClusteringMode::Partial(_)
         ));
         let output = datafusion::physical_plan::collect_partitioned(agg.clone(), ctx.task_ctx())
             .await

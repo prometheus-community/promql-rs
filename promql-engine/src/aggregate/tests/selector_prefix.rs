@@ -9,10 +9,9 @@ use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::{
-    aggregates::{AggregateExec, AggregateMode},
+    aggregates::{AggregateExec, AggregateMode, GroupClusteringMode},
     stream::RecordBatchStreamAdapter,
-    DisplayAs, DisplayFormatType, ExecutionPlan, InputOrderMode, PlanProperties,
-    SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use futures::StreamExt;
 use promql_parser::ast::LabelMatcher;
@@ -148,7 +147,7 @@ async fn selectors_and_ranges_release_upper_block_prefixes_through_exchange_befo
             exchange |= node.name() == "RepartitionExec";
             if let Some(agg) = node.downcast_ref::<AggregateExec>() {
                 assert!(
-                    matches!(agg.input_order_mode(), InputOrderMode::PartiallySorted(_)),
+                    matches!(agg.group_clustering_mode(), GroupClusteringMode::Partial(_)),
                     "{query}"
                 );
                 partial |= *agg.mode() == AggregateMode::Partial;

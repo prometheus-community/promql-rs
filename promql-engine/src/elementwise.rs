@@ -1156,14 +1156,14 @@ mod tests {
                 Arc::new(
                     f.as_ref()
                         .clone()
-                        .with_metadata([("child".into(), f.name().clone())].into_iter().collect()),
+                        .with_metadata([("child", f.name().clone())]),
                 )
             })
             .collect();
         let entries = StructArray::new(fields.clone(), entries.columns().to_vec(), None);
         let item = Arc::new(
             Field::new(series::LIST_ITEM, DataType::Struct(fields), false)
-                .with_metadata([("item".into(), "preserved".into())].into_iter().collect()),
+                .with_metadata([("item", "preserved")]),
         );
         let input =
             ListArray::new(item, backing.offsets().clone(), Arc::new(entries), None).slice(1, 2);

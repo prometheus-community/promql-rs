@@ -413,14 +413,14 @@ impl SeriesSource for SlicedRawSource {
                 Arc::new(
                     f.as_ref()
                         .clone()
-                        .with_metadata([("child".into(), f.name().clone())].into_iter().collect()),
+                        .with_metadata([("child", f.name().clone())]),
                 )
             })
             .collect();
         let entries = StructArray::new(fields.clone(), entries.columns().to_vec(), None);
         let item = Arc::new(
             Field::new(series::LIST_ITEM, DataType::Struct(fields), false)
-                .with_metadata([("item".into(), "preserved".into())].into_iter().collect()),
+                .with_metadata([("item", "preserved")]),
         );
         let samples: ArrayRef = Arc::new(ListArray::new(
             item,
@@ -459,10 +459,10 @@ impl SeriesSource for SlicedRawSource {
             .zip(&columns)
             .map(|(name, array)| {
                 Field::new(name, array.data_type().clone(), false)
-                    .with_metadata([("source-field".into(), name.into())].into_iter().collect())
+                    .with_metadata([("source-field", name)])
             })
             .collect::<Vec<_>>(),
-            [("owner".into(), "source".into())].into_iter().collect(),
+            [("owner", "source")],
         ));
         // Only oslo is part of the source. Both adjacent rows remain in the
         // backing buffers, so their in-window samples expose a span mismatch.

@@ -55,12 +55,13 @@ use datafusion::arrow::datatypes::{
     DataType, Field, FieldRef, Fields, Float64Type, Int32Type, UInt8Type,
 };
 use datafusion::arrow::error::ArrowError;
-use datafusion::common::{plan_err, ScalarValue};
+use datafusion::common::{internal_err, plan_err, ScalarValue};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion::logical_expr::utils::format_state_name;
 use datafusion::logical_expr::{
-    lit, Accumulator, AggregateUDF, AggregateUDFImpl, EmitTo, Expr, GroupsAccumulator, Signature,
+    lit, Accumulator, AggregateUDF, AggregateUDFImpl, ColumnarValue, EmitTo, Expr,
+    GroupsAccumulator, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
     Volatility,
 };
 use datafusion::physical_expr::expressions::Literal;
@@ -570,6 +571,69 @@ fn pair_item(names: &[String]) -> FieldRef {
 /// What one match group answers with: the series it splits into.
 pub fn output_type(names: &[String]) -> DataType {
     DataType::List(pair_item(names))
+}
+
+pub const UNNESTED: &str = "promql_unnested";
+
+/// `promql_unnested(pairs.labels)`: a pair's column as it comes out of
+/// the planner's `Unnest`, declared non-nullable again.
+///
+/// DataFusion 56's `Unnest` marks a list's items nullable, and a struct's
+/// fields inherit that, so `labels` and `samples` would leave the
+/// operator out of the canonical series shape. None is NULL: the pairs
+/// list and its items are non-nullable, and an empty list yields no row.
+/// A NULL that did arrive is an error, not a column relabelled over it.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct Unnested {
+    signature: Signature,
+}
+
+impl Default for Unnested {
+    fn default() -> Self {
+        Self {
+            signature: Signature::any(1, Volatility::Immutable),
+        }
+    }
+}
+
+pub fn unnested_udf() -> ScalarUDF {
+    ScalarUDF::new_from_impl(Unnested::default())
+}
+
+impl ScalarUDFImpl for Unnested {
+    fn name(&self) -> &str {
+        UNNESTED
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        Ok(arg_types[0].clone())
+    }
+
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
+        Ok(Arc::new(
+            args.arg_fields[0]
+                .as_ref()
+                .clone()
+                .with_name(UNNESTED)
+                .with_nullable(false),
+        ))
+    }
+
+    fn invoke_with_args(&self, mut args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let value = args.args.remove(0);
+        let nulls = match &value {
+            ColumnarValue::Array(a) => a.null_count(),
+            ColumnarValue::Scalar(s) => usize::from(s.is_null()),
+        };
+        if nulls > 0 {
+            return internal_err!("{UNNESTED}: {nulls} NULL rows out of the binary operator");
+        }
+        Ok(value)
+    }
 }
 
 /// The operator as a plan carries it: its PromQL spelling, with the
