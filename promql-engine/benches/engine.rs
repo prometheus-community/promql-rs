@@ -268,6 +268,12 @@ fn register_elementwise<'a>(mut suite: Suite<'a>) -> Suite<'a> {
             "label_replace_rate_5m",
             r#"label_replace(rate(http_requests_total[5m]), "metric", "$1", "__name__", "(.+)")"#,
         ),
+        // Writing the name where `code` matches: a mark per row, and the
+        // cleanup drops the name only where the regex missed.
+        (
+            "label_replace_name_rate_5m",
+            r#"label_replace(rate(http_requests_total[5m]), "__name__", "errors", "code", "5.+")"#,
+        ),
     ] {
         suite = suite.bench(
             format!("EngineElementwise/query={qname}/shape={}", shape.id()),
@@ -306,6 +312,15 @@ fn register_binary<'a>(mut suite: Suite<'a>) -> Suite<'a> {
         (
             "or",
             "http_requests_total or on(route) sum by (route) (http_requests_total)",
+        ),
+        // Sides whose marks differ: a mark per row, and a group mark.
+        (
+            "or_marked",
+            "http_requests_total or on(route) rate(http_requests_total[5m])",
+        ),
+        (
+            "sum_by_name_or_marked",
+            "sum by (__name__) (http_requests_total{code=\"500\"} or rate(http_requests_total{code=\"200\"}[5m]))",
         ),
         (
             "fill",
@@ -392,6 +407,30 @@ fn register_plan<'a>(mut suite: Suite<'a>) -> Suite<'a> {
             },
         );
     }
+    // A rewrite over a marking call plans the mark too.
+    let idx = 2usize;
+    let shape = SHAPES[idx];
+    let end = shape.end_ms();
+    let range = RangeQuery::new(end - HOUR_MS, end, STEP_MS);
+    suite = suite.bench(
+        format!(
+            "EnginePlan/query=label_replace_rate_5m/range=range_1h/shape={}",
+            shape.id()
+        ),
+        move |b| {
+            let engine = async_engine();
+            let rt = current_thread_rt();
+            let source = shared_source(idx);
+            let q = r#"label_replace(rate(http_requests_total[5m]), "metric", "$1", "__name__", "(.+)")"#;
+            b.report_allocs();
+            while b.keep_running() {
+                black_box(
+                    rt.block_on(engine.plan_async(source.as_ref(), black_box(q), &range))
+                        .unwrap(),
+                );
+            }
+        },
+    );
     suite
 }
 
