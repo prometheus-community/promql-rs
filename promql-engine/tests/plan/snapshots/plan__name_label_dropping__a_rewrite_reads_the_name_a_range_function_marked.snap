@@ -1,0 +1,11 @@
+---
+source: promql-engine/tests/plan/name_label_dropping.rs
+expression: "label_replace(rate(http_requests_total[5m]), \"metric\", \"$1\", \"__name__\", \"(.+)\")"
+---
+Projection: promql_drop_name(cleanup_1.labels, Boolean(true))
+  SubqueryAlias: cleanup_1
+    Projection: labels{__name__, job, metric: promql_label_replace(get_field(label_replace_0.labels, Utf8("__name__")), Utf8(""), Utf8("^(?s:(.+))$"), Utf8("$1"))}
+      SubqueryAlias: label_replace_0
+        Projection: labels{__name__, job}
+          SeriesEval: rate(samples[5m], 600000..1200000 step 30s) per series per block
+            TableScan: http_requests_total

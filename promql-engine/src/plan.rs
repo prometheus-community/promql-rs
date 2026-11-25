@@ -51,6 +51,7 @@ use crate::absent;
 use crate::aggregate::{self, Op};
 use crate::binary;
 use crate::buffer::Kernel;
+use crate::drop_name::{self, Reads, DROP_NAME};
 use crate::elementwise;
 use crate::error::EngineError;
 use crate::labels;
@@ -67,6 +68,28 @@ use crate::source::{Grouping, SelectHints, SelectorTable, SeriesSource};
 use crate::to_scalar;
 use crate::value_type::{value_type, ValueType};
 use crate::{scalar, series};
+
+const CLEANUP_STAGE: &str = "cleanup";
+
+/// Whether the result order is the root sort's, read through the cleanup
+/// [`Planner::cleanup`] stacks over it.
+pub(crate) fn result_is_sorted(plan: &LogicalPlan) -> bool {
+    let below_cleanup = match plan {
+        LogicalPlan::Projection(projection) => match projection.input.as_ref() {
+            LogicalPlan::SubqueryAlias(alias)
+                if alias
+                    .alias
+                    .table()
+                    .starts_with(&format!("{CLEANUP_STAGE}_")) =>
+            {
+                alias.input.as_ref()
+            }
+            _ => plan,
+        },
+        _ => plan,
+    };
+    matches!(below_cleanup, LogicalPlan::Sort(_))
+}
 
 /// The range a query is evaluated over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,14 +224,21 @@ async fn plan_grid(
         state,
         source,
         query,
+        root: unwrap_arg(expr),
         selectors: 0,
         stages: 0,
     };
     let planned = match range_selector(expr) {
         Some(ms) => planner.matrix(ms).await?,
-        None => planner.expr(expr, Above::default()).await?,
+        None => {
+            let above = Above {
+                reads: Some(Reads::default()),
+                ..Above::default()
+            };
+            planner.expr(expr, above).await?
+        }
     };
-    Ok(planned.plan)
+    planner.cleanup(planned)
 }
 
 /// The parse-time rules upstream holds an expression to before any of
@@ -439,12 +469,17 @@ fn grid_of(query: &RangeQuery) -> Params {
 struct Planned {
     plan: LogicalPlan,
     label_names: Vec<String>,
+    /// Every row is upstream's `DropName: true`, without a [`DROP_NAME`]
+    /// label to say so.
+    marked: bool,
 }
 
 struct Planner<'a> {
     state: &'a dyn Session,
     source: &'a dyn SeriesSource,
     query: &'a RangeQuery,
+    /// The whole query, parentheses unwrapped.
+    root: &'a Expr,
     /// Selectors seen so far; each becomes its own table `selector_N`.
     selectors: usize,
     /// Named nodes built so far — a folded table, an operator's alias.
@@ -465,9 +500,30 @@ struct Above<'a> {
     /// `func` stays the node nearest the selector, so under `rate` the
     /// store hears `func=rate` with the `by` of the `sum` above it.
     grouping: Option<&'a Grouping>,
+    /// What the operators above read of a name-dropping call's metadata,
+    /// carried as far as `grouping` is, plus through vector operators.
+    reads: Option<Reads>,
 }
 
 impl Planner<'_> {
+    fn is_root_call(&self, call: &Call) -> bool {
+        matches!(self.root, Expr::Call(root) if std::ptr::eq(root, call))
+    }
+
+    /// Upstream's `cleanupMetricLabels`, run once over the result. Above a
+    /// root sort, as upstream sorts on the names it has not dropped yet;
+    /// [`result_is_sorted`] looks through it.
+    fn cleanup(&mut self, planned: Planned) -> Result<LogicalPlan, EngineError> {
+        if !planned.marked && !drop_name::has_mark(&planned.label_names) {
+            return Ok(planned.plan);
+        }
+        let stage = self.stage(CLEANUP_STAGE);
+        Ok(LogicalPlanBuilder::from(planned.plan)
+            .alias(stage)?
+            .project(canonical(drop_name::cleanup(planned.marked).alias(LABELS)))?
+            .build()?)
+    }
+
     /// A name nothing else in this plan has, for a node the planner
     /// invents rather than one the store named.
     fn stage(&mut self, what: &str) -> String {
@@ -525,7 +581,7 @@ impl Planner<'_> {
                 Expr::Paren(p) => self.expr(&p.expr, above).await,
                 Expr::Aggregate(a) => self.aggregate(a).await,
                 Expr::Call(c) => self.call(c, above).await,
-                Expr::Binary(b) => self.binary(expr, b).await,
+                Expr::Binary(b) => self.binary(expr, b, above.reads).await,
                 Expr::Unary(u) => self.unary(expr, u, above).await,
                 // A number is a scalar, and a scalar is one unlabelled
                 // series over the grid, as `time()` is. A sign over a
@@ -533,6 +589,7 @@ impl Planner<'_> {
                 Expr::NumberLiteral(_) => Ok(Planned {
                     plan: self.scalar_series(|ts| scalar::fold(expr, ts))?,
                     label_names: Vec::new(),
+                    marked: false,
                 }),
                 other => Err(EngineError::Unsupported(describe(other))),
             }
@@ -611,18 +668,20 @@ impl Planner<'_> {
         let eval =
             SeriesEval::try_new(builder.build()?, Kernel::Selector(pick), params)?.into_plan();
         let builder = LogicalPlanBuilder::from(eval);
-        let (labels_expr, label_names) = match pick {
-            selector::Pick::Value => (col(LABELS), label_names),
-            // `funcTimestamp` emits with `DropName`. Above the grouping,
-            // as the range functions drop it: below, two series differing
-            // only in their name would fold into one group.
+        let (labels_expr, label_names, marked) = match pick {
+            selector::Pick::Value => (col(LABELS), label_names, false),
+            // `funcTimestamp` emits with `DropName`.
             selector::Pick::Timestamp => {
-                let (expr, names) = labels::keep(&label_names, |n| n != METRIC_NAME);
-                (expr.alias(LABELS), names)
+                let (expr, names, marked) = drop_name::mark(&label_names, above.reads);
+                (expr.alias(LABELS), names, marked)
             }
         };
         let plan = builder.project(canonical(labels_expr))?.build()?;
-        Ok(Planned { plan, label_names })
+        Ok(Planned {
+            plan,
+            label_names,
+            marked,
+        })
     }
 
     /// `timestamp(v)`, which upstream evaluates two ways (the `Call` arm
@@ -639,7 +698,7 @@ impl Planner<'_> {
                     vs,
                     Above {
                         func: Some("timestamp"),
-                        grouping: above.grouping,
+                        ..above
                     },
                     selector::Pick::Timestamp,
                 )
@@ -665,6 +724,7 @@ impl Planner<'_> {
             return Ok(Planned {
                 plan: self.scalar_series(|ts| scalar::fold(&call.args[0], ts))?,
                 label_names: Vec::new(),
+                marked: false,
             });
         }
         if name == "absent" {
@@ -673,13 +733,22 @@ impl Planner<'_> {
             let above = Above {
                 func: Some(name),
                 grouping: None,
+                reads: Some(Reads::default()),
             };
             let input = self.expr(&call.args[0], above).await?;
             return self.absent(&call.args[0], input);
         }
         if name == "absent_over_time" {
             let input = self
-                .range_over(call, RangeOp::Func(Func::PresentOverTime), name, None)
+                .range_over(
+                    call,
+                    RangeOp::Func(Func::PresentOverTime),
+                    name,
+                    Above {
+                        reads: Some(Reads::default()),
+                        ..Above::default()
+                    },
+                )
                 .await?;
             return self.absent(&call.args[0], input);
         }
@@ -695,6 +764,7 @@ impl Planner<'_> {
             return Ok(Planned {
                 plan: self.scalar_series(|ts| scalar::call(call, ts))?,
                 label_names: Vec::new(),
+                marked: false,
             });
         }
         if name == "timestamp" {
@@ -727,7 +797,7 @@ impl Planner<'_> {
                 arg,
                 Above {
                     func: Some("scalar"),
-                    grouping: None,
+                    ..Above::default()
                 },
             )
             .await?;
@@ -750,6 +820,7 @@ impl Planner<'_> {
         Ok(Planned {
             plan,
             label_names: Vec::new(),
+            marked: false,
         })
     }
 
@@ -781,7 +852,11 @@ impl Planner<'_> {
             )?
             .project(whole_grid(labels_expr.alias(LABELS), col(SAMPLES)))?
             .build()?;
-        Ok(Planned { plan, label_names })
+        Ok(Planned {
+            plan,
+            label_names,
+            marked: false,
+        })
     }
 
     /// A function applied to one sample at a time: `abs(x)` and its
@@ -806,7 +881,7 @@ impl Planner<'_> {
                     vector,
                     Above {
                         func: Some(func.as_str()),
-                        grouping: above.grouping,
+                        ..above
                     },
                 )
                 .await?
@@ -820,11 +895,15 @@ impl Planner<'_> {
             None => Planned {
                 plan: self.scalar_series(|ts| Ok(scalar::time(ts)))?,
                 label_names: Vec::new(),
+                marked: false,
             },
         };
-        let (labels_expr, label_names) = labels::keep(&input.label_names, |n| {
-            !func.drops_metric_name() || n != METRIC_NAME
-        });
+        let (labels_expr, label_names, marked) = drop_name::mark_if(
+            func.drops_metric_name(),
+            &input.label_names,
+            input.marked,
+            above.reads,
+        );
         // A name of its own for what this function reads. Without it the
         // projection below can be merged into the one under it, and the
         // merged node would hold both the input's qualified `labels` and
@@ -846,7 +925,11 @@ impl Planner<'_> {
                 col(BLOCK_END),
             ])?
             .build()?;
-        Ok(Planned { plan, label_names })
+        Ok(Planned {
+            plan,
+            label_names,
+            marked,
+        })
     }
 
     /// `label_replace` and `label_join`: upstream's `evalLabelReplace`
@@ -904,11 +987,24 @@ impl Planner<'_> {
                 &call.args[0],
                 Above {
                     func: Some(name),
-                    grouping: None,
+                    ..Above::default()
                 },
             )
             .await?;
         let read = |label: &str| labels::field(&input.label_names, label);
+        // Writing `__name__` keeps it: `DropName = false`, but for
+        // `label_replace` only on the rows its regex matched.
+        let rewrites_mark =
+            dst == METRIC_NAME && (input.marked || drop_name::has_mark(&input.label_names));
+        let mark_value = match (&value, rewrites_mark) {
+            (Value::Replace { src, regex, .. }, true) => Some(relabel::call(
+                read(src),
+                drop_name::value(&input.label_names, input.marked),
+                regex.clone(),
+                "",
+            )),
+            _ => None,
+        };
         let dst_value = match value {
             Value::Replace {
                 replacement,
@@ -925,16 +1021,23 @@ impl Planner<'_> {
         };
         let mut label_names = input.label_names.clone();
         label_names.push(dst.to_string());
+        if rewrites_mark {
+            label_names.retain(|n| n != DROP_NAME);
+        }
+        if mark_value.is_some() {
+            label_names.push(DROP_NAME.to_string());
+        }
         label_names.sort();
         label_names.dedup();
+        let marked = input.marked && !rewrites_mark;
         let labels_expr = labels::call(
             label_names
                 .iter()
                 .map(|label| {
-                    let value = if label == dst {
-                        dst_value.clone()
-                    } else {
-                        read(label)
+                    let value = match (label.as_str(), &mark_value) {
+                        (name, _) if name == dst => dst_value.clone(),
+                        (DROP_NAME, Some(mark)) => mark.clone(),
+                        (name, _) => read(name),
                     };
                     (label.clone(), value)
                 })
@@ -953,7 +1056,11 @@ impl Planner<'_> {
                 col(BLOCK_END),
             ])?
             .build()?;
-        Ok(Planned { plan, label_names })
+        Ok(Planned {
+            plan,
+            label_names,
+            marked,
+        })
     }
 
     /// `-x` and `+x`: upstream's `UnaryExpr` arm of `eval`
@@ -973,13 +1080,14 @@ impl Planner<'_> {
             return Ok(Planned {
                 plan: self.scalar_series(|ts| scalar::fold(expr, ts))?,
                 label_names: Vec::new(),
+                marked: false,
             });
         }
         match u.op {
             ItemType::Add => self.expr(&u.expr, above).await,
             ItemType::Sub => {
                 let input = self.expr(&u.expr, above).await?;
-                self.negate(input)
+                self.negate(input, above.reads)
             }
             op => Err(EngineError::Unsupported(format!("the unary {op} operator"))),
         }
@@ -987,9 +1095,9 @@ impl Planner<'_> {
 
     /// `elementwise`'s projection with [`elementwise::Func::Neg`] and no
     /// arguments, over an already planned vector.
-    fn negate(&mut self, input: Planned) -> Result<Planned, EngineError> {
+    fn negate(&mut self, input: Planned, reads: Option<Reads>) -> Result<Planned, EngineError> {
         let func = elementwise::Func::Neg;
-        let (labels_expr, label_names) = labels::keep(&input.label_names, |n| n != METRIC_NAME);
+        let (labels_expr, label_names, marked) = drop_name::mark(&input.label_names, reads);
         // Named for the reason `elementwise` names its stage.
         let stage = self.stage(func.as_str());
         let plan = LogicalPlanBuilder::from(input.plan)
@@ -1001,31 +1109,42 @@ impl Planner<'_> {
                 col(BLOCK_END),
             ])?
             .build()?;
-        Ok(Planned { plan, label_names })
+        Ok(Planned {
+            plan,
+            label_names,
+            marked,
+        })
     }
 
     /// One binary operator, sent to the shape its operand types call
     /// for. `expr` is `b` again, for the scalar fold that needs the
     /// whole node.
-    async fn binary(&mut self, expr: &Expr, b: &BinaryExpr) -> Result<Planned, EngineError> {
+    async fn binary(
+        &mut self,
+        expr: &Expr,
+        b: &BinaryExpr,
+        reads: Option<Reads>,
+    ) -> Result<Planned, EngineError> {
         let (op, return_bool, matching) = binary_op(b)?;
         match (value_type(&b.lhs), value_type(&b.rhs)) {
             (ValueType::Vector, ValueType::Scalar) => {
-                self.vector_scalar(&b.lhs, &b.rhs, op, return_bool, false)
+                self.vector_scalar(&b.lhs, &b.rhs, op, return_bool, false, reads)
                     .await
             }
             (ValueType::Scalar, ValueType::Vector) => {
-                self.vector_scalar(&b.rhs, &b.lhs, op, return_bool, true)
+                self.vector_scalar(&b.rhs, &b.lhs, op, return_bool, true, reads)
                     .await
             }
             (ValueType::Vector, ValueType::Vector) => {
-                self.vector_vector(b, op, return_bool, matching).await
+                self.vector_vector(b, op, return_bool, matching, reads)
+                    .await
             }
             // Two scalars are a value per step and nothing else, which
             // is the table [`Planner::scalar_series`] already builds.
             _ => Ok(Planned {
                 plan: self.scalar_series(|ts| scalar::fold(expr, ts))?,
                 label_names: Vec::new(),
+                marked: false,
             }),
         }
     }
@@ -1042,19 +1161,28 @@ impl Planner<'_> {
         op: binary::Op,
         return_bool: bool,
         swap: bool,
+        reads: Option<Reads>,
     ) -> Result<Planned, EngineError> {
         let what = format!("the {} operator", op.as_str());
         let value = self.constant(scalar, &what)?;
-        let input = self.expr(vector, Above::default()).await?;
+        let above = Above {
+            reads,
+            ..Above::default()
+        };
+        let input = self.expr(vector, above).await?;
         // Rebuilt even when every label survives. Passing `col(LABELS)`
         // through keeps the input's own qualifier on the output field,
         // so the stage answers with `binary_0.labels` where every other
         // stage answers with `labels`; the next operator up then unions
         // two branches that disagree about the name and DataFusion
         // calls it ambiguous. A computed struct is unqualified.
-        let (labels_expr, label_names) = labels::keep(&input.label_names, |n| {
-            !op.drops_metric_name(return_bool) || n != METRIC_NAME
-        });
+        // `VectorscalarBinop` marks rather than drops, unlike `VectorBinop`.
+        let (labels_expr, label_names, marked) = drop_name::mark_if(
+            op.drops_metric_name(return_bool),
+            &input.label_names,
+            input.marked,
+            reads,
+        );
         // The scalar goes in the slot that says which side it was on;
         // see `elementwise::Func::bind`.
         let (a, b) = if swap {
@@ -1079,7 +1207,11 @@ impl Planner<'_> {
                 col(BLOCK_END),
             ])?
             .build()?;
-        Ok(Planned { plan, label_names })
+        Ok(Planned {
+            plan,
+            label_names,
+            marked,
+        })
     }
 
     /// Two vectors, matched on the signature the modifiers name.
@@ -1094,9 +1226,35 @@ impl Planner<'_> {
         op: binary::Op,
         return_bool: bool,
         matching: binary::Matching,
+        reads: Option<Reads>,
     ) -> Result<Planned, EngineError> {
-        let lhs = self.expr(&b.lhs, Above::default()).await?;
-        let rhs = self.expr(&b.rhs, Above::default()).await?;
+        // Arithmetic drops the operands' metadata itself
+        // (`changesMetricSchema`), so it reads only what it matches on.
+        // A set operator hands rows back as they came, so what is read
+        // above reads its operands too; `and` and `unless` hand back none
+        // of the right-hand side's. A comparison keeps its operands' marks
+        // (`DropName: returnBool`), so the result reads all of them.
+        let signature = Reads::kept_by(&matching.labels, matching.on);
+        let (lhs_reads, rhs_reads) = match op {
+            binary::Op::Or => (
+                reads.map(|r| r.or(signature)),
+                reads.map(|r| r.or(signature)),
+            ),
+            binary::Op::And | binary::Op::Unless => {
+                (reads.map(|r| r.or(signature)), Some(signature))
+            }
+            op if op.changes_metric_schema() => {
+                let read = Some(signature.or(Reads::named(&matching.include)));
+                (read, read)
+            }
+            _ => (None, None),
+        };
+        let side = |reads| Above {
+            reads,
+            ..Above::default()
+        };
+        let lhs = self.expr(&b.lhs, side(lhs_reads)).await?;
+        let rhs = self.expr(&b.rhs, side(rhs_reads)).await?;
         // The `on` labels join the schema even where neither side
         // carries them: a label both sides lack is the empty string on
         // both, which is a match, and the grouping needs a column to
@@ -1108,6 +1266,18 @@ impl Planner<'_> {
             .chain(matching.labels.iter().filter(|_| matching.on))
             .cloned()
             .collect();
+        // A set operator hands back each side's rows with their own
+        // `DropName`, so sides that differ need it per row. Any other
+        // operator answers `DropName: returnBool` for every row.
+        let (marked, per_row) = match op.is_set() {
+            true if lhs.marked == rhs.marked && !drop_name::has_mark(&names) => (lhs.marked, false),
+            true => (false, drop_name::has_metadata(&names)),
+            false => (return_bool && drop_name::has_metadata(&names), false),
+        };
+        names.retain(|n| n != DROP_NAME);
+        if per_row {
+            names.push(DROP_NAME.to_string());
+        }
         names.sort();
         names.dedup();
 
@@ -1117,7 +1287,7 @@ impl Planner<'_> {
             true => matching.labels.clone(),
             false => names
                 .iter()
-                .filter(|n| *n != METRIC_NAME && !matching.labels.contains(n))
+                .filter(|n| *n != METRIC_NAME && *n != DROP_NAME && !matching.labels.contains(n))
                 .cloned()
                 .collect(),
         };
@@ -1160,6 +1330,7 @@ impl Planner<'_> {
         Ok(Planned {
             plan,
             label_names: names,
+            marked,
         })
     }
 
@@ -1175,7 +1346,7 @@ impl Planner<'_> {
         Ok(LogicalPlanBuilder::from(operand.plan)
             .alias(stage)?
             .project(vec![
-                labels::widen(&operand.label_names, names).alias(LABELS),
+                labels::widen(&operand.label_names, names, operand.marked).alias(LABELS),
                 col(SAMPLES),
                 lit(is_rhs).alias(binary::SIDE),
             ])?
@@ -1237,11 +1408,15 @@ impl Planner<'_> {
                 vector,
                 Above {
                     func: Some(name),
-                    grouping: None,
+                    ..Above::default()
                 },
             )
             .await?;
-        if self.query.start_ms != self.query.end_ms {
+        // Only the root sort orders the result (`result_is_sorted`); a nested
+        // one would only add a node DataFusion's `push_down_leaf_projections`
+        // fails over when a label read above it was added below it.
+        let is_root = self.is_root_call(call);
+        if self.query.start_ms != self.query.end_ms || !is_root {
             return Ok(input);
         }
         let keys = sort::exprs(func, &labels, &input.label_names);
@@ -1249,6 +1424,7 @@ impl Planner<'_> {
         Ok(Planned {
             plan,
             label_names: input.label_names,
+            marked: input.marked,
         })
     }
 
@@ -1273,12 +1449,12 @@ impl Planner<'_> {
             // of silently projecting with the first step's horizon.
             let seconds = self.constant(&call.args[1], "the predict_linear function")?;
             return self
-                .range_over(call, RangeOp::predict_linear(seconds), name, above.grouping)
+                .range_over(call, RangeOp::predict_linear(seconds), name, above)
                 .await;
         }
         let func = Func::parse(name)
             .ok_or_else(|| EngineError::Unsupported(format!("the {name} function")))?;
-        self.range_over(call, RangeOp::Func(func), name, above.grouping)
+        self.range_over(call, RangeOp::Func(func), name, above)
             .await
     }
 
@@ -1292,7 +1468,7 @@ impl Planner<'_> {
         call: &Call,
         op: RangeOp,
         name: &str,
-        grouping: Option<&Grouping>,
+        above: Above<'_>,
     ) -> Result<Planned, EngineError> {
         let (ms, vs) = match (call.args.as_slice(), &op) {
             // `check_call` has fixed the arity before planning. Keeping the
@@ -1358,26 +1534,29 @@ impl Planner<'_> {
             Some(params.window_ms),
             Above {
                 func: Some(name),
-                grouping,
+                ..above
             },
         );
         let (builder, input_names) = self.scan(vs, hints).await?;
         let drops_metric_name = op.drops_metric_name();
         let eval = SeriesEval::try_new(builder.build()?, Kernel::Range(op), params)?.into_plan();
         let builder = LogicalPlanBuilder::from(eval);
-        // `__name__` is dropped above the grouping, not below it: below, two
-        // series differing only in their name would fold into one group.
         if !drops_metric_name {
             return Ok(Planned {
                 plan: builder.project(canonical(col(LABELS)))?.build()?,
                 label_names: input_names,
+                marked: false,
             });
         }
-        let (labels_expr, label_names) = labels::keep(&input_names, |n| n != METRIC_NAME);
+        let (labels_expr, label_names, marked) = drop_name::mark(&input_names, above.reads);
         let plan = builder
             .project(canonical(labels_expr.alias(LABELS)))?
             .build()?;
-        Ok(Planned { plan, label_names })
+        Ok(Planned {
+            plan,
+            label_names,
+            marked,
+        })
     }
 
     /// A range selector as the whole of an instant query: upstream's
@@ -1430,7 +1609,11 @@ impl Planner<'_> {
                 col(BLOCK_END),
             ])?
             .build()?;
-        Ok(Planned { plan, label_names })
+        Ok(Planned {
+            plan,
+            label_names,
+            marked: false,
+        })
     }
 
     async fn aggregate(&mut self, agg: &AggregateExpr) -> Result<Planned, EngineError> {
@@ -1455,6 +1638,9 @@ impl Planner<'_> {
                 Above {
                     func: Some(op.as_str()),
                     grouping: grouping.as_ref(),
+                    // Every aggregation planned here answers with its group
+                    // labels only.
+                    reads: Some(Reads::kept_by(&agg.grouping, !agg.without)),
                 },
             )
             .await?;
@@ -1464,23 +1650,31 @@ impl Planner<'_> {
         // and leaves when the block does.
         let mut group = vec![col(BLOCK_START), col(BLOCK_END)];
         group.extend(labels::group_exprs(&keys));
+        let mut aggregates = vec![aggregate::call(
+            col(SAMPLES),
+            op,
+            self.query.start_ms,
+            self.query.end_ms,
+            self.query.step_ms,
+        )
+        .alias(SAMPLES)];
+        // A group keeps a metadata label only if `by` names it; then the
+        // group is marked if any member was.
+        let keeps_metadata = drop_name::has_metadata(&keys);
+        let marked = keeps_metadata && input.marked;
+        let mut label_names = keys;
+        if keeps_metadata && drop_name::has_mark(&input.label_names) {
+            aggregates.push(drop_name::any_marked().alias(labels::group_alias(DROP_NAME)));
+            label_names = drop_name::with_mark(&label_names);
+        }
         let plan = LogicalPlanBuilder::from(input.plan)
-            .aggregate(
-                group,
-                vec![aggregate::call(
-                    col(SAMPLES),
-                    op,
-                    self.query.start_ms,
-                    self.query.end_ms,
-                    self.query.step_ms,
-                )
-                .alias(SAMPLES)],
-            )?
-            .project(canonical(labels::regroup(&keys).alias(LABELS)))?
+            .aggregate(group, aggregates)?
+            .project(canonical(labels::regroup(&label_names).alias(LABELS)))?
             .build()?;
         Ok(Planned {
             plan,
-            label_names: keys,
+            label_names,
+            marked,
         })
     }
 }

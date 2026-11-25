@@ -29,6 +29,7 @@ use datafusion::logical_expr::{
     Signature, TypeSignature, Volatility,
 };
 
+use crate::drop_name::{self, DROP_NAME};
 use crate::matcher::METRIC_NAME;
 use crate::series::{self, LABELS};
 
@@ -194,6 +195,8 @@ pub fn group_keys(input: &[String], grouping: &[String], without: bool) -> Vec<S
             .cloned()
             .collect()
     };
+    // The mark is not a label to group on; the aggregation carries it.
+    keys.retain(|n| n != DROP_NAME);
     keys.sort();
     keys.dedup();
     keys
@@ -255,8 +258,16 @@ pub fn regroup(keys: &[String]) -> Expr {
 /// the match groups. A name one side never carried is `""`, which is
 /// how the shape spells absent — so a series without it matches one
 /// whose value is empty, exactly as two label sets compare upstream.
-pub fn widen(input: &[String], names: &[String]) -> Expr {
-    call(names.iter().map(|n| (n.clone(), field(input, n))).collect())
+pub fn widen(input: &[String], names: &[String], marked: bool) -> Expr {
+    call(
+        names
+            .iter()
+            .map(|n| match n.as_str() {
+                DROP_NAME => (n.clone(), drop_name::value(input, marked)),
+                _ => (n.clone(), field(input, n)),
+            })
+            .collect(),
+    )
 }
 
 /// Label `name` of the `labels` column, or `""` where `input` does not

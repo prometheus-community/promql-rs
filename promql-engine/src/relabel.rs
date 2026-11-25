@@ -120,6 +120,17 @@ impl ScalarUDFImpl for LabelReplace {
         let (src, dst) = (src.as_string_view(), dst.as_string_view());
         let mut out = StringViewBuilder::with_capacity(rows);
         let mut expanded = String::new();
+        // A replacement with no `$` reads no group, so a match test does:
+        // the drop-name mark is one, and `captures` costs far more.
+        if !self.replacement.contains('$') {
+            for row in 0..rows {
+                match self.regex.is_match(src.value(row)) {
+                    true => out.append_value(&self.replacement),
+                    false => out.append_value(dst.value(row)),
+                }
+            }
+            return Ok(ColumnarValue::Array(Arc::new(out.finish())));
+        }
         for row in 0..rows {
             match self.regex.captures(src.value(row)) {
                 Some(captures) => {

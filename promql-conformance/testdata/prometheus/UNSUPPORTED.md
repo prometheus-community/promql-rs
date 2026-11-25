@@ -8,7 +8,7 @@ PROMQL_PROMQLTEST_BLESS=1 cargo test -p promql-conformance --test promqltest
 
 Nothing here gates CI. This file is the roadmap, and the core line below is the target: it reads 100% when the engine passes every eval that is neither native histograms, subquery nor experimental syntax. An eval is flag-gated if a stock parser refuses its query at a feature gate, or by its file where the grammar has no productions to reach the gate with (`docs/feature-flags.md`, Conformance). An eval is native-histogram if an expected row is a native histogram sample or a selector in its query matches, by its label matchers, a series the active load blocks load with native histogram samples (`{{…}}`, or derived by `load_with_nhcb`). Each eval is in exactly one category, first match wins: flag-gated, native histograms, subquery, core. The category comes from the eval, never from whether it passes, so the denominators hold still.
 
-**Core: 728 of 871 evals pass (83.6%).**
+**Core: 751 of 871 evals pass (86.2%).**
 
 - Native histograms: 2 of 805 pass.
 - Subqueries: 0 of 65 pass.
@@ -18,15 +18,15 @@ Nothing here gates CI. This file is the roadmap, and the core line below is the 
   - `promql-extended-range-selectors`: 8 of 88
   - `promql-binop-fill-modifiers`: 44 of 44
 
-All but the flag-gated: **730 of 1741 evals pass** (41.9%).
+All but the flag-gated: **753 of 1741 evals pass** (43.3%).
 
 ## Core evals
 
 | | evals |
 |---|---:|
 | total | 871 |
-| passing | 728 |
-| not passing | 143 |
+| passing | 751 |
+| not passing | 120 |
 
 The not-passing ones are the missing features and the unattributed failures below. Fixing those is what takes the core to 100%.
 
@@ -37,8 +37,8 @@ Each failing core eval is filed under a missing feature the engine names, or lef
 | failing evals | reason |
 |---:|---|
 | 118 | missing features |
-| 25 | unattributed |
-| 143 | **total** |
+| 2 | unattributed |
+| 120 | **total** |
 
 ## Missing features
 
@@ -60,40 +60,12 @@ Core evals the engine does not name a missing feature for: wrong results, panics
 - `metric @ 100s @ 10000`
 - `metric @ 1m40s @ 10000`
 
-### name_label_dropping (8)
-
-- `label_replace(rate({env="1"}[10m]), "my_name", "rate_$1", "__name__", "(.+)") @ 600000`
-- `label_replace(rate({env="1"}[10m]), "__name__", "rate_$1", "__name__", "(.+)") @ 600000`
-- `label_join(rate({env="1"}[10m]), "my_name", "_", "__name__") @ 600000`
-- `label_join(rate({env="1"}[10m]), "__name__", "_", "__name__", "env") @ 600000`
-- `sum by (__name__) (rate({env="1"}[10m])) @ 600000`
-- `label_replace(sum by (__name__) (rate(metric_total{env="2"}[5m])), "__name__", "$1", "__name__", "(.+)") @ 600000`
-- `sum by (__name__) (metric_total{env="1"} or rate(metric_total{env="2"}[5m])) @ 600000`
-- `sum by (__name__) (rate(metric_total{env="2"}[5m]) or metric_total{env="1"}) @ 600000`
-
-### type_and_unit (15)
-
-- `-http_requests_total{job="api-server",instance="0",group="production"} @ 3000000`
-- `http_requests_total{group="canary", instance="0", job="api-server"} / 0 @ 3000000`
-- `0 * http_requests_total{group="canary", instance="0", job="api-server"} % 0 @ 3000000`
-- `rate(http_requests_total[25m]) * 25 * 60 @ 3000000`
-- `(http_requests_total{group="canary"} + 1) and http_requests_total{instance="0"} @ 3000000`
-- `(http_requests_total{group="canary"} + 1) or http_requests_total{instance="1"} @ 3000000`
-- `http_requests_total{group="canary"} / ignoring(group) http_requests_total{group="production"} @ 3000000`
-- `http_requests_total{job="api-server", instance="0", group="production"} == bool 100 @ 3000000`
-- `-http_requests_total{job="api-server",instance="0",group="production"} @ 3000000 #2`
-- `http_requests_total{group="canary", instance="0", job="api-server"} / 0 @ 3000000 #2`
-- `0 * http_requests_total{group="canary", instance="0", job="api-server"} % 0 @ 3000000 #2`
-- `rate(http_requests_total[25m]) * 25 * 60 @ 3000000 #2`
-- `(http_requests_total{group="canary"} + 1) and http_requests_total{instance="0"} @ 3000000 #2`
-- `(http_requests_total{group="canary"} + 1) or http_requests_total{instance="1"} @ 3000000 #2`
-- `http_requests_total{job="api-server", instance="0", group="production"} == bool 100 @ 3000000 #2`
-
 ## By file
 
 | file | evals | native histograms | subquery | flag-gated | passing | passing core | |
 |---|---:|---:|---:|---:|---:|---:|---|
 | operators | 213 | 72 | 0 | 0 | 143 (67%) | 141 of 141 (100%) | core green |
+| type_and_unit | 58 | 0 | 0 | 0 | 58 (100%) | 58 of 58 (100%) | core green |
 | selectors | 31 | 0 | 0 | 0 | 31 (100%) | 31 of 31 (100%) | core green |
 | extended_vectors | 30 | 0 | 0 | 88 | 30 (100%) | 30 of 30 (100%) | core green |
 | literals | 25 | 0 | 0 | 0 | 25 (100%) | 25 of 25 (100%) | core green |
@@ -106,9 +78,8 @@ Core evals the engine does not name a missing feature for: wrong results, panics
 | fill-modifier | 1 | 0 | 0 | 44 | 1 (100%) | 1 of 1 (100%) | core green |
 | functions | 350 | 99 | 5 | 63 | 238 (68%) | 238 of 246 (97%) |  |
 | at_modifier | 69 | 0 | 29 | 2 | 38 (55%) | 38 of 40 (95%) |  |
+| name_label_dropping | 29 | 0 | 1 | 1 | 26 (90%) | 26 of 28 (93%) |  |
 | aggregators | 158 | 35 | 0 | 2 | 93 (59%) | 93 of 123 (76%) |  |
-| type_and_unit | 58 | 0 | 0 | 0 | 43 (74%) | 43 of 58 (74%) |  |
-| name_label_dropping | 29 | 0 | 1 | 1 | 18 (62%) | 18 of 28 (64%) |  |
 | histograms | 167 | 84 | 0 | 18 | 8 (5%) | 8 of 83 (10%) |  |
 | native_histograms | 514 | 511 | 0 | 7 | 0 (0%) | 0 of 3 (0%) |  |
 | info | 0 | 0 | 0 | 42 | 0 (0%) | 0 of 0 (0%) | no core evals |
