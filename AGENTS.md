@@ -71,10 +71,13 @@ draft.
   and that moved beyond the five percent noise floor, each with its absolute before and
   after cost (`3.8ms → 4.9ms`). A move on a path the PR does not touch is machine noise
   until a rerun in alternating revision order reproduces it. When nothing moved, the
-  verdict is one line saying so. Below the verdict, put the raw `benchstat` output in one
-  collapsed `<details>` block, with links to the exact `before` and `after` commits it
-  measures. Rerun and update the links whenever review changes touch benchmarked code or
-  benchmarks. Review someone else's benchmark results the same way.
+  verdict is one line saying so. Below the verdict, put the raw `benchstat` output for the
+  cases it names and for the bench that covers each path the PR changes, filtered with
+  `benchstat -filter`, in one collapsed `<details>` block with links to the exact
+  `before` and `after` commits it measures. The full suites stay out of the PR; if the
+  block does not fit in one comment, the filter is too wide. Rerun and update the links
+  whenever review changes touch benchmarked code or benchmarks. Review someone else's
+  benchmark results the same way.
 - Address each actual regression or explain in the PR body why that case is not
   important.
 - Reuse allocations in hot paths where possible, such as `Vec::clear`, scratch buffers,

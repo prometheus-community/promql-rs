@@ -69,7 +69,8 @@ benchstat /tmp/before.txt /tmp/after.txt
 
 4. Repeat suspicious results in alternating revision order on an otherwise idle
    machine. Report the results as `AGENTS.md` describes: a verdict naming the
-   actual changes, with the raw `benchstat` output in a collapsed `<details>` block.
+   actual changes, with only the relevant rows of raw `benchstat` output in a
+   collapsed `<details>` block.
 
 ## Compare heap use
 
