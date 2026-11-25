@@ -1,7 +1,8 @@
 //! The engine: parse, plan, execute.
 //!
-//! Owns a DataFusion [`SessionContext`] with the PromQL functions
-//! registered. A DataFusion query is async end to end; callers that are
+//! Owns an immutable DataFusion [`SessionState`] and [`TaskContext`] with
+//! the PromQL functions registered. A DataFusion query is async end to end;
+//! callers that are
 //! not — the conformance harness runs plain closures — construct the
 //! engine with [`Engine::blocking`], which adds a Tokio runtime to block
 //! on. An engine built with [`Engine::new`] has none and is safe to hold
@@ -20,11 +21,12 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::error::DataFusionError;
-use datafusion::execution::SessionStateBuilder;
+use datafusion::execution::context::SessionState;
+use datafusion::execution::{SessionStateBuilder, TaskContext};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::execution_plan::reset_plan_states;
 use datafusion::physical_plan::{self, ExecutionPlan};
-use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::prelude::SessionConfig;
 
 use promql_parser::{Parser, ParserOptions};
 
@@ -69,7 +71,8 @@ pub enum InstantResult {
 }
 
 pub struct Engine {
-    ctx: SessionContext,
+    state: SessionState,
+    task_ctx: Arc<TaskContext>,
     rt: Option<tokio::runtime::Runtime>,
     options: EngineOptions,
 }
@@ -135,29 +138,40 @@ impl Engine {
         // shuffle. Upper aggregations may hash their completed series rows.
         // Byte-range scan splitting could cut through a source identity.
         let mut config = SessionConfig::new()
+            .with_create_default_catalog_and_schema(false)
+            .with_information_schema(false)
             .with_round_robin_repartition(false)
             .with_repartition_file_scans(false)
             .with_repartition_aggregations(true);
         // Do not rehash an already satisfied upper-aggregation distribution
         // merely to reach the session's target partition count.
         config.options_mut().optimizer.subset_repartition_threshold = 1;
+        // Register only the DataFusion helper UDFs and PromQL functions this
+        // planner emits instead of ~400 default SQL functions and file formats.
         let state = SessionStateBuilder::new()
-            .with_default_features()
             .with_config(config)
+            .with_scalar_functions(vec![
+                datafusion::functions::core::get_field(),
+                datafusion::functions::math::isnan(),
+                datafusion::functions_nested::extract::array_element_udf(),
+                Arc::new(labels::udf()),
+                Arc::new(elementwise::udf()),
+                Arc::new(matrix::udf()),
+                Arc::new(sort::Natural::udf()),
+                Arc::new(sort::Set::udf()),
+            ])
+            .with_aggregate_functions(vec![
+                Arc::new(aggregate::udaf()),
+                Arc::new(absent::udaf()),
+                Arc::new(to_scalar::udaf()),
+                Arc::new(binary::udaf()),
+            ])
             .with_query_planner(Arc::new(crate::series_eval::SeriesEvalQueryPlanner))
             .build();
-        let ctx = SessionContext::new_with_state(state);
-        ctx.register_udf(labels::udf());
-        ctx.register_udaf(aggregate::udaf());
-        ctx.register_udaf(absent::udaf());
-        ctx.register_udaf(to_scalar::udaf());
-        ctx.register_udf(elementwise::udf());
-        ctx.register_udf(matrix::udf());
-        ctx.register_udaf(binary::udaf());
-        ctx.register_udf(sort::Natural::udf());
-        ctx.register_udf(sort::Set::udf());
+        let task_ctx = state.task_ctx();
         Self {
-            ctx,
+            state,
+            task_ctx,
             rt: None,
             options,
         }
@@ -194,7 +208,7 @@ impl Engine {
         range: &RangeQuery,
     ) -> Result<LogicalPlan, EngineError> {
         let expr = self.parse(query)?;
-        crate::plan::plan(&self.ctx.state(), source, &expr, range).await
+        crate::plan::plan(&self.state, source, &expr, range).await
     }
 
     /// Plan an instant query without running it, for inspection. Like
@@ -206,7 +220,7 @@ impl Engine {
         at_ms: i64,
     ) -> Result<LogicalPlan, EngineError> {
         let expr = self.parse(query)?;
-        crate::plan::plan_instant(&self.ctx.state(), source, &expr, at_ms).await
+        crate::plan::plan_instant(&self.state, source, &expr, at_ms).await
     }
 
     fn parse(&self, query: &str) -> Result<promql_parser::ast::Expr, EngineError> {
@@ -250,13 +264,7 @@ impl Engine {
     }
 
     async fn lower(&self, plan: LogicalPlan) -> Result<Arc<dyn ExecutionPlan>, EngineError> {
-        let exec = self
-            .ctx
-            .execute_logical_plan(plan)
-            .await?
-            .create_physical_plan()
-            .await?;
-        Ok(exec)
+        Ok(self.state.create_physical_plan(&plan).await?)
     }
 
     /// Evaluate a range query. Batches are in the canonical schema
@@ -297,7 +305,7 @@ impl Engine {
         if let Some(s) = crate::plan::string_literal(&expr) {
             return Ok(InstantResult::String(s.to_owned()));
         }
-        let plan = crate::plan::plan_instant(&self.ctx.state(), source, &expr, at_ms).await?;
+        let plan = crate::plan::plan_instant(&self.state, source, &expr, at_ms).await?;
         let prepared = self.prepare_plan(plan).await?;
         let batches = self.execute_async(&prepared).await?;
         match value_type(&expr) {
@@ -354,7 +362,7 @@ impl Engine {
         // miss cancellation and let concurrent executions share exchange state.
         // SeriesSetExec::reset_state also resets its protected source subtree.
         let exec = reset_plan_states(Arc::clone(prepared.physical_plan())).map_err(lift)?;
-        let batches = physical_plan::collect(exec, self.ctx.task_ctx())
+        let batches = physical_plan::collect(exec, Arc::clone(&self.task_ctx))
             .await
             .map_err(lift)?;
         labelset::finalize(&batches, prepared.result_order == ResultOrder::Preserve)
@@ -591,5 +599,15 @@ mod tests {
                 assert_eq!(rows(&actual), rows(&expected), "{query}, {range:?}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn minimal_session_state_registers_only_promql_and_helper_functions() {
+        let engine = Engine::new();
+        // 8 scalar UDFs, with array_element also registering its 3 SQL aliases.
+        assert_eq!(engine.state.scalar_functions().len(), 11);
+        assert_eq!(engine.state.aggregate_functions().len(), 4);
+        assert!(engine.state.window_functions().is_empty());
+        assert!(engine.state.table_functions().is_empty());
     }
 }
