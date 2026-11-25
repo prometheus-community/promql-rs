@@ -65,12 +65,18 @@ draft.
 - Performance improvements and hot-path changes require running benchmarks before and
   after the change, for example `cargo bench -p promql-engine --bench engine -- -bench '^BenchmarkEngine' -benchtime 1s -count 6 -cpu 2 -benchmem | tee ${bench}.txt`,
   and comparing with `benchstat before.txt after.txt`.
-- Always output benchmark results in raw `benchstat` format in the PR body and review
-  comments, and always include links to the exact `before` and `after` commits that the
-  benchmark refers to. Rerun benchmarks and update the commit links whenever addressing
-  review comments that touch benchmarked code or benchmarks.
-- If a subset of benchmark results shows a regression, address it or explain in the PR
-  body why that case is not important.
+- Report benchmark results as a short verdict on the PR's own change, with the raw data
+  collapsed beneath it. Read the `benchstat` output first and name only the actual
+  changes: cases on a path the PR touches that `benchstat` marks significant (not `~`)
+  and that moved beyond the five percent noise floor, each with its absolute before and
+  after cost (`3.8ms → 4.9ms`). A move on a path the PR does not touch is machine noise
+  until a rerun in alternating revision order reproduces it. When nothing moved, the
+  verdict is one line saying so. Below the verdict, put the raw `benchstat` output in one
+  collapsed `<details>` block, with links to the exact `before` and `after` commits it
+  measures. Rerun and update the links whenever review changes touch benchmarked code or
+  benchmarks. Review someone else's benchmark results the same way.
+- Address each actual regression or explain in the PR body why that case is not
+  important.
 - Reuse allocations in hot paths where possible, such as `Vec::clear`, scratch buffers,
   and reusable Arrow builders. When reusing buffers exposed through APIs or traits,
   document lifetime and copy requirements on the trait or type definition.

@@ -68,8 +68,8 @@ benchstat /tmp/before.txt /tmp/after.txt
 ```
 
 4. Repeat suspicious results in alternating revision order on an otherwise idle
-   machine. Paste raw `benchstat` output and exact `before` and `after` commit
-   links when reporting results.
+   machine. Report the results as `AGENTS.md` describes: a verdict naming the
+   actual changes, with the raw `benchstat` output in a collapsed `<details>` block.
 
 ## Compare heap use
 
