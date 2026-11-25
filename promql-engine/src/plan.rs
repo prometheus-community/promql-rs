@@ -1136,7 +1136,8 @@ impl Planner<'_> {
                     .await
             }
             (ValueType::Vector, ValueType::Vector) => {
-                self.vector_vector(b, op, return_bool, matching).await
+                self.vector_vector(b, op, return_bool, matching, reads)
+                    .await
             }
             // Two scalars are a value per step and nothing else, which
             // is the table [`Planner::scalar_series`] already builds.
@@ -1225,18 +1226,35 @@ impl Planner<'_> {
         op: binary::Op,
         return_bool: bool,
         matching: binary::Matching,
+        reads: Option<Reads>,
     ) -> Result<Planned, EngineError> {
         // Arithmetic drops the operands' metadata itself
         // (`changesMetricSchema`), so it reads only what it matches on.
+        // A set operator hands rows back as they came, so what is read
+        // above reads its operands too; `and` and `unless` hand back none
+        // of the right-hand side's. A comparison keeps its operands' marks
+        // (`DropName: returnBool`), so the result reads all of them.
         let signature = Reads::kept_by(&matching.labels, matching.on);
-        let above = Above {
-            reads: op
-                .changes_metric_schema()
-                .then(|| signature.or(Reads::named(&matching.include))),
+        let (lhs_reads, rhs_reads) = match op {
+            binary::Op::Or => (
+                reads.map(|r| r.or(signature)),
+                reads.map(|r| r.or(signature)),
+            ),
+            binary::Op::And | binary::Op::Unless => {
+                (reads.map(|r| r.or(signature)), Some(signature))
+            }
+            op if op.changes_metric_schema() => {
+                let read = Some(signature.or(Reads::named(&matching.include)));
+                (read, read)
+            }
+            _ => (None, None),
+        };
+        let side = |reads| Above {
+            reads,
             ..Above::default()
         };
-        let lhs = self.expr(&b.lhs, above).await?;
-        let rhs = self.expr(&b.rhs, above).await?;
+        let lhs = self.expr(&b.lhs, side(lhs_reads)).await?;
+        let rhs = self.expr(&b.rhs, side(rhs_reads)).await?;
         // The `on` labels join the schema even where neither side
         // carries them: a label both sides lack is the empty string on
         // both, which is a match, and the grouping needs a column to
