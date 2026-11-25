@@ -38,9 +38,9 @@ url = "https://github.com/jdx/mr-boxington/releases/download/v1.22.0/mbx-x86_64-
 signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
 
 [[tools.rust]]
-version = "1.94.0"
+version = "1.95.0"
 backend = "core:rust"
-specifiers = ["1.94.0"]
+specifiers = ["1.95.0"]
 
 [tools.rust.options]
 components = "clippy,rustfmt"

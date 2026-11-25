@@ -39,10 +39,10 @@ use datafusion::physical_expr::aggregate::AggregateFunctionExpr;
 use datafusion::physical_expr::expressions::{Column as PhysicalColumn, Literal};
 use datafusion::physical_expr::{PhysicalExpr, ScalarFunctionExpr};
 use datafusion::physical_plan::aggregates::{
-    aggregate_expressions, AggregateExec, AggregateInputMode, AggregateMode,
+    aggregate_expressions, AggregateExec, AggregateInputMode, AggregateMode, GroupClusteringMode,
 };
 use datafusion::physical_plan::projection::ProjectionExec;
-use datafusion::physical_plan::{DisplayFormatType, ExecutionPlan, InputOrderMode};
+use datafusion::physical_plan::{DisplayFormatType, ExecutionPlan};
 use promql_common::model::Duration;
 use promql_parser::ast::LabelMatcher;
 
@@ -978,8 +978,11 @@ pub(crate) fn render_aggregate_exec(a: &AggregateExec) -> Option<String> {
         gby.join(", "),
         aggr.join(", ")
     );
-    if *a.input_order_mode() != InputOrderMode::Linear {
-        line.push_str(&format!(", ordering_mode={:?}", a.input_order_mode()));
+    if *a.group_clustering_mode() != GroupClusteringMode::None {
+        line.push_str(&format!(
+            ", group_clustering_mode={:?}",
+            a.group_clustering_mode()
+        ));
     }
     Some(line)
 }

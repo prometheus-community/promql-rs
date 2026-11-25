@@ -188,11 +188,9 @@ mod tests {
             .iter()
             .map(|f| {
                 Arc::new(
-                    f.as_ref().clone().with_metadata(
-                        [("child".to_string(), f.name().clone())]
-                            .into_iter()
-                            .collect(),
-                    ),
+                    f.as_ref()
+                        .clone()
+                        .with_metadata([("child", f.name().clone())]),
                 )
             })
             .collect();
@@ -206,7 +204,7 @@ mod tests {
         );
         let item = Arc::new(
             Field::new(series::LIST_ITEM, DataType::Struct(fields), false)
-                .with_metadata([("item".into(), "preserved".into())].into_iter().collect()),
+                .with_metadata([("item", "preserved")]),
         );
         ListArray::new(
             item,
@@ -284,7 +282,7 @@ mod tests {
     fn matrix_return_field_keeps_source_metadata_and_nullability() {
         let input = Arc::new(
             Field::new(series::SAMPLES, samples().data_type().clone(), true)
-                .with_metadata([("unit".into(), "samples".into())].into_iter().collect()),
+                .with_metadata([("unit", "samples")]),
         );
         let args = [
             input.clone(),

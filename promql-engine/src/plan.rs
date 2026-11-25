@@ -1149,8 +1149,12 @@ impl Planner<'_> {
             .unnest_column(Column::new_unqualified(PAIRS))?
             .unnest_column(Column::new_unqualified(PAIRS))?
             .project(whole_grid(
-                col(pair_column(binary::PAIR_LABELS)).alias(LABELS),
-                col(pair_column(binary::PAIR_SAMPLES)).alias(SAMPLES),
+                binary::unnested_udf()
+                    .call(vec![col(pair_column(binary::PAIR_LABELS))])
+                    .alias(LABELS),
+                binary::unnested_udf()
+                    .call(vec![col(pair_column(binary::PAIR_SAMPLES))])
+                    .alias(SAMPLES),
             ))?
             .build()?;
         // The aggregation builds the result labels itself, in the

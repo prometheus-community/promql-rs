@@ -187,20 +187,14 @@ mod tests {
         let schema = series::schema(&["pod".to_string()]);
         let mut fields = schema.fields().to_vec();
         fields[1] = Arc::new(
-            fields[1].as_ref().clone().with_metadata(
-                [("unit".to_string(), "samples".to_string())]
-                    .into_iter()
-                    .collect(),
-            ),
+            fields[1]
+                .as_ref()
+                .clone()
+                .with_metadata([("unit", "samples")]),
         );
         fields.push(Arc::new(Field::new(SERIES_ID, DataType::UInt64, false)));
         let n = fields.len();
-        let arrow = Schema::new_with_metadata(
-            fields,
-            [("owner".to_string(), "source".to_string())]
-                .into_iter()
-                .collect(),
-        );
+        let arrow = Schema::new_with_metadata(fields, [("owner", "source")]);
         let schema = DFSchema::try_from(arrow)
             .unwrap()
             .with_functional_dependencies(FunctionalDependencies::new(vec![

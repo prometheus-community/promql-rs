@@ -276,11 +276,10 @@ mod tests {
     #[test]
     fn return_type_accepts_sample_metadata_but_not_a_different_shape_or_grid_type() {
         let item = Arc::new(
-            series::sample_item().as_ref().clone().with_metadata(
-                [("source".into(), "preserved".into())]
-                    .into_iter()
-                    .collect(),
-            ),
+            series::sample_item()
+                .as_ref()
+                .clone()
+                .with_metadata([("source", "preserved")]),
         );
         let scalar = Scalar::default();
         let mut types = vec![

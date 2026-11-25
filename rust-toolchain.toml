@@ -1,5 +1,5 @@
 # Keep the compiler identical for rustup, mise and CI. Cargo.toml records the MSRV.
 [toolchain]
-channel = "1.94.0"
+channel = "1.95.0"
 profile = "minimal"
 components = ["rustfmt", "clippy"]
