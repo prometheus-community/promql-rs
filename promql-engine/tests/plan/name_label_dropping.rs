@@ -37,3 +37,24 @@ fn grouping_by_name_over_sides_that_disagree() {
         query
     );
 }
+
+/// Nothing over `or` reads the name and `or` matches without it, so
+/// `rate` drops it at once and no per-row mark is planned.
+#[test]
+fn or_at_the_root_drops_a_side_name_at_once() {
+    let case = Case::new(RANGE, &[r#"http_requests_total{job="api"} 0"#]);
+    let query = r#"http_requests_total or rate(http_requests_total[5m])"#;
+    let plan = case.plan(query);
+    assert!(!plan.contains("__promql_drop_name__"), "{plan}");
+    assert_snapshot!("or_at_the_root_drops_a_side_name_at_once", plan, query);
+}
+
+/// `and` hands back none of its right-hand rows, so their name goes at
+/// once even where a rewrite above reads the left-hand one.
+#[test]
+fn and_drops_a_right_hand_name_at_once() {
+    let case = Case::new(RANGE, &[r#"http_requests_total{job="api"} 0"#]);
+    let query = r#"label_replace(http_requests_total and rate(http_requests_total[5m]), "n", "$1", "__name__", "(.+)")"#;
+    let plan = case.plan(query);
+    assert!(!plan.contains("__promql_drop_name__"), "{plan}");
+}
