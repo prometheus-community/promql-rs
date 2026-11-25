@@ -129,6 +129,9 @@ impl FloatHistogram {
                 .any(|bucket| bucket.is_infinite())
     }
 
+    /// Prometheus `FloatHistogram.CopyToSchema`: the same histogram at a
+    /// coarser exponential schema. Only reduction is defined, so a target
+    /// above the current schema is a caller bug rather than a no-op.
     pub fn copy_to_schema(&self, target_schema: i32) -> Self {
         assert!(self.schema != CUSTOM_SCHEMA && target_schema != CUSTOM_SCHEMA);
         assert!(target_schema <= self.schema);
@@ -137,6 +140,9 @@ impl FloatHistogram {
         copy
     }
 
+    /// Prometheus `FloatHistogram.Mul`: scale every count by `factor`. A
+    /// negative factor mirrors the histogram, which no counter can do, so
+    /// upstream marks the result a gauge.
     pub fn mul(&mut self, factor: f64) -> &mut Self {
         self.zero_count *= factor;
         self.count *= factor;
@@ -154,6 +160,9 @@ impl FloatHistogram {
         self
     }
 
+    /// Prometheus `FloatHistogram.Div`: divide every count by `divisor`.
+    /// As in `mul`, a negative divisor marks the result a gauge; division
+    /// by zero leaves the infinities upstream leaves, uncompacted.
     pub fn div(&mut self, divisor: f64) -> &mut Self {
         self.zero_count /= divisor;
         self.count /= divisor;
@@ -203,6 +212,19 @@ impl FloatHistogram {
         self
     }
 
+    /// Prometheus `FloatHistogram.DetectReset`: whether this histogram is a
+    /// counter reset relative to `previous`. Both sides are read at this
+    /// histogram's schema and zero threshold, as upstream reads them at
+    /// `h`'s, so the comparison is symmetric.
+    ///
+    /// The custom-bucket arm returns here instead of falling through as
+    /// upstream's does. Upstream branches out only for bounds that do not
+    /// match and otherwise compares with the generic bucket iterators, but
+    /// with matching bounds the intersected remap is the identity, so the
+    /// two paths agree and one is enough. One side custom and the other not
+    /// is a reset either way: upstream reaches that through
+    /// `h.Schema > previous.Schema`, no exponential schema being as low as
+    /// the custom one.
     pub fn detect_reset(&self, previous: &Self) -> bool {
         if self.counter_reset_hint == CounterResetHint::Reset {
             return true;
@@ -330,8 +352,17 @@ impl FloatHistogram {
             }
         }
 
+        // `addBuckets` applies the zero threshold to the operand being added
+        // and never to the receiver. The asymmetry is deliberate upstream:
+        // `reconcileZeroBuckets` has already trimmed the receiver in place,
+        // while `other` is left read-only and so can still hold buckets
+        // inside the common zero bucket. Filtering the receiver here too
+        // would drop population Prometheus keeps, while the `count` added
+        // above still carries it.
+        const KEEP_EVERY_BUCKET: f64 = f64::NEG_INFINITY;
+
         for positive in [true, false] {
-            let mut left = self.side_at_schema(positive, target_schema, self.zero_threshold);
+            let mut left = self.side_at_schema(positive, target_schema, KEEP_EVERY_BUCKET);
             if kahan {
                 let c = compensation.as_deref_mut().expect("Kahan compensation");
                 let mut comp = side_map(c, positive);
