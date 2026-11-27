@@ -13,8 +13,8 @@ writes to this directory, and CI verifies every file against
 
 - Repository: https://github.com/prometheus/prometheus
 - Path: `promql/promqltest/testdata/`
-- Commit: `83962c35a4ab0c9988bc469aa8165014fc065d34`
-- Vendored: 2026-09-13
+- Commit: `ccdfcea89903f5966d3f6b73631f1b37f907dbeb`
+- Vendored: 2026-11-27
 
 The commit is deliberately the same one `promql-parser/sync-meta.toml`
 pins. The two sets are independent — this corpus carries its own
@@ -24,27 +24,30 @@ to move.
 
 ## Files
 
-20 files, 2,098 `eval` assertions.
+23 files, 2,552 `eval` assertions.
 
 | File | Evals |
 |---|---:|
-| `native_histograms.test` | 521 |
-| `functions.test` | 413 |
-| `operators.test` | 213 |
-| `histograms.test` | 185 |
-| `aggregators.test` | 160 |
-| `extended_vectors.test` | 118 |
-| `at_modifier.test` | 71 |
-| `duration_expression.test` | 59 |
-| `type_and_unit.test` | 58 |
-| `fill-modifier.test` | 45 |
-| `info.test` | 42 |
+| `native_histograms.test` | 557 |
+| `functions.test` | 541 |
+| `operators.test` | 214 |
+| `histograms.test` | 195 |
+| `extended_vectors.test` | 174 |
+| `aggregators.test` | 167 |
+| `bitwise.test` | 87 |
+| `at_modifier.test` | 78 |
+| `info.test` | 70 |
+| `duration_expression.test` | 65 |
+| `type_and_unit.test` | 65 |
+| `fill-modifier.test` | 50 |
+| `subquery.test` | 41 |
+| `start_timestamps.test` | 40 |
 | `limit.test` | 37 |
-| `subquery.test` | 34 |
 | `selectors.test` | 31 |
 | `name_label_dropping.test` | 30 |
+| `unquoted_utf8_names.test` | 27 |
 | `literals.test` | 25 |
-| `trig_functions.test` | 19 |
+| `trig_functions.test` | 21 |
 | `range_queries.test` | 18 |
 | `staleness.test` | 17 |
 | `collision.test` | 2 |

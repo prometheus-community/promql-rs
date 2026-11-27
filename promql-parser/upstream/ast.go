@@ -89,16 +89,21 @@ type Expressions []Expr
 
 // AggregateExpr represents an aggregation operation on a Vector.
 type AggregateExpr struct {
+	unquotedUTF8Names bool // Whether the printer can emit unquoted Unicode letters and dots in names.
+
 	Op       ItemType // The used aggregation operation.
 	Expr     Expr     // The Vector expression over which is aggregated.
 	Param    Expr     // Parameter used by some aggregators.
 	Grouping []string // The labels by which to group the Vector.
 	Without  bool     // Whether to drop the given labels rather than keep them.
+
 	PosRange posrange.PositionRange
 }
 
 // BinaryExpr represents a binary expression between two child expressions.
 type BinaryExpr struct {
+	unquotedUTF8Names bool // Whether the printer can emit unquoted Unicode letters and dots in names.
+
 	Op       ItemType // The operation of the expression.
 	LHS, RHS Expr     // The operands on the respective sides of the operator.
 
@@ -116,8 +121,8 @@ type DurationExpr struct {
 	LHS, RHS Expr     // The operands on the respective sides of the operator.
 	Wrapped  bool     // Set when the duration is wrapped in parentheses.
 
-	StartPos posrange.Pos // For unary operations, step(), and range(), the start position of the operator.
-	EndPos   posrange.Pos // For step() and range(), the end position of the operator.
+	StartPos posrange.Pos // The start position of unary operations and duration function calls.
+	EndPos   posrange.Pos // The end position of duration function calls, including the closing parenthesis.
 }
 
 // Call represents a function call.
@@ -204,6 +209,8 @@ func (e *StepInvariantExpr) PositionRange() posrange.PositionRange {
 
 // VectorSelector represents a Vector selection.
 type VectorSelector struct {
+	unquotedUTF8Names bool // Whether the printer can emit unquoted Unicode letters and dots in names.
+
 	Name string
 	// OriginalOffset is the actual offset calculated from OriginalOffsetExpr.
 	OriginalOffset time.Duration
@@ -487,7 +494,7 @@ func (e *BinaryExpr) PositionRange() posrange.PositionRange {
 }
 
 func (e *DurationExpr) PositionRange() posrange.PositionRange {
-	if e.Op == STEP || e.Op == RANGE {
+	if e.Op == MIN_OF || e.Op == MAX_OF || (e.RHS == nil && e.LHS == nil) {
 		return posrange.PositionRange{
 			Start: e.StartPos,
 			End:   e.EndPos,
@@ -496,7 +503,7 @@ func (e *DurationExpr) PositionRange() posrange.PositionRange {
 	if e.RHS == nil {
 		return posrange.PositionRange{
 			Start: e.StartPos,
-			End:   e.RHS.PositionRange().End,
+			End:   e.LHS.PositionRange().End,
 		}
 	}
 	if e.LHS == nil {

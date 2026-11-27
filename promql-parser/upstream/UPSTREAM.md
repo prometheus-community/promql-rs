@@ -9,8 +9,8 @@ every delta as auto-apply-safe or human-required.
 
 - Repository: https://github.com/prometheus/prometheus
 - Path: `promql/parser/`
-- Commit: `83962c35a4ab0c9988bc469aa8165014fc065d34`
-- Vendored: 2026-04-21
+- Commit: `ccdfcea89903f5966d3f6b73631f1b37f907dbeb`
+- Vendored: 2026-11-27
 
 ## Files
 
