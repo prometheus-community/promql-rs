@@ -19,7 +19,7 @@
 //!
 //! # Instant queries
 //!
-//! 1,801 of the 2,098 evals are instant. They go to
+//! 2,172 of the 2,552 evals are instant. They go to
 //! `Engine::instant_query`, which answers with the type the expression
 //! has, as upstream does, and the comparison is by what the script
 //! expects: a vector, a scalar, a string, or `expect range vector` for a
