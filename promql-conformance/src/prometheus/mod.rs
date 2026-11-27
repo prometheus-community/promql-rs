@@ -1,7 +1,7 @@
 //! Prometheus's own promqltest corpus, replayed against our engine.
 //!
-//! The 20 `.test` files under `testdata/prometheus/` are the largest
-//! specification of PromQL behaviour that exists: 2,098 assertions, each
+//! The 23 `.test` files under `testdata/prometheus/` are the largest
+//! specification of PromQL behaviour that exists: 2,552 assertions, each
 //! carrying its expected values inline. That last part is what makes
 //! this suite different from [`crate::thanos`] — there is nothing to
 //! ask, so it needs no oracle, no Go toolchain and no network, and it

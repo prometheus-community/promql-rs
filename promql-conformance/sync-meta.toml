@@ -11,5 +11,5 @@
 # because its vendored Go is ported line by line into Rust; these files
 # are data, replayed verbatim, with nothing to translate.
 
-pinned_upstream_sha = "83962c35a4ab0c9988bc469aa8165014fc065d34"
-last_sync_date = "2026-09-13"
+pinned_upstream_sha = "ccdfcea89903f5966d3f6b73631f1b37f907dbeb"
+last_sync_date = "2026-11-27"

@@ -485,16 +485,12 @@ fn parse_eval(file: &str, lines: &[&str], i: usize) -> Result<(usize, Eval), Err
         pos += 1;
 
         let Ok(desc) = promql_parser::parse_series_desc(row) else {
-            // A native-histogram descriptor is a known gap, not a
-            // broken corpus. Anything else is a parser bug worth
-            // seeing, so the two are kept apart.
+            // A known gap is not a broken corpus. Anything else is a
+            // parser bug worth seeing, so `Unsupported::of` keeps the
+            // two apart.
             eval.unsupported.push(UnsupportedLine {
                 text: row.to_string(),
-                reason: if row.contains("{{") {
-                    Unsupported::NativeHistogram
-                } else {
-                    Unsupported::ParseError
-                },
+                reason: Unsupported::of(row),
             });
             continue;
         };
@@ -689,17 +685,60 @@ pub enum Unsupported {
     /// A `{{schema:1 ...}}` native-histogram descriptor. The grammar
     /// rules behind those are still on `promql-sync`'s skip list.
     NativeHistogram,
+    /// A series carrying start timestamps, `name{…}@st` followed by
+    /// per-sample start offsets (`start_timestamps.test`). Upstream's
+    /// `parseSeries` reads the suffix; `parse_series_desc` has no rule
+    /// for it yet.
+    StartTimestamp,
+    /// An unquoted metric or label name outside `[A-Za-z0-9_:]`, such
+    /// as `http.server.requests` or `温度` (`unquoted_utf8_names.test`).
+    /// Our lexer still takes only legacy names unquoted.
+    UnquotedUtf8Name,
     /// Anything else the parser rejected. Treated as a real failure by
     /// the corpus tests rather than an accepted gap.
     ParseError,
 }
 
+pattern!(pat_start_timestamp, r#"^[^\s{]*(\{[^}]*\})?@st(\s|$)"#);
+pattern!(pat_unquoted_name, r#"^[^\s{"]+"#);
+pattern!(
+    pat_unquoted_label_name,
+    r#"[{,]\s*([^\s{}",=!~]+)\s*(=|!=|=~|!~)"#
+);
+
+impl Unsupported {
+    /// Why `parse_series_desc` rejected `line`. Only a line that is none
+    /// of the known gaps is a [`Unsupported::ParseError`], so a new gap
+    /// shows up in the corpus tests instead of hiding under an old one.
+    fn of(line: &str) -> Self {
+        let non_legacy = |name: &str| {
+            !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+        };
+        if line.contains("{{") {
+            Unsupported::NativeHistogram
+        } else if pat_start_timestamp().is_match(line) {
+            Unsupported::StartTimestamp
+        } else if pat_unquoted_name()
+            .find(line)
+            .is_some_and(|m| non_legacy(m.as_str()))
+            || pat_unquoted_label_name()
+                .captures_iter(line)
+                .any(|c| non_legacy(&c[1]))
+        {
+            Unsupported::UnquotedUtf8Name
+        } else {
+            Unsupported::ParseError
+        }
+    }
+}
+
 /// Split a load block into its directive and its series lines.
 ///
 /// A line that fails to parse is recorded rather than raised: a native
-/// histogram is a known gap, not a broken corpus. Anything else is
-/// flagged as [`Unsupported::ParseError`] so the tests can tell the two
-/// apart.
+/// histogram is a known gap, not a broken corpus. [`Unsupported::of`]
+/// tells the known gaps from a [`Unsupported::ParseError`].
 fn parse_load_block(file: &str, line: usize, raw: &str) -> Result<LoadBlock, Error> {
     let mut lines = raw.lines().map(str::trim).filter(|l| !l.is_empty());
 
@@ -724,11 +763,7 @@ fn parse_load_block(file: &str, line: usize, raw: &str) -> Result<LoadBlock, Err
             Ok(sd) => SeriesLine::Parsed(sd),
             Err(_) => SeriesLine::Unsupported(UnsupportedLine {
                 text: l.to_string(),
-                reason: if l.contains("{{") {
-                    Unsupported::NativeHistogram
-                } else {
-                    Unsupported::ParseError
-                },
+                reason: Unsupported::of(l),
             }),
         })
         .collect();
@@ -738,4 +773,41 @@ fn parse_load_block(file: &str, line: usize, raw: &str) -> Result<LoadBlock, Err
         with_nhcb,
         series,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Unsupported;
+
+    #[test]
+    fn unreadable_lines_are_filed_under_their_gap() {
+        let cases = [
+            (
+                "{} {{schema:1 sum:5 count:4}}",
+                Unsupported::NativeHistogram,
+            ),
+            (
+                r#"cumulative{type="st"}@st _ _ -1m-1mx2"#,
+                Unsupported::StartTimestamp,
+            ),
+            ("series@st  _ _ -1m", Unsupported::StartTimestamp),
+            (
+                r#"http.server.requests{service.name="web"} 240"#,
+                Unsupported::UnquotedUtf8Name,
+            ),
+            (r#"温度{場所="東京"} 30"#, Unsupported::UnquotedUtf8Name),
+            (
+                r#"metric{service.name="web"} 1"#,
+                Unsupported::UnquotedUtf8Name,
+            ),
+            // Quoted names are readable already; a reject there is a bug.
+            (r#"{"http.server.requests"} 1 2 ("#, Unsupported::ParseError),
+            // `@st` inside a label value is not the suffix.
+            (r#"metric{a="x@st y"} 1 2 ("#, Unsupported::ParseError),
+            ("metric 1 2 (", Unsupported::ParseError),
+        ];
+        for (line, want) in cases {
+            assert_eq!(Unsupported::of(line), want, "{line}");
+        }
+    }
 }

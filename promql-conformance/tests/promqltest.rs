@@ -1,6 +1,6 @@
 //! Prometheus's promqltest corpus, replayed against the Rust engine.
 //!
-//! 2,098 evals across 20 vendored `.test` files, each carrying its own
+//! 2,552 evals across 23 vendored `.test` files, each carrying its own
 //! expected values. Unlike [the differential suite](differential.rs)
 //! there is nothing to ask at runtime — no oracle, no Go, no network —
 //! so this is the conformance suite that actually runs in CI.
@@ -38,7 +38,7 @@
 //!
 //! # What is not asserted
 //!
-//! `expect warn` / `info` / `no_warn` / `no_info` — 555 evals — need an
+//! `expect warn` / `info` / `no_warn` / `no_info` — 628 evals — need an
 //! annotation channel the engine does not have. They are parsed, counted
 //! and reported, but not checked; the count is printed so the gap stays
 //! visible rather than silently passing.

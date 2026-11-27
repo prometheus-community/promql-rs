@@ -108,6 +108,7 @@ const PROMQLTEST: VendorSet = VendorSet {
     files: &[
         "aggregators.test",
         "at_modifier.test",
+        "bitwise.test",
         "collision.test",
         "duration_expression.test",
         "extended_vectors.test",
@@ -123,9 +124,11 @@ const PROMQLTEST: VendorSet = VendorSet {
         "range_queries.test",
         "selectors.test",
         "staleness.test",
+        "start_timestamps.test",
         "subquery.test",
         "trig_functions.test",
         "type_and_unit.test",
+        "unquoted_utf8_names.test",
     ],
 };
 

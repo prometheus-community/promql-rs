@@ -7,7 +7,7 @@
 //! passes a third of it.
 //!
 //! The numbers below were measured against
-//! prometheus/prometheus@83962c35 with `grep`. They are expected to
+//! prometheus/prometheus@ccdfcea8 with `grep`. They are expected to
 //! change when the pin moves — that is the point of pinning.
 
 use std::collections::BTreeMap;
@@ -25,7 +25,7 @@ fn corpus() -> &'static [Script] {
 #[test]
 fn every_vendored_file_parses() {
     let scripts = corpus();
-    assert_eq!(scripts.len(), 20, "vendored file count");
+    assert_eq!(scripts.len(), 23, "vendored file count");
 
     // Nothing silently empty: every file has at least one eval.
     for s in scripts {
@@ -47,26 +47,29 @@ fn eval_counts_match_upstream() {
 
     // Counted with `grep -cE '^\s*eval'` over the vendored files.
     let expected: &[(&str, usize)] = &[
-        ("aggregators", 160),
-        ("at_modifier", 71),
+        ("aggregators", 167),
+        ("at_modifier", 78),
+        ("bitwise", 87),
         ("collision", 2),
-        ("duration_expression", 59),
-        ("extended_vectors", 118),
-        ("fill-modifier", 45),
-        ("functions", 413),
-        ("histograms", 185),
-        ("info", 42),
+        ("duration_expression", 65),
+        ("extended_vectors", 174),
+        ("fill-modifier", 50),
+        ("functions", 541),
+        ("histograms", 195),
+        ("info", 70),
         ("limit", 37),
         ("literals", 25),
         ("name_label_dropping", 30),
-        ("native_histograms", 521),
-        ("operators", 213),
+        ("native_histograms", 557),
+        ("operators", 214),
         ("range_queries", 18),
         ("selectors", 31),
         ("staleness", 17),
-        ("subquery", 34),
-        ("trig_functions", 19),
-        ("type_and_unit", 58),
+        ("start_timestamps", 40),
+        ("subquery", 41),
+        ("trig_functions", 21),
+        ("type_and_unit", 65),
+        ("unquoted_utf8_names", 27),
     ];
 
     for (name, want) in expected {
@@ -74,7 +77,7 @@ fn eval_counts_match_upstream() {
     }
 
     let total: usize = per_file.values().sum();
-    assert_eq!(total, 2098, "total evals across the corpus");
+    assert_eq!(total, 2552, "total evals across the corpus");
 }
 
 #[test]
@@ -88,9 +91,10 @@ fn instant_and_range_split_matches_upstream() {
             Timing::Range(_) => range += 1,
         }
     }
-    // 1,798 `eval instant` + 3 `eval_fail instant`, and 297 `eval range`.
-    assert_eq!(instant, 1801, "instant evals");
-    assert_eq!(range, 297, "range evals");
+    // 2,166 `eval instant` + 5 `eval_fail instant` + 1 `eval_warn instant`,
+    // and 380 `eval range`.
+    assert_eq!(instant, 2172, "instant evals");
+    assert_eq!(range, 380, "range evals");
 }
 
 #[test]
@@ -102,8 +106,8 @@ fn load_blocks_and_clears_are_in_source_order() {
         .flat_map(|s| &s.commands)
         .filter(|c| matches!(c, Command::Clear))
         .count();
-    assert_eq!(loads, 280, "load blocks");
-    assert_eq!(clears, 202, "clear directives");
+    assert_eq!(loads, 346, "load blocks");
+    assert_eq!(clears, 263, "clear directives");
 
     // The accumulate-then-clear shape is the thing the runner depends
     // on, so assert a file that genuinely exercises it: histograms.test
@@ -153,8 +157,8 @@ fn expect_assertions_are_recorded() {
         with_message += messaged;
     }
 
-    // 31 `expect fail` plus the 3 legacy `eval_fail` prefixes.
-    assert_eq!(fail, 34, "evals expecting failure");
+    // 32 `expect fail` plus the 5 legacy `eval_fail` prefixes.
+    assert_eq!(fail, 37, "evals expecting failure");
     assert_eq!(ordered, 24, "evals expecting ordered results");
     assert!(
         annotations > 400,
@@ -166,45 +170,52 @@ fn expect_assertions_are_recorded() {
     );
 }
 
-/// Native histograms are the one shape we knowingly cannot read, and
-/// they turn up on both sides — in `load` lines and in expected results.
-/// Every other rejection is a parser bug, so the two are asserted apart.
+/// Every row the series parser rejects is a known gap, and each gap
+/// stays in the files that need it. Native histograms turn up on both
+/// sides, in `load` lines and in expected results, so both are counted.
+/// A [`script::Unsupported::ParseError`] anywhere is a parser bug.
 #[test]
-fn native_histograms_are_the_only_thing_we_cannot_read() {
-    let scripts = corpus();
-    let mut in_loads = 0;
-    let mut in_expectations = 0;
-    let mut parse_errors = Vec::new();
+fn every_unreadable_row_is_a_known_gap() {
+    use script::Unsupported::{NativeHistogram, ParseError, StartTimestamp, UnquotedUtf8Name};
 
-    for l in scripts.iter().flat_map(Script::loads) {
-        for u in l.block.unsupported() {
-            in_loads += 1;
-            if u.reason != script::Unsupported::NativeHistogram {
-                parse_errors.push(u.text.clone());
+    let scripts = corpus();
+    let mut histograms_in_loads = 0;
+    let mut histograms_in_expectations = 0;
+    let mut misplaced = Vec::new();
+
+    for s in scripts {
+        let allowed = |reason| match reason {
+            NativeHistogram => true,
+            StartTimestamp => s.name == "start_timestamps",
+            UnquotedUtf8Name => s.name == "unquoted_utf8_names",
+            ParseError => false,
+        };
+        for u in s.loads().flat_map(|l| l.block.unsupported()) {
+            histograms_in_loads += usize::from(u.reason == NativeHistogram);
+            if !allowed(u.reason) {
+                misplaced.push((s.name.clone(), u.reason, u.text.clone()));
             }
         }
-    }
-    for e in scripts.iter().flat_map(Script::evals) {
-        for u in &e.unsupported {
-            in_expectations += 1;
-            if u.reason != script::Unsupported::NativeHistogram {
-                parse_errors.push(u.text.clone());
+        for u in s.evals().flat_map(|e| &e.unsupported) {
+            histograms_in_expectations += usize::from(u.reason == NativeHistogram);
+            if !allowed(u.reason) {
+                misplaced.push((s.name.clone(), u.reason, u.text.clone()));
             }
         }
     }
 
     assert!(
-        in_loads > 0,
+        histograms_in_loads > 0,
         "native-histogram load lines should be recorded"
     );
     assert!(
-        in_expectations > 0,
+        histograms_in_expectations > 0,
         "native-histogram expected rows should be recorded"
     );
     assert!(
-        parse_errors.is_empty(),
-        "{} row(s) rejected for reasons other than native histograms: {parse_errors:#?}",
-        parse_errors.len()
+        misplaced.is_empty(),
+        "{} row(s) rejected outside a known gap: {misplaced:#?}",
+        misplaced.len()
     );
 }
 
@@ -225,12 +236,12 @@ fn scalar_string_and_range_vector_expectations_are_parsed() {
         }
     }
 
-    assert_eq!(scalars, 40, "bare scalar results");
+    assert_eq!(scalars, 105, "bare scalar results");
     assert_eq!(strings, 5, "`expect string` rows");
-    // Five, not the six a grep for the phrase reports: range_queries.test:79
+    // Twelve, not the thirteen a grep for the phrase reports: range_queries.test:79
     // is a comment that names the directive in prose. Comments are blanked
     // before dispatch, which is why the two numbers differ.
-    assert_eq!(range_vectors, 5, "`expect range vector` rows");
+    assert_eq!(range_vectors, 12, "`expect range vector` rows");
 
     // literals.test is small enough to account for completely, which is
     // what makes the totals above more than magic numbers: 25 evals,

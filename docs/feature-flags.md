@@ -9,7 +9,7 @@ off by default, so a stock Prometheus rejects `mad_over_time(x[5m])` with
 
 | `--enable-feature` | upstream `parser.Options` | `promql_parser::ParserOptions` | default | gates |
 |---|---|---|---|---|
-| `promql-experimental-functions` | `EnableExperimentalFunctions` | `enable_experimental_functions` | off | Functions marked `Experimental: true` in `functions.go` (`mad_over_time`, `sort_by_label`, `info`, `first_over_time`, `ts_of_*_over_time`, `double_exponential_smoothing`, `histogram_quantiles`, `start`, `end`, `step`, `range`), and the `limitk` and `limit_ratio` aggregators |
+| `promql-experimental-functions` | `EnableExperimentalFunctions` | `enable_experimental_functions` | off | Functions marked `Experimental: true` in `functions.go` (`mad_over_time`, `sort_by_label`, `info`, `ts_of_*_over_time`, `double_exponential_smoothing`, `histogram_quantiles`, `integral`, `max_of`, `min_of`, `start_timestamp`, `start`, `end`, `step`, `range`), and the `limitk` and `limit_ratio` aggregators |
 | `promql-duration-expr` | `ExperimentalDurationExpr` | `experimental_duration_expr` | off | Arithmetic, `step()`, `range()` and `min`/`max` in durations. The option and its helper exist; the grammar does not use them until the duration productions are ported |
 | `promql-extended-range-selectors` | `EnableExtendedRangeSelectors` | `enable_extended_range_selectors` | off | The `anchored` and `smoothed` selector modifiers |
 | `promql-binop-fill-modifiers` | `EnableBinopFillModifiers` | `enable_binop_fill_modifiers` | off | `fill`, `fill_left` and `fill_right` on binary operators |
