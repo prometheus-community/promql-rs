@@ -120,7 +120,9 @@ fn a_stable_function_needs_no_flag() {
 
 #[test]
 fn every_experimental_call_in_a_query_is_reported() {
-    let got = errors(parse_expr("mad_over_time(x[5m]) + first_over_time(y[5m])"));
+    let got = errors(parse_expr(
+        "mad_over_time(x[5m]) + ts_of_first_over_time(y[5m])",
+    ));
     assert_eq!(
         got,
         vec![
@@ -129,8 +131,8 @@ fn every_experimental_call_in_a_query_is_reported() {
                 range(0, 13)
             ),
             (
-                r#"function "first_over_time" is not enabled"#.to_string(),
-                range(23, 38)
+                r#"function "ts_of_first_over_time" is not enabled"#.to_string(),
+                range(23, 44)
             ),
         ]
     );

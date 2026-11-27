@@ -8,17 +8,20 @@
 /// `EnableExperimentalFunctions` gates. `start`, `end`, `step` and
 /// `range` are among them: their `function_call` arms gate exactly like
 /// the identifier arm.
-const EXPERIMENTAL: [&str; 15] = [
+const EXPERIMENTAL: [&str; 18] = [
     "double_exponential_smoothing",
     "end",
-    "first_over_time",
     "histogram_quantiles",
     "info",
+    "integral",
     "mad_over_time",
+    "max_of",
+    "min_of",
     "range",
     "sort_by_label",
     "sort_by_label_desc",
     "start",
+    "start_timestamp",
     "step",
     "ts_of_first_over_time",
     "ts_of_last_over_time",
